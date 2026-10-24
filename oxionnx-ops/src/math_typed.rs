@@ -397,6 +397,41 @@ pub(crate) fn matmul_f32_into(
     let a_batch_stride = m * k;
     let b_batch_stride = k * n;
     out.resize(batch_size * mn, 0.0f32);
+    if mn == 0 {
+        return Ok(out_shape);
+    }
+
+    // Prototype (onnx_spike): packed-panel kernel for operands that are not
+    // session weights (e.g. attention QK^T / PV). Packing B per call is cheap next
+    // to matrixmultiply's fixed per-call setup, which dominates these small GEMMs;
+    // tiny batched GEMMs run serially instead of paying for a fork/join.
+    #[cfg(target_arch = "x86_64")]
+    if crate::gemm_packed::available() {
+        use crate::gemm_packed::{gemm, PackedB};
+        let threads = crate::par::threads();
+        if b_batches == 1 && a_batches == batch_size {
+            let pb = PackedB::pack(&b_data[..k * n], k, n);
+            gemm(batch_size * m, a_data, &pb, &mut out[..], threads);
+            return Ok(out_shape);
+        }
+        let shared = (b_batches == 1).then(|| PackedB::pack(&b_data[..k * n], k, n));
+        let run = |(b_idx, dst): (usize, &mut [f32])| {
+            let a_off = (b_idx % a_batches) * a_batch_stride;
+            let b_off = (b_idx % b_batches) * b_batch_stride;
+            let a = &a_data[a_off..a_off + m * k];
+            match &shared {
+                Some(pb) => gemm(m, a, pb, dst, threads),
+                None => gemm(m, a, &PackedB::pack(&b_data[b_off..b_off + k * n], k, n), dst, threads),
+            }
+        };
+        if batch_size * mn * k < 2 * 64 * 1024 || threads == 1 {
+            out.chunks_mut(mn).enumerate().for_each(run);
+        } else {
+            use rayon::prelude::*;
+            out.par_chunks_mut(mn).enumerate().for_each(run);
+        }
+        return Ok(out_shape);
+    }
 
     #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     {

@@ -69,7 +69,8 @@ pub fn gelu(x: &Tensor) -> Tensor {
 /// cross-path ULP divergence between allocating and in-place variants.
 #[cfg(feature = "simd")]
 pub fn gelu_slice(data: &mut [f32]) {
-    crate::simd_ops::simd_gelu(data);
+    // Prototype (onnx_spike): same SIMD kernel, split into chunks across threads.
+    crate::par::for_each_row(data, 4096, |_, chunk| crate::simd_ops::simd_gelu(chunk));
 }
 
 /// See the `simd` variant above — scalar fallback, same formula.

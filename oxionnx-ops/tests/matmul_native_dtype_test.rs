@@ -66,7 +66,7 @@ fn bf16_bits_to_f32(bits: &[u16]) -> Vec<f32> {
 fn test_matmul_f32_baseline() {
     // Verify native_dtypes contains F32
     assert!(
-        MatMulOp.native_dtypes().contains(&DType::F32),
+        MatMulOp::default().native_dtypes().contains(&DType::F32),
         "DType::F32 must be in native_dtypes()"
     );
 
@@ -78,7 +78,7 @@ fn test_matmul_f32_baseline() {
 
     let node = matmul_node();
     let ctx = make_typed_ctx(&node, &a, &b);
-    let result = MatMulOp
+    let result = MatMulOp::default()
         .execute_typed(&ctx)
         .expect("execute_typed F32 failed");
 
@@ -116,7 +116,7 @@ fn test_matmul_f32_baseline() {
 #[test]
 fn test_matmul_i8_i32_against_reference() {
     assert!(
-        MatMulOp.native_dtypes().contains(&DType::I8),
+        MatMulOp::default().native_dtypes().contains(&DType::I8),
         "DType::I8 must be in native_dtypes()"
     );
 
@@ -126,7 +126,7 @@ fn test_matmul_i8_i32_against_reference() {
 
     let node = matmul_node();
     let ctx = make_typed_ctx(&node, &a, &b);
-    let result = MatMulOp
+    let result = MatMulOp::default()
         .execute_typed(&ctx)
         .expect("execute_typed I8 failed");
 
@@ -153,7 +153,7 @@ fn test_matmul_i8_i32_2x3_3x2() {
 
     let node = matmul_node();
     let ctx = make_typed_ctx(&node, &a, &b);
-    let result = MatMulOp
+    let result = MatMulOp::default()
         .execute_typed(&ctx)
         .expect("execute_typed I8 2x3@3x2 failed");
 
@@ -174,7 +174,7 @@ fn test_matmul_i8_i32_2x3_3x2() {
 #[test]
 fn test_matmul_i32_i32() {
     assert!(
-        MatMulOp.native_dtypes().contains(&DType::I32),
+        MatMulOp::default().native_dtypes().contains(&DType::I32),
         "DType::I32 must be in native_dtypes()"
     );
 
@@ -184,7 +184,7 @@ fn test_matmul_i32_i32() {
 
     let node = matmul_node();
     let ctx = make_typed_ctx(&node, &a, &b);
-    let result = MatMulOp
+    let result = MatMulOp::default()
         .execute_typed(&ctx)
         .expect("execute_typed I32 failed");
 
@@ -205,7 +205,7 @@ fn test_matmul_i32_i32() {
 #[test]
 fn test_matmul_f16_numerical_parity() {
     assert!(
-        MatMulOp.native_dtypes().contains(&DType::F16),
+        MatMulOp::default().native_dtypes().contains(&DType::F16),
         "DType::F16 must be in native_dtypes()"
     );
 
@@ -223,7 +223,7 @@ fn test_matmul_f16_numerical_parity() {
 
     let node = matmul_node();
     let ctx = make_typed_ctx(&node, &a, &b);
-    let result = MatMulOp
+    let result = MatMulOp::default()
         .execute_typed(&ctx)
         .expect("execute_typed F16 failed");
 
@@ -252,7 +252,7 @@ fn test_matmul_f16_numerical_parity() {
 #[test]
 fn test_matmul_bf16_numerical_parity() {
     assert!(
-        MatMulOp.native_dtypes().contains(&DType::BF16),
+        MatMulOp::default().native_dtypes().contains(&DType::BF16),
         "DType::BF16 must be in native_dtypes()"
     );
 
@@ -270,7 +270,7 @@ fn test_matmul_bf16_numerical_parity() {
 
     let node = matmul_node();
     let ctx = make_typed_ctx(&node, &a, &b);
-    let result = MatMulOp
+    let result = MatMulOp::default()
         .execute_typed(&ctx)
         .expect("execute_typed BF16 failed");
 
@@ -298,7 +298,7 @@ fn test_matmul_bf16_numerical_parity() {
 /// All declared native_dtypes are present.
 #[test]
 fn test_native_dtypes_coverage() {
-    let dtypes = MatMulOp.native_dtypes();
+    let dtypes = MatMulOp::default().native_dtypes();
     for &expected in &[DType::F32, DType::F16, DType::BF16, DType::I8, DType::I32] {
         assert!(
             dtypes.contains(&expected),
@@ -321,7 +321,7 @@ fn test_matmul_i8_batched() {
 
     let node = matmul_node();
     let ctx = make_typed_ctx(&node, &a, &b);
-    let result = MatMulOp
+    let result = MatMulOp::default()
         .execute_typed(&ctx)
         .expect("batched I8 matmul failed");
 

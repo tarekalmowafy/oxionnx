@@ -13,6 +13,8 @@ pub(crate) mod conv_typed;
 pub mod dsp;
 pub mod einsum;
 pub mod flash;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod gemm_packed;
 pub mod indexing;
 pub mod kv_cache;
 pub mod math;

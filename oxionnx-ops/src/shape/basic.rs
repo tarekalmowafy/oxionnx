@@ -144,19 +144,13 @@ pub fn flatten(x: &Tensor, axis: i64) -> Result<Tensor, String> {
 
 /// Transpose according to a permutation. If perm is empty, reverses all dims.
 pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
-    // Row-major (C-order) strides for `shape`: `strides[i] = prod(shape[i+1..])`.
-    // Nested inside `transpose` (the only op owned in this file) rather than a
-    // file-scope item shared with the rest of `basic.rs`.
-    fn row_major_strides(shape: &[usize]) -> Vec<usize> {
-        let mut strides = vec![0usize; shape.len()];
-        let mut s = 1usize;
-        for i in (0..shape.len()).rev() {
-            strides[i] = s;
-            s *= shape[i];
-        }
-        strides
-    }
+    let mut out = Vec::new();
+    let out_shape = transpose_into(x, perm, &mut out)?;
+    Ok(Tensor::new(out, out_shape))
+}
 
+/// [`transpose`] writing into `out` (resized to fit); returns the output shape.
+pub fn transpose_into(x: &Tensor, perm: &[usize], out: &mut Vec<f32>) -> Result<Vec<usize>, String> {
     let ndim = x.ndim();
     let perm: Vec<usize> = if perm.is_empty() {
         (0..ndim).rev().collect()
@@ -195,12 +189,12 @@ pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
     // of `x.shape`, so this is exactly `out_shape.iter().product()`. For a well-formed
     // tensor (the overwhelming common case) it is the same number as before.
     let shape_numel: usize = x.shape.iter().product();
-    let mut out = vec![0.0f32; shape_numel];
+    out.resize(shape_numel, 0.0);
     // A zero-size dimension anywhere makes `shape_numel == 0`: bail out before any of the
     // stride/division math below, which otherwise risks a `0 / 0` (the trailing-run length
     // can itself be 0 when a size-0 axis lands in the "run"). Nothing to move either way.
     if shape_numel == 0 {
-        return Ok(Tensor::new(out, out_shape));
+        return Ok(out_shape);
     }
     // The opposite invariant violation -- a buffer *shorter* than the shape describes -- has
     // no correct transpose: some source element the output requires does not exist. Both the
@@ -214,111 +208,10 @@ pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
         ));
     }
 
-    let in_strides = row_major_strides(&x.shape);
-
-    // Fast path: every leading axis is untouched (`perm[i] == i`) and only the
-    // trailing two axes are swapped -- e.g. plain 2D transpose (`[1,0]`), or
-    // the attention `K^T` pattern at any batch rank (`[...,S,D] -> [...,D,S]`,
-    // perm `[0,1,3,2]`). Each of the `batch = prod(shape[..ndim-2])` leading
-    // combinations is then an independent 2D transpose of a contiguous
-    // `[rows, cols]` plane.
-    //
-    // That inner 2D transpose is tiled into 16x16 blocks rather than walked as
-    // one `rows`-times-`cols` double loop: measured against the untiled loop,
-    // a plain double loop is a *regression* (down to ~0.7-0.9x the original
-    // div/mod code) whenever `rows` lands on an unlucky power-of-two-ish
-    // stride (512, 768, 2048 -- exactly the hidden sizes real transformer
-    // shapes use), because every inner-loop write jumps `rows` elements and
-    // aliases the same cache sets. Tiling keeps each block's scatter writes
-    // confined to a few dozen cache lines; measured speedup with 16x16 tiles
-    // ranged 1.0x-18x across a set of representative shapes (square, tall,
-    // wide, power-of-two and not), with no observed regression versus the
-    // original code.
-    let is_trailing_swap = ndim >= 2
-        && perm[..ndim - 2].iter().enumerate().all(|(i, &p)| p == i)
-        && perm[ndim - 2] == ndim - 1
-        && perm[ndim - 1] == ndim - 2;
-    if is_trailing_swap {
-        const BLOCK: usize = 16;
-        let rows = x.shape[ndim - 2];
-        let cols = x.shape[ndim - 1];
-        let plane = rows * cols;
-        // Prototype (onnx_spike): planes are independent -> transpose them in parallel.
-        crate::par::for_each_row(&mut out[..], plane, |b, dst| {
-            let base = b * plane;
-            let mut bi = 0;
-            while bi < rows {
-                let i_end = (bi + BLOCK).min(rows);
-                let mut bj = 0;
-                while bj < cols {
-                    let j_end = (bj + BLOCK).min(cols);
-                    for i in bi..i_end {
-                        let row = &x.data[base + i * cols + bj..base + i * cols + j_end];
-                        for (jj, &v) in row.iter().enumerate() {
-                            dst[(bj + jj) * rows + i] = v;
-                        }
-                    }
-                    bj = j_end;
-                }
-                bi = i_end;
-            }
-        });
-        return Ok(Tensor::new(out, out_shape));
-    }
-
-    // General path: no division anywhere. First, find the longest suffix of
-    // axes left untouched by `perm` (`perm[i] == i`) -- input and output store
-    // that suffix with the same shape in the same order, so it is one
-    // contiguous block in both tensors and can be moved with a single
-    // `copy_from_slice` per outer step instead of walked element by element
-    // (this is what turns the `[1,512,12,64] -> [1,12,512,64]` attention
-    // permute, `perm = [0,2,1,3]`, into 6144 64-element `copy_from_slice`
-    // calls instead of 393216 individually-divided element copies).
-    let mut run = 0usize;
-    while run < ndim && perm[ndim - 1 - run] == ndim - 1 - run {
-        run += 1;
-    }
-    let run_len: usize = x.shape[ndim - run..].iter().product();
-    let outer_ndim = ndim - run;
-    if outer_ndim == 0 {
-        // `perm` is the identity permutation (or `ndim == 0`): the whole
-        // tensor is one contiguous run.
-        out.copy_from_slice(&x.data);
-        return Ok(Tensor::new(out, out_shape));
-    }
-
-    // The remaining `outer_ndim` axes are walked with an increment-and-carry
-    // odometer: `in_off`/`out_off` are updated by addition/subtraction only as
-    // each coordinate ticks over, never recomputed from scratch by dividing
-    // the flat index against a stride.
-    let out_strides = row_major_strides(&out_shape);
-    let mut coord = vec![0usize; outer_ndim];
-    let mut in_off = 0usize;
-    let mut out_off = 0usize;
-    // The odometer's cycle length is the shape product -- driving it from `x.data.len()`
-    // instead (as this did before) would run extra laps for an over-long buffer, re-walking
-    // the same valid output range with wrapped source data and leaving a last-write-wins
-    // result decided by the final lap rather than the first. This is the same invariant gap
-    // `reduce_with_into`'s `.take(shape_numel)` and `shape_bounded_data`'s `.min(data.len())`
-    // in `math/reduce.rs` were hardened against. `run_len` cannot be 0 here: it is a product
-    // of a suffix of `x.shape`, so a 0 in it would have forced `shape_numel == 0` and taken
-    // the early return above.
-    let n_outer = shape_numel / run_len;
-    for _ in 0..n_outer {
-        out[out_off..out_off + run_len].copy_from_slice(&x.data[in_off..in_off + run_len]);
-        for axis in (0..outer_ndim).rev() {
-            coord[axis] += 1;
-            in_off += in_strides[perm[axis]];
-            out_off += out_strides[axis];
-            if coord[axis] < out_shape[axis] {
-                break;
-            }
-            in_off -= coord[axis] * in_strides[perm[axis]];
-            out_off -= coord[axis] * out_strides[axis];
-            coord[axis] = 0;
-        }
-    }
-    Ok(Tensor::new(out, out_shape))
+    // Prototype (onnx_spike): coalescing, cache-blocked, parallel kernel for every
+    // permutation (replaces the trailing-swap fast path and the serial odometer).
+    super::transpose_fast::transpose_into(&x.data[..shape_numel], &x.shape, &perm, &mut out[..]);
+    Ok(out_shape)
 }
 
 /// Resolve the output shape for Squeeze: drop the given (possibly negative) axes, provided

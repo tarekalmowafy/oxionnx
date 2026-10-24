@@ -313,8 +313,11 @@ pub(crate) fn softmax_into(x: &Tensor, axis: i64, out: &mut [f32]) -> Result<(),
             // kernel normalizes each axis-length chunk in place); the
             // general path below reads `x.data` through a small gather
             // buffer and never needs a whole-tensor copy.
-            out.copy_from_slice(&x.data);
-            crate::simd_ops::simd_softmax_strided(out, axis_len);
+            // Prototype (onnx_spike): rows in parallel, copy fused into each task.
+            crate::par::for_each_row(out, axis_len, |r, row| {
+                row.copy_from_slice(&x.data[r * axis_len..(r + 1) * axis_len]);
+                crate::simd_ops::simd_softmax_strided(row, axis_len);
+            });
             return Ok(());
         }
     }

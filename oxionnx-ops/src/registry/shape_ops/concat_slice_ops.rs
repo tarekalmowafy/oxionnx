@@ -212,29 +212,24 @@ impl Operator for SplitOp {
         "Split"
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+        // Prototype (onnx_spike): same parallel span-copy kernel as the slot path
+        // (used when the output shapes were not statically resolved).
         let x = ctx.input(0)?;
         let attrs = ctx.attrs();
-        let axis = attrs.i("axis", 0);
-        let ndim = x.ndim();
-        // Bounds-checked up front: previously this indexed `x.shape[ax_u]` below with no range
-        // check (unlike `execute_into_slots`), so an out-of-range `axis` attribute panicked
-        // here instead of returning a typed error.
-        let ax_u = normalize_axis(axis, ndim).map_err(OnnxError::ShapeMismatch)?;
+        let ax_u = normalize_axis(attrs.i("axis", 0), x.ndim()).map_err(OnnxError::ShapeMismatch)?;
         let num_outputs = ctx.node.outputs.len().max(1);
-        let split_attr = attrs.ints("split");
-        let split_sizes: Vec<usize> = if let Some(t) = ctx.optional_input(1) {
-            t.data.iter().map(|&v| v as usize).collect()
-        } else if !split_attr.is_empty() {
-            split_attr.iter().map(|&v| v as usize).collect()
+        let n_chunks = if let Some(t) = ctx.optional_input(1) {
+            t.data.len()
+        } else if !attrs.ints("split").is_empty() {
+            attrs.ints("split").len()
         } else if attrs.i("num_outputs", 0) > 0 {
-            equal_split(
-                x.shape[ax_u],
-                attrs.i("num_outputs", num_outputs as i64) as usize,
-            )
+            equal_split(x.shape[ax_u], attrs.i("num_outputs", num_outputs as i64) as usize).len()
         } else {
-            equal_split(x.shape[ax_u], num_outputs)
+            num_outputs
         };
-        Ok(shape::split(x, axis, &split_sizes)?)
+        let mut slots: Vec<Tensor> = (0..n_chunks.max(1)).map(|_| Tensor::new(Vec::new(), Vec::new())).collect();
+        self.execute_into_slots(ctx, &mut slots)?;
+        Ok(slots)
     }
     fn supports_output_slots(&self) -> bool {
         true

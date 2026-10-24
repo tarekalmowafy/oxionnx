@@ -8,6 +8,7 @@
 pub mod basic;
 pub mod sequence;
 pub mod spatial;
+mod transpose_fast;
 
 #[cfg(test)]
 #[path = "tests.rs"]

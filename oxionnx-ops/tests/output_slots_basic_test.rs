@@ -246,14 +246,14 @@ fn test_reduce_mean_supports_output_slots() {
 
 #[test]
 fn test_matmul_supports_output_slots() {
-    assert!(MatMulOp.supports_output_slots());
+    assert!(MatMulOp::default().supports_output_slots());
     let node = dummy_node(OpKind::MatMul);
     let a = Tensor::new(vec![1.0_f32, 2.0, 3.0, 4.0], vec![2, 2]);
     let b = Tensor::new(vec![5.0_f32, 6.0, 7.0, 8.0], vec![2, 2]);
     let ctx = make_ctx(&node, vec![Some(&a), Some(&b)]);
-    let expected = MatMulOp.execute(&ctx).expect("MatMul execute failed");
+    let expected = MatMulOp::default().execute(&ctx).expect("MatMul execute failed");
     let mut slots = vec![Tensor::new(vec![0.0_f32; 4], vec![2, 2])];
-    MatMulOp
+    MatMulOp::default()
         .execute_into_slots(&ctx, &mut slots)
         .expect("MatMul execute_into_slots failed");
     assert_tensor_eq(&slots[0], &expected[0], "matmul slot correctness");

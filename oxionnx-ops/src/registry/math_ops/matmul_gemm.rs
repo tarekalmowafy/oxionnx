@@ -6,7 +6,57 @@ use crate::math;
 
 // ── MatMul ──────────────────────────────────────────────────────────────────
 
-pub struct MatMulOp;
+/// `cache` (prototype, onnx_spike): constant weights (B inputs that are session
+/// initializers) packed once for [`crate::gemm_packed`], keyed by the weight's
+/// data pointer. The registry, and therefore this cache, is per session, and
+/// session weights are immutable while it lives.
+#[derive(Default)]
+pub struct MatMulOp {
+    #[cfg(target_arch = "x86_64")]
+    cache: std::sync::RwLock<std::collections::HashMap<usize, std::sync::Arc<crate::gemm_packed::PackedB>>>,
+}
+
+impl MatMulOp {
+    /// Packed-weight fast path: f32, B 2-D and a session weight, AVX2+FMA.
+    /// Returns the output shape, or `None` to use the generic kernel.
+    #[cfg(target_arch = "x86_64")]
+    fn try_packed(&self, ctx: &OpContext<'_>, a: &Tensor, b: &Tensor, out: &mut Vec<f32>) -> Option<Vec<usize>> {
+        use crate::gemm_packed::{self, PackedB};
+        if b.ndim() != 2 || a.ndim() < 2 || !gemm_packed::available() {
+            return None;
+        }
+        let w = ctx.weights?.get(ctx.node.inputs.get(1)?)?;
+        if !std::ptr::eq(w, b) {
+            return None;
+        }
+        let (k, n) = (b.shape[0], b.shape[1]);
+        if a.shape[a.ndim() - 1] != k {
+            return None;
+        }
+        let key = b.data.as_ptr() as usize;
+        let cached = self.cache.read().ok()?.get(&key).cloned();
+        let packed = match cached {
+            Some(p) if p.k == k && p.n == n => p,
+            _ => {
+                let p = std::sync::Arc::new(PackedB::pack(&b.data, k, n));
+                self.cache.write().ok()?.insert(key, p.clone());
+                p
+            }
+        };
+        let m = a.data.len() / k.max(1);
+        out.resize(m * n, 0.0);
+        gemm_packed::gemm(m, &a.data, &packed, &mut out[..], crate::par::threads());
+        let mut shape = a.shape.clone();
+        *shape.last_mut()? = n;
+        Some(shape)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn try_packed(&self, _: &OpContext<'_>, _: &Tensor, _: &Tensor, _: &mut Vec<f32>) -> Option<Vec<usize>> {
+        None
+    }
+}
+
 impl Operator for MatMulOp {
     fn op_type(&self) -> &str {
         "MatMul"
@@ -14,6 +64,10 @@ impl Operator for MatMulOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let a = ctx.input(0)?;
         let b = ctx.input(1)?;
+        let mut out = Vec::new();
+        if let Some(shape) = self.try_packed(ctx, a, b, &mut out) {
+            return Ok(vec![Tensor::new(out, shape)]);
+        }
         Ok(vec![math::matmul(a, b)?])
     }
     fn supports_output_slots(&self) -> bool {
@@ -30,8 +84,10 @@ impl Operator for MatMulOp {
         let slot = slots
             .first_mut()
             .ok_or_else(|| OnnxError::InvalidModel("MatMul: no output slot provided".into()))?;
-        let out_shape =
-            math::matmul_into(a, b, &mut slot.data).map_err(OnnxError::ShapeMismatch)?;
+        let out_shape = match self.try_packed(ctx, a, b, &mut slot.data) {
+            Some(shape) => shape,
+            None => math::matmul_into(a, b, &mut slot.data).map_err(OnnxError::ShapeMismatch)?,
+        };
         slot.shape = out_shape;
         Ok(())
     }

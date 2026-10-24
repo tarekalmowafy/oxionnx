@@ -355,7 +355,7 @@ macro_rules! binary_op_inplace {
             fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
                 // Prototype: same row-wise broadcast kernel as the slot path (used when
                 // the output shape was not statically resolved).
-                let f: fn(f32, f32) -> f32 = $inplace_fn;
+                let f = crate::math::binary_fn($inplace_fn);
                 let mut out = Tensor::new(Vec::new(), Vec::new());
                 crate::math::binary_into(ctx.input(0)?, ctx.input(1)?, &mut out, f)?;
                 Ok(vec![out])
@@ -369,7 +369,7 @@ macro_rules! binary_op_inplace {
                 ctx: &OpContext<'_>,
             ) -> Result<Vec<Tensor>, OnnxError> {
                 let other = ctx.input(1)?;
-                let f: fn(f32, f32) -> f32 = $inplace_fn;
+                let f = crate::math::binary_fn($inplace_fn);
                 // Prototype: broadcast in place whenever the output has `input`'s shape.
                 if crate::math::binary_inplace(&mut input, other, f)? {
                     return Ok(vec![input]);
@@ -419,7 +419,7 @@ macro_rules! binary_op_inplace {
                 let a = ctx.input(0)?;
                 let b = ctx.input(1)?;
                 // Prototype: row-wise broadcast kernel writing straight into the slot.
-                let f: fn(f32, f32) -> f32 = $inplace_fn;
+                let f = crate::math::binary_fn($inplace_fn);
                 crate::math::binary_into(a, b, &mut slots[0], f)?;
                 Ok(())
             }

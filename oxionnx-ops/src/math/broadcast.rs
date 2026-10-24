@@ -384,7 +384,7 @@ impl RowPlan {
 }
 
 #[inline(always)]
-fn binary_row(dst: &mut [f32], a: &[f32], a_unit: bool, b: &[f32], b_unit: bool, f: fn(f32, f32) -> f32) {
+fn binary_row<F: Fn(f32, f32) -> f32>(dst: &mut [f32], a: &[f32], a_unit: bool, b: &[f32], b_unit: bool, f: F) {
     match (a_unit, b_unit) {
         (true, true) => dst.iter_mut().zip(a.iter().zip(b)).for_each(|(d, (&x, &y))| *d = f(x, y)),
         (true, false) => {
@@ -422,9 +422,20 @@ fn for_segments(plan: &RowPlan, pos: usize, dst: &mut [f32], mut seg: impl FnMut
 /// so a single huge row still spreads across threads).
 const CHUNK: usize = 16 * 1024;
 
+/// Binary elementwise op usable by the kernels below. Generic (not a `fn`
+/// pointer) so the op is inlined and each row segment vectorizes.
+pub(crate) trait BinaryFn: Fn(f32, f32) -> f32 + Copy + Send + Sync {}
+impl<F: Fn(f32, f32) -> f32 + Copy + Send + Sync> BinaryFn for F {}
+
+/// Pins a closure literal's signature to `(f32, f32) -> f32` (for the op macros).
+#[inline(always)]
+pub(crate) fn binary_fn<F: BinaryFn>(f: F) -> F {
+    f
+}
+
 /// `out = a op b` with ONNX broadcasting, written straight into `out` (resized
 /// as needed), vectorizable per row segment and parallel for large outputs.
-pub(crate) fn binary_into(a: &Tensor, b: &Tensor, out: &mut Tensor, f: fn(f32, f32) -> f32) -> Result<(), String> {
+pub(crate) fn binary_into(a: &Tensor, b: &Tensor, out: &mut Tensor, f: impl BinaryFn) -> Result<(), String> {
     let out_shape = Tensor::broadcast_shape(&a.shape, &b.shape)?;
     let numel: usize = out_shape.iter().product();
     out.data.resize(numel, 0.0);
@@ -443,7 +454,7 @@ pub(crate) fn binary_into(a: &Tensor, b: &Tensor, out: &mut Tensor, f: fn(f32, f
 
 /// In-place `a = a op b` when the broadcast output shape equals `a`'s shape.
 /// Returns `false` (leaving `a` untouched) when it does not.
-pub(crate) fn binary_inplace(a: &mut Tensor, b: &Tensor, f: fn(f32, f32) -> f32) -> Result<bool, String> {
+pub(crate) fn binary_inplace(a: &mut Tensor, b: &Tensor, f: impl BinaryFn) -> Result<bool, String> {
     let out_shape = Tensor::broadcast_shape(&a.shape, &b.shape)?;
     if out_shape != a.shape {
         return Ok(false);

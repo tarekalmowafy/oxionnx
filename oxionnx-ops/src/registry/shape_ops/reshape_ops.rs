@@ -131,6 +131,25 @@ impl Operator for TransposeOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+    /// Prototype (onnx_spike): permute straight into the slot.
+    fn execute_into_slots(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
+        let x = ctx.input(0)?;
+        let ndim = x.ndim();
+        let mut perm = Vec::with_capacity(ndim);
+        for &v in ctx.attrs().ints("perm") {
+            if v < 0 || v >= ndim as i64 {
+                return Err(OnnxError::ShapeMismatch(format!(
+                    "Transpose: perm entry {v} out of range for {ndim}D tensor"
+                )));
+            }
+            perm.push(v as usize);
+        }
+        let slot = slots
+            .first_mut()
+            .ok_or_else(|| OnnxError::Internal("Transpose: no output slot".into()))?;
+        slot.shape = crate::shape::basic::transpose_into(x, &perm, &mut slot.data)?;
+        Ok(())
+    }
 }
 
 // ── Squeeze ──────────────────────────────────────────────────────────────────
