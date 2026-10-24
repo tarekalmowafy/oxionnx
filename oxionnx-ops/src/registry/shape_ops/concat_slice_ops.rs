@@ -227,7 +227,7 @@ impl Operator for SplitOp {
         } else {
             num_outputs
         };
-        let mut slots: Vec<Tensor> = (0..n_chunks.max(1)).map(|_| Tensor::new(Vec::new(), Vec::new())).collect();
+        let mut slots: Vec<Tensor> = (0..n_chunks.max(1)).map(|_| Tensor { data: Vec::new(), shape: Vec::new() }).collect();
         self.execute_into_slots(ctx, &mut slots)?;
         Ok(slots)
     }
