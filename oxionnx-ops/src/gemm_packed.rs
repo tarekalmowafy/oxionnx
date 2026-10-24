@@ -74,6 +74,17 @@ impl PackedB {
 
     pub fn pack_for(isa: Isa, b: &[f32], k: usize, n: usize) -> Self {
         assert_eq!(b.len(), k * n);
+        Self::pack_strided_for(isa, b, k, n, n, 1)
+    }
+
+    /// Pack the `k x n` matrix with `B[p, j] = b[p * rs + j * cs]` (e.g. `rs = 1,
+    /// cs = ld` packs the transpose of a row-major `n x k` matrix with row stride `ld`).
+    pub fn pack_strided(b: &[f32], k: usize, n: usize, rs: usize, cs: usize) -> Self {
+        Self::pack_strided_for(isa().expect("gemm_packed: no AVX2/AVX-512"), b, k, n, rs, cs)
+    }
+
+    pub fn pack_strided_for(isa: Isa, b: &[f32], k: usize, n: usize, rs: usize, cs: usize) -> Self {
+        assert!(k == 0 || n == 0 || (k - 1) * rs + (n - 1) * cs < b.len());
         let nr = isa.tile().1;
         let panels = n.div_ceil(nr);
         let len = k * panels * nr;
@@ -87,9 +98,19 @@ impl PackedB {
                 let j0 = j * nr;
                 let nb = nr.min(n - j0);
                 let panel = &mut dst[base + j * kc * nr..base + (j + 1) * kc * nr];
-                for p in 0..kc {
-                    let src = &b[(k0 + p) * n + j0..(k0 + p) * n + j0 + nb];
-                    panel[p * nr..p * nr + nb].copy_from_slice(src);
+                if cs == 1 {
+                    for p in 0..kc {
+                        let src = &b[(k0 + p) * rs + j0..(k0 + p) * rs + j0 + nb];
+                        panel[p * nr..p * nr + nb].copy_from_slice(src);
+                    }
+                } else {
+                    // Transposed source: walk each source column contiguously.
+                    for jj in 0..nb {
+                        let col = (j0 + jj) * cs;
+                        for p in 0..kc {
+                            panel[p * nr + jj] = b[(k0 + p) * rs + col];
+                        }
+                    }
                 }
             }
             base += kc * panels * nr;
@@ -148,6 +169,29 @@ pub fn gemm(m: usize, a: &[f32], b: &PackedB, c: &mut [f32], threads: usize) {
         (0..total).for_each(run);
     } else {
         (0..total).into_par_iter().for_each(run);
+    }
+}
+
+/// Single-threaded `C[m, n] = A[m, k] @ B` with row strides `lda` / `ldc`.
+///
+/// # Safety
+/// `a` must be valid for `m` rows of `b.k` elements at stride `lda`, `c` for `m`
+/// rows of `b.n` elements at stride `ldc`, and `b` packed for this CPU.
+pub unsafe fn gemm_strided_serial(m: usize, a: *const f32, lda: usize, b: &PackedB, c: *mut f32, ldc: usize) {
+    if m == 0 || b.n == 0 {
+        return;
+    }
+    if b.k == 0 {
+        for i in 0..m {
+            std::slice::from_raw_parts_mut(c.add(i * ldc), b.n).fill(0.0);
+        }
+        return;
+    }
+    let mut i0 = 0;
+    while i0 < m {
+        let mb = MC.min(m - i0);
+        tile(a.add(i0 * lda), lda, mb, b, 0, b.panels, c.add(i0 * ldc), ldc);
+        i0 += mb;
     }
 }
 

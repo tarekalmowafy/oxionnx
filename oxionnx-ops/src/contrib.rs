@@ -12,6 +12,9 @@
 
 #![allow(unsafe_code)]
 
+#[cfg(target_arch = "x86_64")]
+use crate::gemm_packed::PackedB;
+
 /// Raw output pointer shared by tasks that write disjoint regions.
 #[derive(Clone, Copy)]
 struct SendPtr(*mut f32);
@@ -342,6 +345,27 @@ pub fn attention_into(
     let blocks = (4 * t).div_ceil(n_bh).clamp(1, seq_q.div_ceil(8).max(1));
     let rows_per = seq_q.div_ceil(blocks).clamp(1, 64);
     let blocks = seq_q.div_ceil(rows_per);
+    // x86: pack Kᵀ and V once per (batch, KV head) for the packed AVX-512/AVX2
+    // GEMM, reused by the R query heads of the group and all their row blocks.
+    #[cfg(target_arch = "x86_64")]
+    let packs: Option<Vec<(PackedB, PackedB)>> = crate::gemm_packed::available().then(|| {
+        let pack = |bg: usize| {
+            let (b, g) = (bg / kv_heads, bg % kv_heads);
+            let base = b * seq_kv * krs + g * head_dim;
+            (
+                PackedB::pack_strided(&k[base..], head_dim, seq_kv, 1, krs),
+                PackedB::pack_strided(&v[base..], seq_kv, head_dim, krs, 1),
+            )
+        };
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+        if t > 1 && batch * kv_heads > 1 {
+            use rayon::prelude::*;
+            return (0..batch * kv_heads).into_par_iter().map(pack).collect();
+        }
+        (0..batch * kv_heads).map(pack).collect()
+    });
+    #[cfg(not(target_arch = "x86_64"))]
+    let packs: Option<Vec<()>> = None;
     let op = SendPtr(out.as_mut_ptr());
     let work = |task: usize, scores: &mut Vec<f32>| {
         let op = op;
@@ -354,18 +378,31 @@ pub fn attention_into(
         let qp = q[(b * seq_q + s0) * qrs + h * head_dim..].as_ptr();
         let kp = k[b * seq_kv * krs + g * head_dim..].as_ptr();
         let vp = v[b * seq_kv * krs + g * head_dim..].as_ptr();
+        let pk = packs.as_ref().map(|p| &p[b * kv_heads + g]);
         // SAFETY: strides stay inside q/k/v (checked sizes above); every task
         // writes rows s0..s0+m of head h only.
-        unsafe {
-            // scores[m, T] = scale * Q[m, D] · K[T, D]ᵀ
-            matrixmultiply::sgemm(
-                m, head_dim, seq_kv, scale,
-                qp, qrs as isize, 1,
-                kp, 1, krs as isize,
-                0.0, scores.as_mut_ptr(), seq_kv as isize, 1,
-            );
+        let mut row_scale = scale;
+        match pk {
+            #[cfg(target_arch = "x86_64")]
+            Some((kt, _)) => unsafe {
+                // scores[m, T] = Q[m, D] · Kᵀ; `scale` is applied with the bias below.
+                crate::gemm_packed::gemm_strided_serial(m, qp, qrs, kt, scores.as_mut_ptr(), seq_kv);
+            },
+            _ => unsafe {
+                // scores[m, T] = scale * Q[m, D] · K[T, D]ᵀ
+                row_scale = 1.0;
+                matrixmultiply::sgemm(
+                    m, head_dim, seq_kv, scale,
+                    qp, qrs as isize, 1,
+                    kp, 1, krs as isize,
+                    0.0, scores.as_mut_ptr(), seq_kv as isize, 1,
+                );
+            },
         }
         for (i, row) in scores.chunks_mut(seq_kv).enumerate() {
+            if row_scale != 1.0 {
+                row.iter_mut().for_each(|x| *x *= row_scale);
+            }
             if let Some(bb) = bias {
                 let [sb, sg, sr, ss, st] = bb.strides;
                 let base = b * sb + g * sg + r * sr + (s0 + i) * ss;
@@ -381,14 +418,21 @@ pub fn attention_into(
             }
             softmax_row(row);
         }
-        unsafe {
-            // out[m, D] = P[m, T] · V[T, D]
-            matrixmultiply::sgemm(
-                m, seq_kv, head_dim, 1.0,
-                scores.as_ptr(), seq_kv as isize, 1,
-                vp, krs as isize, 1,
-                0.0, op.0.add((b * seq_q + s0) * qrs + h * head_dim), qrs as isize, 1,
-            );
+        let dst = unsafe { op.0.add((b * seq_q + s0) * qrs + h * head_dim) };
+        match pk {
+            #[cfg(target_arch = "x86_64")]
+            Some((_, vp)) => unsafe {
+                // out[m, D] = P[m, T] · V[T, D]
+                crate::gemm_packed::gemm_strided_serial(m, scores.as_ptr(), seq_kv, vp, dst, qrs);
+            },
+            _ => unsafe {
+                matrixmultiply::sgemm(
+                    m, seq_kv, head_dim, 1.0,
+                    scores.as_ptr(), seq_kv as isize, 1,
+                    vp, krs as isize, 1,
+                    0.0, dst, qrs as isize, 1,
+                );
+            },
         }
     };
     let tasks = n_bh * blocks;
