@@ -119,10 +119,18 @@ impl SizeClassPool {
     pub fn acquire_for_overwrite(&mut self, size: usize) -> Vec<f32> {
         let class = bucket_for(size);
         let bucket = self.bucket_mut(class);
-        let best_idx = Self::best_fit_index(bucket, size);
-        let found = match best_idx {
-            Some(idx) => Some((class, idx)),
-            None => self.find_in_larger_buckets(class, size),
+        // Prototype (onnx_spike): prefer a buffer whose *length* already covers
+        // `size` (no tail to zero) among those at most 2x too big, then best fit.
+        let best_idx = Self::no_zeroing_fit_index(bucket, size).or_else(|| Self::best_fit_index(bucket, size));
+        // Prototype (onnx_spike): an exact-length buffer anywhere in the pool needs
+        // no zeroing at all; in steady state every run repeats the same sizes.
+        let exact = [SizeClass::Tiny, SizeClass::Small, SizeClass::Medium, SizeClass::Large]
+            .into_iter()
+            .find_map(|c| self.bucket_mut(c).iter().position(|b| b.len() == size).map(|i| (c, i)));
+        let found = match (exact, best_idx) {
+            (Some(hit), _) => Some(hit),
+            (None, Some(idx)) => Some((class, idx)),
+            (None, None) => self.find_in_larger_buckets(class, size),
         };
         match found {
             Some((found_class, idx)) => {
@@ -229,6 +237,21 @@ impl SizeClassPool {
         }
     }
     /// Find the index of the smallest buffer with capacity >= `size` in a bucket.
+    /// Buffer needing the least zero-filling for `size`: the first with `size <= len`
+    /// and `capacity <= 4 * size`, else the one with the longest `len` among those
+    /// with enough capacity (the bucket is sorted by capacity).
+    fn no_zeroing_fit_index(bucket: &[Vec<f32>], size: usize) -> Option<usize> {
+        let start = bucket.partition_point(|b| b.capacity() < size);
+        let cands = &bucket[start..];
+        if let Some(i) = cands
+            .iter()
+            .take_while(|b| b.capacity() <= size.saturating_mul(4))
+            .position(|b| b.len() >= size)
+        {
+            return Some(start + i);
+        }
+        cands.iter().enumerate().max_by_key(|(_, b)| b.len().min(size)).map(|(i, _)| start + i)
+    }
     fn best_fit_index(bucket: &[Vec<f32>], size: usize) -> Option<usize> {
         let pos = bucket.partition_point(|b| b.capacity() < size);
         if pos < bucket.len() {

@@ -34,7 +34,10 @@ impl Session {
         let can_slot = !can_inplace && operator.supports_output_slots();
 
         if can_slot {
-            if let Some(mut slots) = Self::acquire_output_slots(node, resolved_shapes, pool) {
+            let t_acq = std::time::Instant::now();
+            let acquired = Self::acquire_output_slots(node, resolved_shapes, pool);
+            phase_timers::add(&phase_timers::ACQUIRE, t_acq.elapsed());
+            if let Some(mut slots) = acquired {
                 let resolved_inputs: Vec<Option<&Tensor>> = node
                     .inputs
                     .iter()
@@ -53,6 +56,7 @@ impl Session {
                     weights: Some(&self.weights),
                     registry: Some(&self.registry),
                 };
+                trace_path(node, "slot");
                 let start = crate::time_compat::Instant::now();
                 operator.execute_into_slots(&ctx, &mut slots)?;
                 let elapsed = start.elapsed();
@@ -66,6 +70,7 @@ impl Session {
             // Fall through to normal path if not all shapes known
         }
 
+        trace_path(node, if can_inplace { "inplace" } else if can_slot { "execute(shapes unknown)" } else { "execute" });
         let start = crate::time_compat::Instant::now();
 
         let results = if can_inplace {
@@ -118,6 +123,13 @@ impl Session {
         };
 
         let elapsed = start.elapsed();
+        if can_slot && shape_depends_only_on_input_shapes(node, &self.weights) {
+            for (out_name, tensor) in node.outputs.iter().zip(&results) {
+                if !out_name.is_empty() && !resolved_shapes.contains_key(out_name) {
+                    state.learn_shape(out_name, &tensor.shape);
+                }
+            }
+        }
         for (out_name, tensor) in node.outputs.iter().zip(results) {
             if !out_name.is_empty() {
                 state.insert(out_name.clone(), tensor, pool);
@@ -245,7 +257,9 @@ impl Session {
             } else {
                 shape.iter().product()
             };
+            let overwrite = fully_writes_slot(node, slots.len());
             let data = match guard.as_mut() {
+                Some(pool_guard) if overwrite => pool_guard.acquire_for_overwrite(size),
                 Some(pool_guard) => pool_guard.acquire(size),
                 None => vec![0.0f32; size],
             };
@@ -1278,6 +1292,67 @@ mod tests {
             ),
             crate::execution_providers::ProviderKind::Cpu,
             "this is precisely the gap an explicit provider list buys the user",
+        );
+    }
+}
+
+/// Prototype (onnx_spike): stand-in for the `fully_writes_slots()` predicate the
+/// note on `acquire_output_slots` asks for. True for output `idx` of operators whose
+/// `execute_into_slots` was checked to write every element of that slot, so the
+/// pool can skip zero-filling a buffer the kernel overwrites anyway.
+fn fully_writes_slot(node: &Node, idx: usize) -> bool {
+    match node.op.as_str() {
+        "Split" => true,
+        "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "Concat" | "Transpose"
+        | "SimplifiedLayerNormalization" => idx == 0,
+        _ => false,
+    }
+}
+
+/// Prototype (onnx_spike) diagnostic: `OXIONNX_TRACE_PATHS=1` prints the dispatch path
+/// taken by every node to stderr.
+fn trace_path(node: &Node, path: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("OXIONNX_TRACE_PATHS").is_some()) {
+        eprintln!("oxionnx-path {} {}", node.op.as_str(), path);
+    }
+}
+
+/// Prototype (onnx_spike): ops whose output shapes are a function of their input
+/// *shapes* alone (not values), so a shape observed in one run holds for every
+/// later run with the same model-input shapes. Learned shapes only pre-size output
+/// slots; each of these kernels still sets its output shape itself.
+fn shape_depends_only_on_input_shapes(node: &Node, weights: &HashMap<String, Tensor>) -> bool {
+    match node.op.as_str() {
+        "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "Concat" | "Transpose"
+        | "SimplifiedLayerNormalization" => true,
+        // `split` sizes may come from a runtime tensor.
+        "Split" => node.inputs.get(1).is_none_or(|n| n.is_empty() || weights.contains_key(n)),
+        _ => false,
+    }
+}
+
+/// Prototype (onnx_spike) diagnostic: cumulative executor phase timers, printed per
+/// run when `OXIONNX_TRACE_TIMERS` is set.
+pub(crate) mod phase_timers {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub(crate) static ACQUIRE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static DISPATCH: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static KERNEL: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static RELEASE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static RUN: AtomicU64 = AtomicU64::new(0);
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("OXIONNX_TRACE_TIMERS").is_some())
+    }
+    pub(crate) fn add(c: &AtomicU64, d: std::time::Duration) {
+        c.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+    }
+    pub(crate) fn report() {
+        let ms = |c: &AtomicU64| c.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        eprintln!(
+            "oxionnx-timers run {:.1} ms: dispatch {:.1} (kernel {:.1}, acquire {:.1}), release {:.1}",
+            ms(&RUN), ms(&DISPATCH), ms(&KERNEL), ms(&ACQUIRE), ms(&RELEASE)
         );
     }
 }

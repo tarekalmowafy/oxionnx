@@ -14,6 +14,9 @@ use std::sync::Mutex;
 pub(crate) struct SessionRunState {
     /// Active intermediate tensors keyed by name.
     tensors: HashMap<String, Tensor>,
+    /// Prototype (onnx_spike): output shapes observed this run for nodes whose
+    /// shapes static inference could not resolve (see `Session::run_internal`).
+    learned_shapes: Vec<(String, Vec<usize>)>,
 }
 
 impl SessionRunState {
@@ -21,7 +24,18 @@ impl SessionRunState {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             tensors: HashMap::with_capacity(capacity),
+            learned_shapes: Vec::new(),
         }
+    }
+
+    /// Record an output shape observed at run time.
+    pub(crate) fn learn_shape(&mut self, name: &str, shape: &[usize]) {
+        self.learned_shapes.push((name.to_string(), shape.to_vec()));
+    }
+
+    /// Take the shapes recorded with [`Self::learn_shape`].
+    pub(crate) fn take_learned_shapes(&mut self) -> Vec<(String, Vec<usize>)> {
+        std::mem::take(&mut self.learned_shapes)
     }
 
     /// Look up a tensor by name (immutable).
