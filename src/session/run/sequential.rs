@@ -691,8 +691,11 @@ impl Session {
                 .get(op_name)
                 .ok_or_else(|| super::unsupported_op_error(node))?;
 
+            let t_disp = std::time::Instant::now();
             let elapsed =
                 self.dispatch_node(node, operator, state, ref_counts, output_set, resolved)?;
+            super::dispatch::phase_timers::add(&super::dispatch::phase_timers::DISPATCH, t_disp.elapsed());
+            super::dispatch::phase_timers::add(&super::dispatch::phase_timers::KERNEL, elapsed);
 
             // Mixed precision: round outputs to f16 for f16-safe ops without native f16 path.
             // This simulates f16 storage precision for ops that ran in f32.
@@ -718,7 +721,9 @@ impl Session {
                 }
             }
 
+            let t_rel = std::time::Instant::now();
             self.decrement_refs_state(node, state, ref_counts, output_set);
+            super::dispatch::phase_timers::add(&super::dispatch::phase_timers::RELEASE, t_rel.elapsed());
             // Released after a node that ran on the CPU too: "last consumer" is
             // a property of the graph, not of where the node executed.
             #[cfg(feature = "cuda")]

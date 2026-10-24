@@ -11,6 +11,7 @@ mod tests;
 
 // ── Broadcast & elementwise arithmetic ──────────────────────────────────────
 pub use broadcast::{add, broadcast_to, div, mul, neg, pow, reciprocal, sqrt, sub};
+pub(crate) use broadcast::{binary_fn, binary_inplace, binary_into};
 
 // ── Reductions ───────────────────────────────────────────────────────────────
 pub use reduce::{

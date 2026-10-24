@@ -17,6 +17,7 @@ impl Session {
         &self,
         inputs: &HashMap<&str, &Tensor>,
     ) -> Result<HashMap<String, Tensor>, OnnxError> {
+        let t_run = std::time::Instant::now();
         // Validate input shapes against model metadata (rank, static dims, symbolic consistency)
         if !self.input_infos.is_empty() {
             Self::validate_input_shapes(&self.input_infos, inputs)?;
@@ -77,8 +78,26 @@ impl Session {
             self.run_sequential_inner(&mut state, &mut ref_counts, &output_set, &resolved_shapes)?;
         }
 
+        // Prototype (onnx_spike): shapes static inference left unresolved, observed
+        // in this run, are added to this input signature's plan, so the next run with
+        // the same input shapes writes those nodes into pooled slots instead of fresh
+        // allocations (the analogue of ORT's per-shape memory pattern cache).
+        let learned = state.take_learned_shapes();
+        if !learned.is_empty() {
+            let input_shapes: HashMap<String, Vec<usize>> =
+                inputs.iter().map(|(name, t)| ((*name).to_string(), t.shape.clone())).collect();
+            let mut plan = (*resolved_shapes).clone();
+            plan.extend(learned);
+            self.shape_plans.store(&input_shapes, &plan);
+        }
+
         let pool_ref = self.pool.as_ref().map(|m| m as &Mutex<SizeClassPool>);
-        state.take_outputs(&self.output_names, &self.weights, pool_ref)
+        let out = state.take_outputs(&self.output_names, &self.weights, pool_ref);
+        if super::dispatch::phase_timers::on() {
+            super::dispatch::phase_timers::add(&super::dispatch::phase_timers::RUN, t_run.elapsed());
+            super::dispatch::phase_timers::report();
+        }
+        out
     }
 
     /// Run inference with the given named inputs.

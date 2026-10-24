@@ -320,3 +320,158 @@ mod perf_smoke {
         });
     }
 }
+
+// ── Prototype (onnx_spike): row-wise broadcasting kernel ────────────────────
+
+/// Broadcast layout of `a op b` collapsed into rows: every output row is a
+/// contiguous run of `len` elements, and within a row each operand is either
+/// contiguous (inner stride 1) or a single repeated element (inner stride 0).
+struct RowPlan {
+    /// Collapsed outer dims (output extents) and each operand's stride per dim.
+    outer: Vec<usize>,
+    a_outer: Vec<usize>,
+    b_outer: Vec<usize>,
+    len: usize,
+    a_inner: usize,
+    b_inner: usize,
+}
+
+impl RowPlan {
+    fn new(a_shape: &[usize], b_shape: &[usize], out_shape: &[usize]) -> Self {
+        let sa = broadcast_strides(a_shape, out_shape);
+        let sb = broadcast_strides(b_shape, out_shape);
+        // Drop size-1 output dims, then merge adjacent dims whose strides chain
+        // for *both* operands (contiguous continuation, or broadcast on both).
+        let mut dims: Vec<(usize, usize, usize)> = out_shape
+            .iter()
+            .zip(sa.iter().zip(sb.iter()))
+            .filter(|(&d, _)| d != 1)
+            .map(|(&d, (&x, &y))| (d, x, y))
+            .collect();
+        let mut merged: Vec<(usize, usize, usize)> = Vec::with_capacity(dims.len());
+        for (d, x, y) in dims.drain(..).rev() {
+            if let Some(last) = merged.last_mut() {
+                if x == last.1 * last.0 && y == last.2 * last.0 {
+                    last.0 *= d;
+                    continue;
+                }
+            }
+            merged.push((d, x, y));
+        }
+        merged.reverse();
+        let (len, a_inner, b_inner) = merged.pop().unwrap_or((1, 0, 0));
+        Self {
+            outer: merged.iter().map(|m| m.0).collect(),
+            a_outer: merged.iter().map(|m| m.1).collect(),
+            b_outer: merged.iter().map(|m| m.2).collect(),
+            len,
+            a_inner,
+            b_inner,
+        }
+    }
+
+    /// Flat offsets of output row `r` in `a` and `b`.
+    fn offsets(&self, mut r: usize) -> (usize, usize) {
+        let (mut oa, mut ob) = (0, 0);
+        for i in (0..self.outer.len()).rev() {
+            let c = r % self.outer[i];
+            r /= self.outer[i];
+            oa += c * self.a_outer[i];
+            ob += c * self.b_outer[i];
+        }
+        (oa, ob)
+    }
+}
+
+#[inline(always)]
+fn binary_row<F: Fn(f32, f32) -> f32>(dst: &mut [f32], a: &[f32], a_unit: bool, b: &[f32], b_unit: bool, f: F) {
+    match (a_unit, b_unit) {
+        (true, true) => dst.iter_mut().zip(a.iter().zip(b)).for_each(|(d, (&x, &y))| *d = f(x, y)),
+        (true, false) => {
+            let y = b[0];
+            dst.iter_mut().zip(a).for_each(|(d, &x)| *d = f(x, y));
+        }
+        (false, true) => {
+            let x = a[0];
+            dst.iter_mut().zip(b).for_each(|(d, &y)| *d = f(x, y));
+        }
+        (false, false) => dst.fill(f(a[0], b[0])),
+    }
+}
+
+/// Walk output elements `[pos, pos + dst.len())` row segment by row segment,
+/// calling `seg(dst_part, a_off, b_off)` with each operand's flat offset of the
+/// segment start (an operand with inner stride 0 keeps its row's offset).
+#[inline]
+fn for_segments(plan: &RowPlan, pos: usize, dst: &mut [f32], mut seg: impl FnMut(&mut [f32], usize, usize)) {
+    let (len, au, bu) = (plan.len, plan.a_inner, plan.b_inner);
+    let (mut r, mut off) = (pos / len, pos % len);
+    let mut rest = dst;
+    while !rest.is_empty() {
+        let take = (len - off).min(rest.len());
+        let (head, tail) = rest.split_at_mut(take);
+        let (oa, ob) = plan.offsets(r);
+        seg(head, oa + off * au, ob + off * bu);
+        rest = tail;
+        r += 1;
+        off = 0;
+    }
+}
+
+/// Output chunk size for parallel elementwise work (independent of row length,
+/// so a single huge row still spreads across threads).
+const CHUNK: usize = 16 * 1024;
+
+/// Binary elementwise op usable by the kernels below. Generic (not a `fn`
+/// pointer) so the op is inlined and each row segment vectorizes.
+pub(crate) trait BinaryFn: Fn(f32, f32) -> f32 + Copy + Send + Sync {}
+impl<F: Fn(f32, f32) -> f32 + Copy + Send + Sync> BinaryFn for F {}
+
+/// Pins a closure literal's signature to `(f32, f32) -> f32` (for the op macros).
+#[inline(always)]
+pub(crate) fn binary_fn<F: BinaryFn>(f: F) -> F {
+    f
+}
+
+/// `out = a op b` with ONNX broadcasting, written straight into `out` (resized
+/// as needed), vectorizable per row segment and parallel for large outputs.
+pub(crate) fn binary_into(a: &Tensor, b: &Tensor, out: &mut Tensor, f: impl BinaryFn) -> Result<(), String> {
+    let out_shape = Tensor::broadcast_shape(&a.shape, &b.shape)?;
+    let numel: usize = out_shape.iter().product();
+    out.data.resize(numel, 0.0);
+    out.shape = out_shape;
+    if numel == 0 {
+        return Ok(());
+    }
+    let plan = RowPlan::new(&a.shape, &b.shape, &out.shape);
+    let (au, bu) = (plan.a_inner == 1, plan.b_inner == 1);
+    let (ad, bd) = (&a.data[..], &b.data[..]);
+    crate::par::for_each_row(&mut out.data[..numel], CHUNK, |ci, chunk| {
+        for_segments(&plan, ci * CHUNK, chunk, |dst, oa, ob| binary_row(dst, &ad[oa..], au, &bd[ob..], bu, f));
+    });
+    Ok(())
+}
+
+/// In-place `a = a op b` when the broadcast output shape equals `a`'s shape.
+/// Returns `false` (leaving `a` untouched) when it does not.
+pub(crate) fn binary_inplace(a: &mut Tensor, b: &Tensor, f: impl BinaryFn) -> Result<bool, String> {
+    let out_shape = Tensor::broadcast_shape(&a.shape, &b.shape)?;
+    if out_shape != a.shape {
+        return Ok(false);
+    }
+    let plan = RowPlan::new(&a.shape, &b.shape, &out_shape);
+    debug_assert_eq!(plan.a_inner, 1);
+    let bu = plan.b_inner == 1;
+    let bd = &b.data[..];
+    crate::par::for_each_row(&mut a.data[..], CHUNK, |ci, chunk| {
+        for_segments(&plan, ci * CHUNK, chunk, |row, _, ob| {
+            if bu {
+                row.iter_mut().zip(&bd[ob..]).for_each(|(x, &y)| *x = f(*x, y));
+            } else {
+                let y = bd[ob];
+                row.iter_mut().for_each(|x| *x = f(*x, y));
+            }
+        });
+    });
+    Ok(true)
+}

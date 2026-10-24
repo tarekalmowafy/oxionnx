@@ -28,7 +28,7 @@ pub fn default_registry() -> OperatorRegistry {
     let mut r = OperatorRegistry::new();
 
     // ── Math ops ────────────────────────────────────────────────────────────
-    r.register(Box::new(math_ops::MatMulOp));
+    r.register(Box::new(math_ops::MatMulOp::default()));
     r.register(Box::new(math_ops::GemmOp));
     r.register(Box::new(math_ops::AddOp));
     r.register(Box::new(math_ops::SubOp));

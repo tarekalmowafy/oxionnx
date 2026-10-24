@@ -353,7 +353,12 @@ macro_rules! binary_op_inplace {
                 $op_type
             }
             fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
-                Ok(vec![$func(ctx.input(0)?, ctx.input(1)?)?])
+                // Prototype: same row-wise broadcast kernel as the slot path (used when
+                // the output shape was not statically resolved).
+                let f = crate::math::binary_fn($inplace_fn);
+                let mut out = Tensor::new(Vec::new(), Vec::new());
+                crate::math::binary_into(ctx.input(0)?, ctx.input(1)?, &mut out, f)?;
+                Ok(vec![out])
             }
             fn supports_inplace(&self) -> bool {
                 true
@@ -364,15 +369,14 @@ macro_rules! binary_op_inplace {
                 ctx: &OpContext<'_>,
             ) -> Result<Vec<Tensor>, OnnxError> {
                 let other = ctx.input(1)?;
-                if input.shape != other.shape {
-                    // Shapes differ (broadcasting needed) — fall back to regular path.
-                    return Ok(vec![$func(&input, other)?]);
+                let f = crate::math::binary_fn($inplace_fn);
+                // Prototype: broadcast in place whenever the output has `input`'s shape.
+                if crate::math::binary_inplace(&mut input, other, f)? {
+                    return Ok(vec![input]);
                 }
-                let f: fn(f32, f32) -> f32 = $inplace_fn;
-                for (a, b) in input.data.iter_mut().zip(other.data.iter()) {
-                    *a = f(*a, *b);
-                }
-                Ok(vec![input])
+                let mut out = Tensor::new(Vec::new(), Vec::new());
+                crate::math::binary_into(&input, other, &mut out, f)?;
+                Ok(vec![out])
             }
             fn native_dtypes(&self) -> &'static [oxionnx_core::DType] {
                 &[
@@ -414,22 +418,9 @@ macro_rules! binary_op_inplace {
                 }
                 let a = ctx.input(0)?;
                 let b = ctx.input(1)?;
-                let out = &mut slots[0];
-                if out.shape == a.shape && a.shape == b.shape && out.data.len() == a.data.len() {
-                    let f: fn(f32, f32) -> f32 = $inplace_fn;
-                    for ((dst, &sa), &sb) in
-                        out.data.iter_mut().zip(a.data.iter()).zip(b.data.iter())
-                    {
-                        *dst = f(sa, sb);
-                    }
-                } else {
-                    let result = $func(a, b)?;
-                    if out.shape == result.shape && out.data.len() == result.data.len() {
-                        out.data.copy_from_slice(&result.data);
-                    } else {
-                        *out = result;
-                    }
-                }
+                // Prototype: row-wise broadcast kernel writing straight into the slot.
+                let f = crate::math::binary_fn($inplace_fn);
+                crate::math::binary_into(a, b, &mut slots[0], f)?;
                 Ok(())
             }
         }
