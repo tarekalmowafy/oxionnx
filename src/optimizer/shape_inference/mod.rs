@@ -183,9 +183,9 @@ fn infer_node_shapes(
 
         OpKind::Transpose => reshape_ops::infer_transpose_shape(node, known),
 
-        OpKind::Squeeze => reshape_ops::infer_squeeze_shape(node, known),
+        OpKind::Squeeze => reshape_ops::infer_squeeze_shape(node, known, weights),
 
-        OpKind::Unsqueeze => reshape_ops::infer_unsqueeze_shape(node, known),
+        OpKind::Unsqueeze => reshape_ops::infer_unsqueeze_shape(node, known, weights),
 
         OpKind::Flatten => reshape_ops::infer_flatten_shape(node, known),
 

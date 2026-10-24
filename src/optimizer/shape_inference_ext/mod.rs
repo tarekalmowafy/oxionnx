@@ -165,7 +165,7 @@ pub(crate) fn infer_ext_node_shapes(
         | OpKind::ReduceL2
         | OpKind::ReduceLogSum
         | OpKind::ReduceLogSumExp
-        | OpKind::ReduceSumSquare => infer_reduce_shape(node, known),
+        | OpKind::ReduceSumSquare => infer_reduce_shape(node, known, weights),
 
         // ArgMax, ArgMin: reduce one axis to 1 (keepdims) or remove it
         OpKind::ArgMax | OpKind::ArgMin => infer_arg_reduce_shape(node, known),

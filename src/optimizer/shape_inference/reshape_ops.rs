@@ -96,15 +96,26 @@ pub(super) fn infer_transpose_shape(
     Some(vec![out])
 }
 
+/// `axes` for Squeeze/Unsqueeze: the attribute (opset < 13) or the constant
+/// second input (opset >= 13). `None` when the input exists but is not constant,
+/// i.e. the output shape is unknowable statically.
+fn squeeze_axes(node: &Node, weights: &HashMap<String, Tensor>) -> Option<Vec<i64>> {
+    match node.inputs.get(1).filter(|n| !n.is_empty()) {
+        Some(name) => Some(weights.get(name)?.data.iter().map(|&v| v as i64).collect()),
+        None => Some(node.attrs.ints("axes").to_vec()),
+    }
+}
+
 /// Squeeze: remove dims at given axes.
 pub(super) fn infer_squeeze_shape(
     node: &Node,
     known: &HashMap<String, Vec<usize>>,
+    weights: &HashMap<String, Tensor>,
 ) -> Option<Vec<Vec<usize>>> {
     let input_shape = get_input_shape(node, 0, known)?;
     let rank = input_shape.len() as i64;
 
-    let axes: Vec<i64> = node.attrs.ints("axes").to_vec();
+    let axes: Vec<i64> = squeeze_axes(node, weights)?;
     if axes.is_empty() {
         // Squeeze all dims of size 1
         let out: Vec<usize> = input_shape.iter().copied().filter(|&d| d != 1).collect();
@@ -136,9 +147,10 @@ pub(super) fn infer_squeeze_shape(
 pub(super) fn infer_unsqueeze_shape(
     node: &Node,
     known: &HashMap<String, Vec<usize>>,
+    weights: &HashMap<String, Tensor>,
 ) -> Option<Vec<Vec<usize>>> {
     let input_shape = get_input_shape(node, 0, known)?;
-    let axes: Vec<i64> = node.attrs.ints("axes").to_vec();
+    let axes: Vec<i64> = squeeze_axes(node, weights)?;
 
     if axes.is_empty() {
         return Some(vec![input_shape]);
