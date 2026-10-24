@@ -66,6 +66,18 @@ impl Operator for ReshapeOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+    /// Prototype: metadata-only when this node is the input's sole consumer.
+    fn supports_inplace(&self) -> bool {
+        true
+    }
+    fn execute_inplace(&self, mut input: Tensor, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+        let shape_t = ctx.input(1)?;
+        let allowzero = ctx.attrs().i("allowzero", 0) != 0;
+        let s: Vec<i64> = shape_t.data.iter().map(|&v| v as i64).collect();
+        input.shape = shape::resolve_reshape(&input.shape, input.numel(), &s, allowzero)
+            .map_err(OnnxError::ShapeMismatch)?;
+        Ok(vec![input])
+    }
     fn execute_into_slots(
         &self,
         ctx: &OpContext<'_>,
@@ -78,13 +90,13 @@ impl Operator for ReshapeOp {
         let shape_t = ctx.input(1)?;
         let allowzero = ctx.attrs().i("allowzero", 0) != 0;
         let s: Vec<i64> = shape_t.data.iter().map(|&v| v as i64).collect();
-        let result = shape::reshape(x, &s, allowzero)?;
+        // Prototype: one copy straight from the input (was clone + copy).
+        let new_shape = shape::resolve_reshape(&x.shape, x.numel(), &s, allowzero)
+            .map_err(OnnxError::ShapeMismatch)?;
         let out = &mut slots[0];
-        if out.shape == result.shape && out.data.len() == result.data.len() {
-            out.data.copy_from_slice(&result.data);
-        } else {
-            *out = result;
-        }
+        out.data.resize(x.data.len(), 0.0);
+        out.data.copy_from_slice(&x.data);
+        out.shape = new_shape;
         Ok(())
     }
 }
@@ -137,6 +149,19 @@ impl Operator for SqueezeOp {
         };
         Ok(vec![shape::squeeze(x, &axes)?])
     }
+    /// Prototype: metadata-only when this node is the input's sole consumer.
+    fn supports_inplace(&self) -> bool {
+        true
+    }
+    fn execute_inplace(&self, mut input: Tensor, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+        let raw_axes: Vec<i64> = if let Some(t) = ctx.optional_input(1) {
+            t.data.iter().map(|&v| v as i64).collect()
+        } else {
+            ctx.attrs().ints("axes").to_vec()
+        };
+        input.shape = shape::basic::resolve_squeeze_shape(&input.shape, &raw_axes)?;
+        Ok(vec![input])
+    }
     fn supports_output_slots(&self) -> bool {
         true
     }
@@ -182,6 +207,19 @@ impl Operator for UnsqueezeOp {
             ctx.attrs().ints("axes").to_vec()
         };
         Ok(vec![shape::unsqueeze(x, &axes)?])
+    }
+    /// Prototype: metadata-only when this node is the input's sole consumer.
+    fn supports_inplace(&self) -> bool {
+        true
+    }
+    fn execute_inplace(&self, mut input: Tensor, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+        let raw_axes: Vec<i64> = if let Some(t) = ctx.optional_input(1) {
+            t.data.iter().map(|&v| v as i64).collect()
+        } else {
+            ctx.attrs().ints("axes").to_vec()
+        };
+        input.shape = shape::basic::resolve_unsqueeze_shape(&input.shape, &raw_axes)?;
+        Ok(vec![input])
     }
     fn supports_output_slots(&self) -> bool {
         true

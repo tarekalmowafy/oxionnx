@@ -22,6 +22,7 @@ pub mod ml_svm;
 pub mod ml_tree;
 pub mod nms;
 pub mod nn;
+pub(crate) mod par;
 pub mod quantized;
 pub mod registry;
 pub mod resize;

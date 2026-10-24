@@ -31,11 +31,8 @@ pub fn concat(tensors: &[&Tensor], axis: i64) -> Result<Tensor, String> {
     let inner: usize = tensors[0].shape[ax + 1..].iter().product();
     for o in 0..outer {
         for t in tensors {
-            let seg = t.shape[ax];
-            for s in 0..seg {
-                let src_start = (o * t.shape[ax] + s) * inner;
-                out.extend_from_slice(&t.data[src_start..src_start + inner]);
-            }
+            let span = t.shape[ax] * inner;
+            out.extend_from_slice(&t.data[o * span..(o + 1) * span]);
         }
     }
     Ok(Tensor::new(out, out_shape))
@@ -379,10 +376,8 @@ pub fn split(x: &Tensor, axis: i64, split_sizes: &[usize]) -> Result<Vec<Tensor>
         let n_out = outer * chunk * inner;
         let mut out = Vec::with_capacity(n_out);
         for o in 0..outer {
-            for j in start..start + chunk {
-                let src = o * axis_len * inner + j * inner;
-                out.extend_from_slice(&x.data[src..src + inner]);
-            }
+            let src = o * axis_len * inner + start * inner;
+            out.extend_from_slice(&x.data[src..src + chunk * inner]);
         }
         let mut out_shape = x.shape.clone();
         out_shape[ax] = chunk;

@@ -243,8 +243,8 @@ pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
         let rows = x.shape[ndim - 2];
         let cols = x.shape[ndim - 1];
         let plane = rows * cols;
-        let batch: usize = x.shape[..ndim - 2].iter().product();
-        for b in 0..batch {
+        // Prototype (onnx_spike): planes are independent -> transpose them in parallel.
+        crate::par::for_each_row(&mut out[..], plane, |b, dst| {
             let base = b * plane;
             let mut bi = 0;
             while bi < rows {
@@ -255,14 +255,14 @@ pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
                     for i in bi..i_end {
                         let row = &x.data[base + i * cols + bj..base + i * cols + j_end];
                         for (jj, &v) in row.iter().enumerate() {
-                            out[base + (bj + jj) * rows + i] = v;
+                            dst[(bj + jj) * rows + i] = v;
                         }
                     }
                     bj = j_end;
                 }
                 bi = i_end;
             }
-        }
+        });
         return Ok(Tensor::new(out, out_shape));
     }
 

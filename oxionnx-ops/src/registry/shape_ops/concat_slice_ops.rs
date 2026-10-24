@@ -20,6 +20,38 @@ impl Operator for ConcatOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+    /// Prototype: write straight into the slot with one memcpy per (outer row, input).
+    fn execute_into_slots(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
+        let axis = ctx.attrs().i("axis", 0);
+        let tensors: Vec<&Tensor> = ctx.inputs.iter().filter_map(|opt| *opt).collect();
+        if tensors.is_empty() || slots.is_empty() {
+            return Err(OnnxError::Internal("Concat: no inputs/slots".into()));
+        }
+        let ndim = tensors[0].ndim();
+        let ax = normalize_axis(axis, ndim).map_err(OnnxError::ShapeMismatch)?;
+        for t in &tensors[1..] {
+            if t.ndim() != ndim || (0..ndim).any(|d| d != ax && t.shape[d] != tensors[0].shape[d]) {
+                return Err(OnnxError::ShapeMismatch("concat: shape mismatch".into()));
+            }
+        }
+        let mut out_shape = tensors[0].shape.clone();
+        out_shape[ax] = tensors.iter().map(|t| t.shape[ax]).sum();
+        let inner: usize = tensors[0].shape[ax + 1..].iter().product();
+        let row: usize = out_shape[ax] * inner;
+        let n: usize = out_shape.iter().product();
+        let slot = &mut slots[0];
+        slot.data.resize(n, 0.0);
+        crate::par::for_each_row(&mut slot.data[..n], row, |o, dst| {
+            let mut off = 0;
+            for t in &tensors {
+                let span = t.shape[ax] * inner;
+                dst[off..off + span].copy_from_slice(&t.data[o * span..(o + 1) * span]);
+                off += span;
+            }
+        });
+        slot.shape = out_shape;
+        Ok(())
+    }
 }
 
 // ── Slice ────────────────────────────────────────────────────────────────────
@@ -262,14 +294,15 @@ impl Operator for SplitOp {
             if slot.data.len() != n_out {
                 slot.data.resize(n_out, 0.0_f32);
             }
-            let mut dst = 0usize;
-            for o in 0..outer {
-                for j in start..start + chunk {
-                    let src = o * axis_len * inner + j * inner;
-                    slot.data[dst..dst + inner].copy_from_slice(&x.data[src..src + inner]);
-                    dst += inner;
-                }
-            }
+            // Prototype: each outer row of the output is one contiguous span of
+            // `chunk * inner` floats in the input — copy it in a single memcpy.
+            let span = chunk * inner;
+            let src_row = axis_len * inner;
+            let src_off = start * inner;
+            crate::par::for_each_row(&mut slot.data[..n_out], span, |o, dst| {
+                let src = o * src_row + src_off;
+                dst.copy_from_slice(&x.data[src..src + span]);
+            });
             let mut out_shape = x.shape.clone();
             out_shape[ax_u] = chunk;
             slot.shape = out_shape;

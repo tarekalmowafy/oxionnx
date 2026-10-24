@@ -107,10 +107,21 @@ pub(crate) fn rms_norm_into(
     // norm_size`.
     let fast_path = scale_len == norm_size;
 
-    for o in 0..outer {
+    // Prototype (onnx_spike): rows in parallel, and an 8-lane sum of squares the
+    // compiler can vectorize (changes summation order -> ulp-level differences).
+    let _ = outer;
+    let n_out = x.numel();
+    crate::par::for_each_row(&mut out[..n_out], norm_size, |o, out_slice| {
         let in_slice = &x.data[o * norm_size..(o + 1) * norm_size];
-        let out_slice = &mut out[o * norm_size..(o + 1) * norm_size];
-        let mean_sq = in_slice.iter().map(|&v| v * v).sum::<f32>() / norm_size as f32;
+        let mut lanes = [0.0f32; 8];
+        let mut chunks = in_slice.chunks_exact(8);
+        for c in &mut chunks {
+            for (l, &v) in lanes.iter_mut().zip(c) {
+                *l += v * v;
+            }
+        }
+        let tail: f32 = chunks.remainder().iter().map(|&v| v * v).sum();
+        let mean_sq = (lanes.iter().sum::<f32>() + tail) / norm_size as f32;
         let inv_rms = (mean_sq + eps).sqrt().recip();
         if fast_path {
             for ((o_v, &i_v), &s) in out_slice
@@ -125,7 +136,7 @@ pub(crate) fn rms_norm_into(
                 *o_v = i_v * inv_rms * scale.data[j % scale_len];
             }
         }
-    }
+    });
     Ok(())
 }
 

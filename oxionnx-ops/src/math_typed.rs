@@ -78,6 +78,55 @@ pub(crate) fn sgemm_strided(
     }
 }
 
+/// Prototype (onnx_spike): row-major `C[m,n] = A[m,k] @ B[k,n]`, split across the
+/// current rayon pool when the GEMM is big enough. Mirrors MLAS's policy
+/// (`MlasGemmBatch`): ~64K multiply-adds minimum per thread, split along N in
+/// column blocks when M is small (so each thread packs only its own slice of B),
+/// otherwise along M.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+#[allow(unsafe_code)]
+pub(crate) fn sgemm_par(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    use rayon::prelude::*;
+    const MIN_MACS_PER_TASK: usize = 64 * 1024;
+    let threads = crate::par::threads();
+    let tasks = (m * n * k / MIN_MACS_PER_TASK).clamp(1, threads);
+    if tasks <= 1 {
+        sgemm_strided(m, k, n, 1.0, a, k as isize, 1, b, n as isize, 1, 0.0, c, n as isize, 1);
+        return;
+    }
+    if m >= 8 * tasks && m >= n / 4 {
+        // Row blocks: A and C rows are contiguous.
+        let rows = m.div_ceil(tasks).next_multiple_of(8);
+        c.par_chunks_mut(rows * n).zip(a.par_chunks(rows * k)).for_each(|(cb, ab)| {
+            let mb = cb.len() / n;
+            sgemm_strided(mb, k, n, 1.0, ab, k as isize, 1, b, n as isize, 1, 0.0, cb, n as isize, 1);
+        });
+    } else {
+        // Column blocks: each task writes a disjoint column range of C.
+        let cols = n.div_ceil(tasks).next_multiple_of(16).min(n);
+        struct SendPtr(*mut f32);
+        unsafe impl Send for SendPtr {}
+        unsafe impl Sync for SendPtr {}
+        let cp = SendPtr(c.as_mut_ptr());
+        let cp = &cp;
+        (0..n.div_ceil(cols)).into_par_iter().for_each(|blk| {
+            let j0 = blk * cols;
+            let nb = cols.min(n - j0);
+            // SAFETY: tasks write disjoint column ranges [j0, j0+nb) of the m x n
+            // row-major C; A/B are only read; all offsets are within bounds.
+            unsafe {
+                matrixmultiply::sgemm(
+                    m, k, nb, 1.0,
+                    a.as_ptr(), k as isize, 1,
+                    b.as_ptr().add(j0), n as isize, 1,
+                    0.0,
+                    cp.0.add(j0), n as isize, 1,
+                );
+            }
+        });
+    }
+}
+
 // ── v0.1.8: Batch-info helper ────────────────────────────────────────────────
 
 /// Compute batch info `(batch_size, a_batches, b_batches, out_shape)` shared
@@ -350,49 +399,21 @@ pub(crate) fn matmul_f32_into(
     out.resize(batch_size * mn, 0.0f32);
 
     #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
-    if batch_size >= 4 {
-        use rayon::prelude::*;
-        out.par_chunks_mut(mn).enumerate().for_each(|(b_idx, dst)| {
-            let a_off = (b_idx % a_batches) * a_batch_stride;
-            let b_off = (b_idx % b_batches) * b_batch_stride;
-            sgemm_strided(
-                m,
-                k,
-                n,
-                1.0,
-                &a_data[a_off..a_off + m * k],
-                k as isize,
-                1,
-                &b_data[b_off..b_off + k * n],
-                n as isize,
-                1,
-                0.0,
-                dst,
-                n as isize,
-                1,
-            );
-        });
-    } else {
-        for b_idx in 0..batch_size {
-            let a_off = (b_idx % a_batches) * a_batch_stride;
-            let b_off = (b_idx % b_batches) * b_batch_stride;
-            let c_off = b_idx * mn;
-            sgemm_strided(
-                m,
-                k,
-                n,
-                1.0,
-                &a_data[a_off..a_off + m * k],
-                k as isize,
-                1,
-                &b_data[b_off..b_off + k * n],
-                n as isize,
-                1,
-                0.0,
-                &mut out[c_off..c_off + mn],
-                n as isize,
-                1,
-            );
+    {
+        // Prototype (onnx_spike):
+        // * B shared by every batch (2-D weight): fold the batch into M, like ORT's
+        //   matmul_helper, so B is packed once per call instead of once per batch.
+        // * Otherwise parallelize over the batch.
+        // * Each GEMM is additionally split across threads (`sgemm_par`).
+        if b_batches == 1 && a_batches == batch_size {
+            sgemm_par(batch_size * m, k, n, a_data, b_data, &mut out[..]);
+        } else {
+            use rayon::prelude::*;
+            out.par_chunks_mut(mn).enumerate().for_each(|(b_idx, dst)| {
+                let a_off = (b_idx % a_batches) * a_batch_stride;
+                let b_off = (b_idx % b_batches) * b_batch_stride;
+                sgemm_par(m, k, n, &a_data[a_off..a_off + m * k], &b_data[b_off..b_off + k * n], dst);
+            });
         }
     }
 
