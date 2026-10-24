@@ -1302,7 +1302,8 @@ mod tests {
 /// pool can skip zero-filling a buffer the kernel overwrites anyway.
 fn fully_writes_slot(node: &Node, idx: usize) -> bool {
     match node.op.as_str() {
-        "Split" => true,
+        "Split" | "SkipSimplifiedLayerNormalization" => true,
+        "com.microsoft.RotaryEmbedding" | "OxiAttention" => idx == 0,
         "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "Concat" | "Transpose"
         | "SimplifiedLayerNormalization" => idx == 0,
         _ => false,
@@ -1326,6 +1327,7 @@ fn shape_depends_only_on_input_shapes(node: &Node, weights: &HashMap<String, Ten
     match node.op.as_str() {
         "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "Concat" | "Transpose"
         | "SimplifiedLayerNormalization" => true,
+        "SkipSimplifiedLayerNormalization" | "com.microsoft.RotaryEmbedding" | "OxiAttention" => true,
         // `split` sizes may come from a runtime tensor.
         "Split" => node.inputs.get(1).is_none_or(|n| n.is_empty() || weights.contains_key(n)),
         _ => false,

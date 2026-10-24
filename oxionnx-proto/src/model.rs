@@ -302,6 +302,19 @@ pub fn build_graph(
 /// the streaming/bytes-only load paths — have no base directory of their
 /// own) makes such a tensor a named error instead of a misleading
 /// `MissingTensorData`.
+/// Map a node's `(domain, op_type)` to its [`OpKind`].
+///
+/// Op types are otherwise looked up by name alone, so a `com.microsoft` contrib op
+/// whose semantics differ from a same-named ONNX op gets a domain-qualified name
+/// (`com.microsoft.RotaryEmbedding` takes `(input, position_ids, cos, sin)` on
+/// `[B, S, N*D]` input; ONNX's takes `(X, cos, sin, position_ids)`).
+fn op_kind_for(domain: &str, op_type: &str) -> OpKind {
+    match (domain, op_type) {
+        ("com.microsoft", "RotaryEmbedding") => OpKind::Unknown(format!("{domain}.{op_type}")),
+        _ => OpKind::parse(op_type),
+    }
+}
+
 fn build_graph_impl(
     graph_proto: &crate::types::GraphProto,
     weights: &HashMap<String, Tensor>,
@@ -309,7 +322,7 @@ fn build_graph_impl(
 ) -> Result<Graph, String> {
     let mut nodes: Vec<Node> = Vec::with_capacity(graph_proto.nodes.len());
     for np in &graph_proto.nodes {
-        let op = OpKind::parse(&np.op_type);
+        let op = op_kind_for(&np.domain, &np.op_type);
         if let OpKind::Unknown(ref name) = op {
             tracing::debug!(op = %name, "unsupported op, will be skipped");
         }

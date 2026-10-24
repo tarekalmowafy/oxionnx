@@ -3,22 +3,24 @@
 //! folding, LayerNorm pattern, consecutive Transpose/Reshape cancellation,
 //! MatMul+Transpose fusion, Add+MatMul→Gemm fusion, Conv+Add+Relu (ResNet),
 //! Gather+Gather composition, Dropout elimination, Transpose+Reshape simplification,
-//! spatial (InstanceNorm-style) normalization chains.
+//! spatial (InstanceNorm-style) normalization chains, scaled dot-product attention.
 //!
 //! All of them are wired into [`crate::optimizer::optimize_with_level`] at
-//! `PassLevel::Extended` and above, except `fuse_conv_add_relu` and
-//! `fuse_instance_norm`, which emit the optimizer-only `ConvAddRelu` /
-//! `OxiInstanceNorm` ops and therefore run only when the active
-//! `OperatorRegistry` provides a kernel for them.
+//! `PassLevel::Extended` and above, except `fuse_conv_add_relu`,
+//! `fuse_instance_norm` and `fuse_attention`, which emit the optimizer-only
+//! `ConvAddRelu` / `OxiInstanceNorm` / `OxiAttention` ops and therefore run
+//! only when the active `OperatorRegistry` provides a kernel for them.
 //!
 //! Every pass takes the graph's `output_names` and refuses to remove, rename or
 //! re-parent a tensor the model declares as an output.
 
+mod attention;
 mod conv;
 mod instance_norm;
 mod matmul;
 mod simplify;
 
+pub use attention::fuse_attention;
 pub use instance_norm::fuse_instance_norm;
 
 pub use conv::{

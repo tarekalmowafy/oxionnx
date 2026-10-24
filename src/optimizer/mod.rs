@@ -129,6 +129,13 @@ pub fn optimize_with_input_shapes(
     // Inference-mode Dropout is the identity; removing it first lets the
     // downstream patterns (e.g. Softmax → Dropout → MatMul) match.
     let nodes = fusion::eliminate_dropout_inference(nodes, weights, output_names);
+    // Before the MatMul/Transpose fusions, which would otherwise absorb pieces of
+    // the attention chain (e.g. an unscaled `MatMul(q, k) + mask`).
+    let nodes = if registry.get("OxiAttention").is_some() {
+        fusion::fuse_attention(nodes, weights, output_names)
+    } else {
+        nodes
+    };
 
     let shapes = shape_inference::infer_shapes(&nodes, weights, input_shapes);
     let nodes = fusion::fuse_matmul_add(nodes, weights, &shapes, output_names);

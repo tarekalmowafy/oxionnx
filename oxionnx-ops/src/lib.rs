@@ -6,6 +6,7 @@ pub mod simd_ops;
 
 pub mod attention;
 pub mod bitwise;
+pub mod contrib;
 pub mod comparison;
 pub mod control_flow;
 pub mod conv;

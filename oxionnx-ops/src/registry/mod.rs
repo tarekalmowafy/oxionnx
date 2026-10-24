@@ -6,6 +6,7 @@
 pub mod cast_like;
 pub mod center_crop_pad;
 pub mod col2im;
+pub mod contrib_ops;
 pub mod conv_ops;
 pub mod det;
 pub mod indexing_ops;
@@ -173,6 +174,11 @@ pub fn default_registry() -> OperatorRegistry {
     r.register(Box::new(rnn_ops::RotaryEmbeddingOp));
     r.register(Box::new(rnn_ops::GridSampleOp));
     r.register(Box::new(rnn_ops::RoiAlignOp));
+
+    // ── ONNX Runtime contrib ops and optimizer-only fused ops ──────────────
+    r.register(Box::new(contrib_ops::SkipSimplifiedLayerNormOp));
+    r.register(Box::new(contrib_ops::MsRotaryEmbeddingOp));
+    r.register(Box::new(contrib_ops::OxiAttentionOp));
 
     // ── Aliases (ONNX names that differ from our canonical op_type) ────────
     r.register_as("LayerNorm", Box::new(nn_ops::LayerNormOp));
