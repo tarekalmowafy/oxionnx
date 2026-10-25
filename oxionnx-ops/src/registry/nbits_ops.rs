@@ -351,38 +351,29 @@ impl GatherBlockQuantizedOp {
         let cols = row_bytes * (8 / bits);
         let table_rows: usize = dims[..dims.len() - 1].iter().product();
         let per_index: usize = dims[1..dims.len() - 1].iter().product();
-        // Rows of the table, with their stride in bytes.
-        let shared;
-        let (bytes, stride): (&[u8], usize) = match last_bytes {
-            Some(l) => (words_as_bytes(&data.data), l.div_ceil(4) * 4),
-            None => {
-                let key = data.data.as_ptr() as usize;
-                let cached = is_weight(ctx, 0, data);
-                shared = match self.bytes.read().ok().and_then(|c| c.get(&key).cloned()).filter(|_| cached) {
-                    Some(b) => b,
-                    None => {
-                        let b = Arc::new(input_bytes(attrs, 0, data).map_err(bad)?.into_owned());
-                        if cached {
-                            if let Ok(mut c) = self.bytes.write() {
-                                c.insert(key, b.clone());
-                            }
-                        }
-                        b
-                    }
-                };
-                (&shared[..], row_bytes)
-            }
-        };
-        let zp_bytes;
-        let zp = match zp {
-            None => ZeroPoints::Default,
-            Some(z) if dtype(attrs, 3) == DT_FLOAT => ZeroPoints::Float(&z.data),
+        // Rows of the table and of packed zero points, with their strides in bytes.
+        let data_rows = self.byte_rows(ctx, 0, data, row_bytes).map_err(bad)?;
+        let zp_rows;
+        let (zp, zp_stride) = match zp {
+            None => (ZeroPoints::Default, 0),
+            Some(z) if dtype(attrs, 3) == DT_FLOAT => (ZeroPoints::Float(&z.data), 0),
             Some(z) => {
-                zp_bytes = input_bytes(attrs, 3, z).map_err(bad)?;
-                ZeroPoints::Packed(&zp_bytes)
+                let kb = cols.div_ceil(block);
+                zp_rows = self.byte_rows(ctx, 3, z, (kb * bits).div_ceil(8)).map_err(bad)?;
+                (ZeroPoints::Packed(zp_rows.0.get()), zp_rows.1)
             }
         };
-        let table = Table { data: bytes, stride, rows: table_rows, cols, bits, block, scales: &scales.data, zp };
+        let table = Table {
+            data: data_rows.0.get(),
+            stride: data_rows.1,
+            rows: table_rows,
+            cols,
+            bits,
+            block,
+            scales: &scales.data,
+            zp,
+            zp_stride,
+        };
         table.check().map_err(bad)?;
         let mut out_shape = indices.shape.clone();
         out_shape.extend_from_slice(&dims[1..dims.len() - 1]);
@@ -402,6 +393,48 @@ impl GatherBlockQuantizedOp {
             }
         });
         Ok(())
+    }
+}
+
+/// Byte rows borrowed from a loader byte tensor, or a (cached) copy.
+enum Bytes<'t> {
+    Borrowed(&'t [u8]),
+    Shared(Arc<Vec<u8>>),
+}
+
+impl Bytes<'_> {
+    fn get(&self) -> &[u8] {
+        match self {
+            Bytes::Borrowed(b) => b,
+            Bytes::Shared(b) => b,
+        }
+    }
+}
+
+impl GatherBlockQuantizedOp {
+    /// The uint8 rows of input `idx` (`row` bytes each) and their stride:
+    /// borrowed from a loader byte tensor, else converted once per session
+    /// weight (or per call for a dynamic input).
+    fn byte_rows<'t>(&self, ctx: &OpContext<'t>, idx: usize, t: &'t Tensor, row: usize) -> Result<(Bytes<'t>, usize), String> {
+        let attrs = ctx.attrs();
+        if let Some(last) = byte_tensor_last(attrs, idx) {
+            if last != row {
+                return Err(format!("input {idx} has rows of {last} bytes, expected {row}"));
+            }
+            return Ok((Bytes::Borrowed(words_as_bytes(&t.data)), last.div_ceil(4) * 4));
+        }
+        let key = t.data.as_ptr() as usize;
+        let cached = is_weight(ctx, idx, t);
+        if let Some(b) = self.bytes.read().ok().and_then(|c| c.get(&key).cloned()).filter(|_| cached) {
+            return Ok((Bytes::Shared(b), row));
+        }
+        let b = Arc::new(input_bytes(attrs, idx, t)?.into_owned());
+        if cached {
+            if let Ok(mut c) = self.bytes.write() {
+                c.insert(key, b.clone());
+            }
+        }
+        Ok((Bytes::Shared(b), row))
     }
 }
 
@@ -710,5 +743,62 @@ mod tests {
         assert_eq!(y.data, want);
         let nd = node("GatherBlockQuantized", &["d", "i", "s"], &[("bits", 8), ("block_size", 32), ("gather_axis", 1)], &[]);
         assert!(run(&op, &nd, &HashMap::new(), &[Some(&d), Some(&t(vec![1.0], &[1])), Some(&s8)]).is_err());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fused_ops_take_quantized_weights() {
+        use crate::registry::contrib_ops::{OxiMatMulActOp, OxiMatMulSplitOp};
+        let mut rng = Lcg(21);
+        let gelu = |x: f32| 0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044715 * x * x * x)).tanh());
+        // K = 80 (a partial block), N = 2 x 64 (gated) and 96 (split 32 + 64).
+        for &(n, bits) in &[(128usize, 4usize), (128, 8), (96, 8)] {
+            let (k, block, m) = (80usize, 32usize, 7usize);
+            let c = case(&mut rng, k, n, bits, block);
+            let kb = k.div_ceil(block);
+            let attrs = [("K", k as i64), ("N", n as i64), ("bits", bits as i64), ("block_size", block as i64)];
+            let nd = node("MatMulNBits", &["a", "b", "s", "z"], &attrs, &[]);
+            let f = |v: &[u8]| v.iter().map(|&x| f32::from(x)).collect();
+            let b = t(f(&c.b), &[n, kb, block * bits / 8]);
+            let z = t(f(&c.zp), &[n, (kb * bits).div_ceil(8)]);
+            let packed = pack_matmul_nbits(&nd.attrs, &b, &t(c.scales.clone(), &[n, kb]), Some(&z)).unwrap();
+            let pw: HashMap<String, Tensor> = [("p".to_string(), t(packed.clone(), &[packed.len()]))].into();
+            let a = t((0..m * k).map(|_| rng.f()).collect(), &[1, m, k]);
+            let p = &pw["p"];
+            let y = run(&MatMulNBitsOp::new(true), &node("OxiMatMulNBits", &["a", "p"], &[], &[]), &pw, &[Some(&a), Some(p)]).unwrap();
+            let close = |got: &[f32], want: &[f32], what: &str| {
+                assert_eq!(got.len(), want.len(), "{what}");
+                for (g, w) in got.iter().zip(want) {
+                    assert!((g - w).abs() <= 1e-4 * (1.0 + w.abs()), "{what}: {g} vs {w}");
+                }
+            };
+            if n == 128 {
+                for gate in [0i64, 1] {
+                    let mut nd = node("OxiMatMulAct", &["a", "p"], &[("gate", gate), ("nbits", 1)], &[]);
+                    nd.attrs.strings.insert("activation".into(), "gelu".into());
+                    nd.attrs.strings.insert("approximate".into(), "tanh".into());
+                    let got = run(&OxiMatMulActOp::default(), &nd, &pw, &[Some(&a), Some(p)]).unwrap();
+                    assert_eq!(got.shape, vec![1, m, n / 2]);
+                    let h = n / 2;
+                    let want: Vec<f32> = (0..m * h)
+                        .map(|i| {
+                            let (r, j) = (i / h, i % h);
+                            let (lo, hi) = (y.data[r * n + j], y.data[r * n + h + j]);
+                            if gate == 0 { gelu(lo) * hi } else { gelu(hi) * lo }
+                        })
+                        .collect();
+                    close(&got.data, &want, &format!("gated gate={gate} bits={bits}"));
+                }
+            } else {
+                let mut nd = node("OxiMatMulSplit", &["a", "p"], &[("nbits", 1)], &[("split", vec![32, 64])]);
+                nd.outputs = vec!["y0".into(), "y1".into()];
+                let ctx = OpContext { node: &nd, inputs: vec![Some(&a), Some(p)], outer_scope: None, weights: Some(&pw), registry: None };
+                let outs = OxiMatMulSplitOp::default().execute(&ctx).unwrap();
+                assert_eq!((outs[0].shape.clone(), outs[1].shape.clone()), (vec![1, m, 32], vec![1, m, 64]));
+                let col = |lo: usize, w: usize| -> Vec<f32> { (0..m).flat_map(|r| y.data[r * n + lo..r * n + lo + w].to_vec()).collect() };
+                close(&outs[0].data, &col(0, 32), "split 0");
+                close(&outs[1].data, &col(32, 64), "split 1");
+            }
+        }
     }
 }

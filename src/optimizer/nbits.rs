@@ -25,6 +25,25 @@ fn subgraph_refs(graph: &Graph, out: &mut HashSet<String>) {
     }
 }
 
+/// Output width of a projection the MatMul fusions (`OxiMatMulAct`,
+/// `OxiMatMulSplit`) may absorb, and whether it is quantized: a `MatMul` by a
+/// 2-D weight, or a bias-free `OxiMatMulNBits` (its fused node then carries
+/// `nbits = 1` and the packed weight).
+pub(crate) fn projection_cols(node: &Node, w: &Tensor) -> Option<(usize, bool)> {
+    match node.op.as_str() {
+        "MatMul" if w.shape.len() == 2 => Some((w.shape[1], false)),
+        "OxiMatMulNBits" if node.inputs.len() == 2 => {
+            oxionnx_ops::matmul_nbits::Packed::from_words(&w.data).ok().map(|p| (p.s.n, true))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `node` is a projection the MatMul fusions consider.
+pub(crate) fn is_projection(node: &Node) -> bool {
+    node.op == OpKind::MatMul || node.op.as_str() == "OxiMatMulNBits"
+}
+
 /// See the module docs.
 pub fn prepack_matmul_nbits(nodes: Vec<Node>, weights: &mut HashMap<String, Tensor>, output_names: &[String]) -> Vec<Node> {
     if !nodes.iter().any(|n| n.op.as_str() == "MatMulNBits") {
@@ -173,5 +192,30 @@ mod tests {
                 assert!((got - want).abs() < 0.02 * (1.0 + want.abs()), "[{i},{j}] {got} vs {want}");
             }
         }
+    }
+
+    #[test]
+    fn gated_mlp_on_quantized_weights_fuses() {
+        // MatMulNBits -> Split -> Gelu(first half) * second half.
+        let (mut nodes, mut weights, _) = graph();
+        nodes[0].inputs.truncate(4);
+        let mk = |op: OpKind, inputs: &[&str], outputs: &[&str]| Node {
+            op,
+            name: outputs[0].to_string(),
+            inputs: inputs.iter().map(|s| s.to_string()).collect(),
+            outputs: outputs.iter().map(|s| s.to_string()).collect(),
+            attrs: Attributes::default(),
+        };
+        let mut split = mk(OpKind::Split, &["Y"], &["g", "u"]);
+        split.attrs.ints.insert("axis".into(), -1);
+        let mut gelu = mk(OpKind::Gelu, &["g"], &["ga"]);
+        gelu.attrs.strings.insert("approximate".into(), "tanh".into());
+        nodes.extend([split, gelu, mk(OpKind::Mul, &["ga", "u"], &["out"])]);
+        let registry = oxionnx_ops::default_registry();
+        let out = crate::optimizer::optimize(nodes, &mut weights, &["out".to_string()], &registry);
+        let ops: Vec<&str> = out.iter().map(|n| n.op.as_str()).collect();
+        assert_eq!(ops, vec!["OxiMatMulAct"]);
+        assert_eq!(out[0].attrs.i("nbits", 0), 1);
+        assert!(oxionnx_ops::matmul_nbits::Packed::is_packed(&weights[&out[0].inputs[1]].data));
     }
 }

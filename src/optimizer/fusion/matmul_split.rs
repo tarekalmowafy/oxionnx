@@ -132,7 +132,7 @@ impl<'a> Matcher<'a> {
     fn try_fuse(&self, mm: usize) -> Option<Fused> {
         let node = &self.nodes[mm];
         let (x, w) = (node.inputs.first()?.as_str(), node.inputs.get(1)?.as_str());
-        let n = *self.weights.get(w).filter(|t| t.shape.len() == 2)?.shape.last()?;
+        let (n, nbits) = crate::optimizer::nbits::projection_cols(node, self.weights.get(w)?)?;
         if node.outputs.len() != 1 || x.is_empty() {
             return None;
         }
@@ -140,6 +140,9 @@ impl<'a> Matcher<'a> {
         let mut y = self.out(mm);
         let mut inputs: Vec<String> = vec![x.into(), w.into(), String::new(), String::new(), String::new()];
         let mut attrs = Attributes::default();
+        if nbits {
+            attrs.ints.insert("nbits".into(), 1);
+        }
         if let Some(add) = self.cons(y, "Add") {
             let b = self.other_input(add, y)?;
             if !self.row_const(b, n) {
@@ -232,7 +235,7 @@ pub fn fuse_matmul_split(nodes: Vec<Node>, weights: &HashMap<String, Tensor>, ou
         let mut claimed = HashSet::new();
         let mut out = Vec::new();
         for (i, n) in nodes.iter().enumerate() {
-            if n.op != OpKind::MatMul {
+            if !crate::optimizer::nbits::is_projection(n) {
                 continue;
             }
             if let Some(f) = m.try_fuse(i) {

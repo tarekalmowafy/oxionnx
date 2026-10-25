@@ -535,25 +535,40 @@ pub fn matmul(isa: Isa, m: usize, a: &[f32], w: &Packed<'_>, bias: Option<&[f32]
     SCRATCH.with(|q| q.replace(qa));
 }
 
-fn gemm_quantized(isa: Isa, qa: &QuantA, w: &Packed<'_>, bias: Option<&[f32]>, c: &mut [f32], threads: usize) {
-    let (s, m) = (w.s, qa.m);
-    let mr = isa.mr();
-    let tasks = (m * s.n * s.k / MIN_MACS_PER_TASK).clamp(1, threads.max(1));
-    // Units of two panels, so the AVX-512 kernel always gets whole pairs.
-    let units = s.panels().div_ceil(2);
+/// Task tiles: `(rows per tile, row tiles, units per tile, unit tiles)`. One
+/// tile per task, split along M only when there are many rows (each row tile
+/// streams all of its weight columns) and only by a divisor of the task count.
+fn grid(m: usize, mr: usize, units: usize, tasks: usize) -> (usize, usize, usize, usize) {
     let strips = m.div_ceil(mr);
-    // Split along M only when there are many rows (each row tile streams all of
-    // its weight columns), and only by a divisor of the task count.
     let max_mtiles = (m / MIN_ROWS_PER_TILE).clamp(1, strips);
     let mt = (1..=max_mtiles.min(tasks)).rev().find(|d| tasks % d == 0).unwrap_or(1);
     let rows_per_tile = strips.div_ceil(mt) * mr;
-    let mtiles = m.div_ceil(rows_per_tile);
-    let splits = (tasks / mt).clamp(1, units);
-    let units_per_tile = units.div_ceil(splits);
-    let ntiles = units.div_ceil(units_per_tile);
+    let splits = (tasks / mt).clamp(1, units.max(1));
+    let units_per_tile = units.div_ceil(splits).max(1);
+    (rows_per_tile, m.div_ceil(rows_per_tile), units_per_tile, units.div_ceil(units_per_tile))
+}
+
+/// Run `one(task)` for `0..total`, on rayon when there is more than one task.
+fn run_tasks(tasks: usize, total: usize, one: impl Fn(usize) + Sync + Send) {
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+    if tasks > 1 && total > 1 {
+        use rayon::prelude::*;
+        (0..total).into_par_iter().for_each(one);
+        return;
+    }
+    let _ = tasks;
+    (0..total).for_each(one);
+}
+
+fn gemm_quantized(isa: Isa, qa: &QuantA, w: &Packed<'_>, bias: Option<&[f32]>, c: &mut [f32], threads: usize) {
+    let (s, m) = (w.s, qa.m);
+    let tasks = (m * s.n * s.k / MIN_MACS_PER_TASK).clamp(1, threads.max(1));
+    // Units of two panels, so the AVX-512 kernel always gets whole pairs.
+    let units = s.panels().div_ceil(2);
+    let (rows_per_tile, mtiles, units_per_tile, ntiles) = grid(m, isa.mr(), units, tasks);
     let cp = SendPtr(c.as_mut_ptr());
     let cp = &cp;
-    let one = |t: usize| {
+    run_tasks(tasks, mtiles * ntiles, |t| {
         let (ti, tj) = (t / ntiles, t % ntiles);
         let i0 = ti * rows_per_tile;
         let mb = rows_per_tile.min(m - i0);
@@ -562,26 +577,26 @@ fn gemm_quantized(isa: Isa, qa: &QuantA, w: &Packed<'_>, bias: Option<&[f32]>, c
         // SAFETY: tiles cover disjoint (row, panel) ranges of C, inside its m x N
         // bounds; `isa` was detected on this CPU.
         unsafe { tile(isa, qa, w, bias, i0, mb, p0, p1, cp.0) };
-    };
-    let total = mtiles * ntiles;
-    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
-    if tasks > 1 && total > 1 {
-        use rayon::prelude::*;
-        (0..total).into_par_iter().for_each(one);
-        return;
+    });
+}
+
+/// Whether the ISA's micro-kernel takes two panels at once.
+fn wide(isa: Isa) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        isa == Isa::Avx512Vnni
     }
-    (0..total).for_each(one);
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = isa;
+        false
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn tile(isa: Isa, qa: &QuantA, w: &Packed<'_>, bias: Option<&[f32]>, i0: usize, mb: usize, p0: usize, p1: usize, c: *mut f32) {
     let s = w.s;
-    let (kb, qblock, mr) = (s.kb(), s.qblock(), isa.mr());
-    // Only the AVX-512 kernel takes two panels at once.
-    #[cfg(target_arch = "x86_64")]
-    let wide = isa == Isa::Avx512Vnni;
-    #[cfg(not(target_arch = "x86_64"))]
-    let wide = false;
+    let mr = isa.mr();
     let mut s0 = p0;
     while s0 < p1 {
         let s1 = (s0 + SLICE_PANELS).min(p1);
@@ -591,37 +606,119 @@ unsafe fn tile(isa: Isa, qa: &QuantA, w: &Packed<'_>, bias: Option<&[f32]>, i0: 
             let row = i0 + i;
             let mut p = s0;
             while p < s1 {
-                let nv = if wide && p + 1 < s1 { 2 } else { 1 };
-                let pv = [p, p + nv - 1];
-                let micro = Micro {
-                    kb,
-                    block: s.block,
-                    a: qa.aq.as_ptr().add(row * qa.kp),
-                    lda: qa.kp,
-                    sa: qa.sa.as_ptr().add(row * kb),
-                    ss: qa.ss.as_ptr().add(row * kb),
-                    q: pv.map(|p| w.q.as_ptr().add(p * kb * qblock)),
-                    qblock,
-                    sb: pv.map(|p| w.sb.as_ptr().add(p * kb * NP)),
-                    zb: pv.map(|p| w.zb.as_ptr().add(p * kb * NP)),
-                    c: c.add(row * s.n + p * NP),
-                    ldc: s.n,
-                    nb: (nv * NP).min(s.n - p * NP),
-                    bias: bias.map_or(std::ptr::null(), |b| b.as_ptr().add(p * NP)),
-                };
-                match isa {
-                    Isa::Scalar => scalar::kernel(r, s.bits, &micro),
-                    #[cfg(target_arch = "x86_64")]
-                    Isa::Avx2 => avx2::dispatch(r, s.bits, &micro),
-                    #[cfg(target_arch = "x86_64")]
-                    Isa::Avx512Vnni => avx512::dispatch(r, nv, s.bits, &micro),
-                }
+                let nv = if wide(isa) && p + 1 < s1 { 2 } else { 1 };
+                let nb = (nv * NP).min(s.n - p * NP);
+                let b = bias.map(|b| &b[p * NP..]);
+                micro(isa, qa, w, row, r, p, nv, c.add(row * s.n + p * NP), s.n, nb, b);
                 p += nv;
             }
             i += r;
         }
         s0 = s1;
     }
+}
+
+/// `C[r rows from row, panels p..p + nv]` into `c` (row stride `ldc`, `nb` valid columns).
+#[allow(clippy::too_many_arguments)]
+unsafe fn micro(
+    isa: Isa,
+    qa: &QuantA,
+    w: &Packed<'_>,
+    row: usize,
+    r: usize,
+    p: usize,
+    nv: usize,
+    c: *mut f32,
+    ldc: usize,
+    nb: usize,
+    bias: Option<&[f32]>,
+) {
+    let s = w.s;
+    let (kb, qblock) = (s.kb(), s.qblock());
+    let pv = [p, p + nv - 1];
+    let k = Micro {
+        kb,
+        block: s.block,
+        a: qa.aq.as_ptr().add(row * qa.kp),
+        lda: qa.kp,
+        sa: qa.sa.as_ptr().add(row * kb),
+        ss: qa.ss.as_ptr().add(row * kb),
+        q: pv.map(|p| w.q.as_ptr().add(p * kb * qblock)),
+        qblock,
+        sb: pv.map(|p| w.sb.as_ptr().add(p * kb * NP)),
+        zb: pv.map(|p| w.zb.as_ptr().add(p * kb * NP)),
+        c,
+        ldc,
+        nb,
+        bias: bias.map_or(std::ptr::null(), |b| b.as_ptr()),
+    };
+    match isa {
+        Isa::Scalar => scalar::kernel(r, s.bits, &k),
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => avx2::dispatch(r, s.bits, &k),
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx512Vnni => avx512::dispatch(r, nv, s.bits, &k),
+    }
+}
+
+/// Like [`crate::gemm_packed::gemm_epilogue`] for a quantized weight: `epi`
+/// receives every `rows x width` block of `a @ W` while it is in L1. Block `u`
+/// is made of the weight columns `segs(u)` (`(first column, count)` pairs,
+/// both multiples of [`NP`], widths summing to `width`), so a gated epilogue
+/// can take matching columns of both halves without repacking the weight.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn matmul_epilogue<E, S>(isa: Isa, m: usize, a: &[f32], w: &Packed<'_>, epi: &E, segs: S, threads: usize)
+where
+    E: crate::gemm_packed::Epilogue,
+    S: Fn(usize) -> [(usize, usize); 2] + Sync,
+{
+    let s = w.s;
+    let width = epi.width();
+    assert_eq!(a.len(), m * s.k, "MatMulNBits: A is not m x K");
+    assert!(width > 0 && width % NP == 0 && s.n % width == 0, "matmul_epilogue: width {width} must be a multiple of {NP} dividing N={}", s.n);
+    if m == 0 {
+        return;
+    }
+    let mut qa = SCRATCH.with(|q| q.take());
+    qa.quantize(isa, a, m, s.k, s.block, threads);
+    let blocks = s.n / width;
+    let mr = isa.mr();
+    let tasks = (m * s.n * s.k / MIN_MACS_PER_TASK).clamp(1, threads.max(1));
+    let (rows_per_tile, mtiles, units_per_tile, ntiles) = grid(m, mr, blocks, tasks);
+    let qa_ref = &qa;
+    run_tasks(tasks, mtiles * ntiles, |t| {
+        let (ti, tj) = (t / ntiles, t % ntiles);
+        let i0 = ti * rows_per_tile;
+        let mb = rows_per_tile.min(m - i0);
+        let mut buf = vec![0f32; mr * width];
+        for u in tj * units_per_tile..((tj + 1) * units_per_tile).min(blocks) {
+            let segs = segs(u);
+            assert!(segs.iter().all(|&(c, n)| c % NP == 0 && n % NP == 0 && c + n <= s.n));
+            assert_eq!(segs[0].1 + segs[1].1, width, "matmul_epilogue: segments must cover the block");
+            let mut i = 0;
+            while i < mb {
+                let r = mr.min(mb - i);
+                let mut off = 0;
+                for &(col, len) in &segs {
+                    let (mut p, pend) = (col / NP, (col + len) / NP);
+                    while p < pend {
+                        let nv = if wide(isa) && p + 1 < pend { 2 } else { 1 };
+                        // SAFETY: rows i0+i..+r exist, panels p..p+nv are inside the
+                        // weight, and the r x (nv*NP) tile lies inside `buf`.
+                        unsafe {
+                            micro(isa, qa_ref, w, i0 + i, r, p, nv, buf.as_mut_ptr().add(off + (p - col / NP) * NP), width, nv * NP, None)
+                        };
+                        p += nv;
+                    }
+                    off += len;
+                }
+                // SAFETY: each (row strip, block) is visited by exactly one task.
+                unsafe { epi.apply(i0 + i, r, u * width, &mut buf[..r * width]) };
+                i += r;
+            }
+        }
+    });
+    SCRATCH.with(|q| q.replace(qa));
 }
 
 #[allow(clippy::needless_range_loop)]
@@ -877,6 +974,8 @@ pub struct Table<'a> {
     pub scales: &'a [f32],
     /// Packed uint8 (`[rows, ceil(blocks * bits / 8)]`) or float `[rows, blocks]`.
     pub zp: ZeroPoints<'a>,
+    /// Row stride of packed uint8 zero points, in bytes (at least the row size).
+    pub zp_stride: usize,
 }
 
 impl Table<'_> {
@@ -896,8 +995,13 @@ impl Table<'_> {
             return Err(format!("scales has {} elements, expected {}*{kb}", self.scales.len(), self.rows));
         }
         match self.zp {
-            ZeroPoints::Packed(z) if z.len() != self.rows * (kb * self.bits).div_ceil(8) => {
-                Err(format!("zero_points has {} bytes, expected {}*{}", z.len(), self.rows, (kb * self.bits).div_ceil(8)))
+            ZeroPoints::Packed(z) => {
+                let row = (kb * self.bits).div_ceil(8);
+                if self.rows > 0 && (self.zp_stride < row || z.len() < (self.rows - 1) * self.zp_stride + row) {
+                    Err(format!("zero_points has {} bytes, too few for {} rows of {row}", z.len(), self.rows))
+                } else {
+                    Ok(())
+                }
             }
             ZeroPoints::Float(z) if z.len() != self.rows * kb => {
                 Err(format!("zero_points has {} elements, expected {}*{kb}", z.len(), self.rows))
@@ -918,7 +1022,7 @@ impl Table<'_> {
                 ZeroPoints::Default => (1u32 << (bits - 1)) as f32,
                 ZeroPoints::Float(z) => z[r * kb + b],
                 ZeroPoints::Packed(z) => {
-                    let zr = &z[r * (kb * bits).div_ceil(8)..];
+                    let zr = &z[r * self.zp_stride..];
                     f32::from((zr[b / per] >> (bits * (b % per))) & mask)
                 }
             };
@@ -1079,7 +1183,7 @@ mod tests {
         let data: Vec<u8> = (0..2 * 20).map(|i| (i * 37 % 256) as u8).collect();
         let scales: Vec<f32> = (0..6).map(|i| 0.5 + i as f32).collect();
         let zp: Vec<u8> = vec![0x21, 0x03, 0x54, 0x06];
-        let t = Table { data: &data, stride: 20, rows: 2, cols: 40, bits: 4, block: 16, scales: &scales, zp: ZeroPoints::Packed(&zp) };
+        let t = Table { data: &data, stride: 20, rows: 2, cols: 40, bits: 4, block: 16, scales: &scales, zp: ZeroPoints::Packed(&zp), zp_stride: 2 };
         t.check().unwrap();
         let mut out = vec![0f32; 40];
         t.row(1, &mut out);
