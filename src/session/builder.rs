@@ -196,15 +196,8 @@ impl SessionBuilder {
     /// Load an ONNX model from a file path.
     /// Supports models with external data by resolving paths relative to the file's directory.
     pub fn load(mut self, path: &Path) -> Result<Session, OnnxError> {
-        let bytes = std::fs::read(path).map_err(|e| {
-            OnnxError::Parse(format!("Cannot read ONNX file {}: {e}", path.display()))
-        })?;
-        let base_path = path.parent().unwrap_or_else(|| Path::new("."));
         let registry = self.take_registry();
-        let (raw_meta, graph, weights) = super::loading::parse_stage("file", bytes.len(), || {
-            crate::model::load_with_metadata_and_path(&bytes, base_path)
-        })
-        .map_err(OnnxError::Parse)?;
+        let (raw_meta, graph, weights) = super::loading::parse_file(path)?;
         let metadata = raw_meta_to_model_metadata(raw_meta);
         let built = Session::build_from_graph(
             graph,

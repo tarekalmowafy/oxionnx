@@ -1,4 +1,5 @@
 use crate::parser;
+use std::ops::Range;
 use crate::reader;
 use crate::types::{AttributeProto, NodeProto, OpsetImport, TensorProto};
 use oxionnx_core::Tensor;
@@ -63,7 +64,48 @@ pub fn load_with_path(
 pub fn load_with_metadata(
     bytes: &[u8],
 ) -> Result<(RawModelMeta, Graph, HashMap<String, Tensor>), String> {
-    let model = parser::parse_model(bytes)?;
+    load_with_metadata_releasing(bytes, None, &mut |_| {})
+}
+
+/// Internal helper: build Graph + return weights map from a GraphProto and pre-collected
+/// weights. The caller hands ownership of `weights` in; this function borrows them for
+/// attribute resolution and hands the same map straight back out together with the Graph.
+///
+/// `base_path`, when present, lets a subgraph's own (If/Loop/Scan body) initializer resolve
+/// external data the same way a top-level initializer does; see [`build_graph_impl`].
+fn build_graph_and_weights(
+    graph_proto: crate::types::GraphProto,
+    weights: HashMap<String, Tensor>,
+    base_path: Option<&Path>,
+) -> Result<(Graph, HashMap<String, Tensor>), String> {
+    let graph = build_graph_impl(&graph_proto, &weights, base_path)?;
+    Ok((graph, weights))
+}
+
+/// Load an ONNX model from bytes (resolving external data relative to `base_path`)
+/// and return `(RawModelMeta, Graph, weight_tensors)`.
+pub fn load_with_metadata_and_path(
+    bytes: &[u8],
+    base_path: &Path,
+) -> Result<(RawModelMeta, Graph, HashMap<String, Tensor>), String> {
+    load_with_metadata_releasing(bytes, Some(base_path), &mut |_| {})
+}
+
+/// [`load_with_metadata_and_path`] (or, without `base_path`, [`load_with_metadata`])
+/// that tells the caller when it is done with parts of `bytes`.
+///
+/// The large inline initializers are not copied out of `bytes` while parsing
+/// (see [`parser::parse_model_deferred`]); each one is decoded straight from
+/// `bytes`, after which `release(range)` is called: `bytes[range]` is not read
+/// again. A caller holding `bytes` as a memory map can then drop those pages,
+/// so loading an inline model needs about one copy of its weights in memory
+/// rather than three (file, parsed payloads, decoded tensors).
+pub fn load_with_metadata_releasing(
+    bytes: &[u8],
+    base_path: Option<&Path>,
+    release: &mut dyn FnMut(Range<usize>),
+) -> Result<(RawModelMeta, Graph, HashMap<String, Tensor>), String> {
+    let (model, deferred) = parser::parse_model_deferred(bytes)?;
     validate_opset(&model.opset_imports);
 
     let meta = RawModelMeta {
@@ -88,95 +130,49 @@ pub fn load_with_metadata(
     let mut graph_proto = model.graph;
     inline_local_functions(&mut graph_proto, &functions)?;
 
-    // Collect initializer (weight) tensors first (needed for input_names filter and node attrs).
-    let byte_names = crate::byte_tensor::plan(&mut graph_proto);
-    let mut weights: HashMap<String, Tensor> = HashMap::new();
-    for init in &graph_proto.initializers {
-        // Same external-data predicate as `reader::OnnxReader`, so both APIs
-        // agree on a tensor that carries external_data without data_location.
-        if reader::is_external(init) {
-            return Err("External data requires load_with_path()".to_string());
-        }
-        let tensor = if byte_names.contains(&init.name) {
-            crate::byte_tensor::pack(&init.name, &init.dims, &crate::byte_tensor::inline_bytes(init))
-                .map_err(|e| e.to_string())?
-        } else {
-            decode_tensor_proto(init)?
-        };
-        weights.insert(init.name.clone(), tensor);
-    }
-
-    let (graph, weights_out) = build_graph_and_weights(graph_proto, weights, None)?;
-    Ok((meta, graph, weights_out))
-}
-
-/// Internal helper: build Graph + return weights map from a GraphProto and pre-collected
-/// weights. The caller hands ownership of `weights` in; this function borrows them for
-/// attribute resolution and hands the same map straight back out together with the Graph.
-///
-/// `base_path`, when present, lets a subgraph's own (If/Loop/Scan body) initializer resolve
-/// external data the same way a top-level initializer does; see [`build_graph_impl`].
-fn build_graph_and_weights(
-    graph_proto: crate::types::GraphProto,
-    weights: HashMap<String, Tensor>,
-    base_path: Option<&Path>,
-) -> Result<(Graph, HashMap<String, Tensor>), String> {
-    let graph = build_graph_impl(&graph_proto, &weights, base_path)?;
-    Ok((graph, weights))
-}
-
-/// Load an ONNX model from bytes (resolving external data relative to `base_path`)
-/// and return `(RawModelMeta, Graph, weight_tensors)`.
-pub fn load_with_metadata_and_path(
-    bytes: &[u8],
-    base_path: &Path,
-) -> Result<(RawModelMeta, Graph, HashMap<String, Tensor>), String> {
-    let model = parser::parse_model(bytes)?;
-    validate_opset(&model.opset_imports);
-
-    let meta = RawModelMeta {
-        producer_name: model.producer_name.clone(),
-        producer_version: model.producer_version.clone(),
-        domain: model.domain.clone(),
-        graph_name: model.graph.name.clone(),
-        ir_version: model.ir_version,
-        opset_imports: model
-            .opset_imports
-            .iter()
-            .map(|o| (o.domain.clone(), o.version))
-            .collect(),
-        metadata_props: model.metadata_props.clone(),
-    };
-
-    // Resolve `ModelProto.functions` (field 25) — see [`inline_local_functions`].
-    let functions = model.functions;
-    let mut graph_proto = model.graph;
-    inline_local_functions(&mut graph_proto, &functions)?;
-
     // Collect initializer (weight) tensors. Sidecar files are opened once and
-    // read per tensor range.
+    // read per tensor range; deferred inline payloads are decoded from `bytes`.
     let byte_names = crate::byte_tensor::plan(&mut graph_proto);
+    let mut inline: HashMap<usize, Range<usize>> = deferred.into_iter().map(|d| (d.initializer, d.range)).collect();
     let mut files = ExternalFiles::default();
     let mut weights: HashMap<String, Tensor> = HashMap::new();
-    for init in &graph_proto.initializers {
+    for (i, init) in graph_proto.initializers.iter().enumerate() {
         let as_bytes = byte_names.contains(&init.name);
-        let tensor = match (reader::is_external(init), as_bytes) {
-            (true, false) => {
+        // Same external-data predicate as `reader::OnnxReader`, so both APIs
+        // agree on a tensor that carries external_data without data_location.
+        let external = reader::is_external(init);
+        let tensor = match (external, inline.remove(&i)) {
+            (true, _) => {
+                let Some(base_path) = base_path else {
+                    return Err("External data requires load_with_path()".to_string());
+                };
                 let bytes = files.read(init, base_path)?;
-                init.tensor_from_raw_bytes(&bytes).map_err(|e| e.to_string())?
+                if as_bytes {
+                    crate::byte_tensor::pack(&init.name, &init.dims, &bytes)
+                } else {
+                    init.tensor_from_raw_bytes(&bytes)
+                }
+                .map_err(|e| e.to_string())?
             }
-            (true, true) => {
-                let bytes = files.read(init, base_path)?;
-                crate::byte_tensor::pack(&init.name, &init.dims, &bytes).map_err(|e| e.to_string())?
+            (false, Some(range)) => {
+                let raw = bytes.get(range.clone()).ok_or_else(|| format!("initializer '{}': payload out of range", init.name))?;
+                let tensor = if as_bytes {
+                    crate::byte_tensor::pack(&init.name, &init.dims, raw)
+                } else {
+                    init.tensor_from_raw_bytes(raw)
+                }
+                .map_err(|e| e.to_string())?;
+                release(range);
+                tensor
             }
-            (false, true) => crate::byte_tensor::pack(&init.name, &init.dims, &crate::byte_tensor::inline_bytes(init))
+            (false, None) if as_bytes => crate::byte_tensor::pack(&init.name, &init.dims, &crate::byte_tensor::inline_bytes(init))
                 .map_err(|e| e.to_string())?,
-            (false, false) => decode_tensor_proto(init)?,
+            (false, None) => decode_tensor_proto(init)?,
         };
         weights.insert(init.name.clone(), tensor);
     }
 
-    let (graph, weights_out) = build_graph_and_weights(graph_proto, weights, Some(base_path))?;
+    let (graph, weights_out) = build_graph_and_weights(graph_proto, weights, base_path)?;
     Ok((meta, graph, weights_out))
 }
 
