@@ -60,41 +60,42 @@ pub fn prepack_matmul_nbits(nodes: Vec<Node>, weights: &mut HashMap<String, Tens
         }
     }
     let exclusive = |name: &str| uses.get(name) == Some(&1) && !pinned.contains(name);
-    let mut plan = Vec::new();
-    for (idx, n) in nodes.iter().enumerate() {
-        if n.op.as_str() != "MatMulNBits" || n.inputs.get(4).is_some_and(|g| !g.is_empty()) {
-            continue;
-        }
-        let input = |i: usize| n.inputs.get(i).filter(|s| !s.is_empty());
-        let (Some(b), Some(scales)) = (input(1), input(2)) else { continue };
-        let zp = input(3);
-        let consts = [Some(b), Some(scales), zp].into_iter().flatten();
-        if !consts.clone().all(|name| weights.contains_key(name) && exclusive(name)) {
-            continue;
-        }
+    let candidates: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.op.as_str() == "MatMulNBits" && !n.inputs.get(4).is_some_and(|g| !g.is_empty()))
+        .filter(|(_, n)| {
+            let input = |i: usize| n.inputs.get(i).filter(|s| !s.is_empty());
+            let (Some(b), Some(scales)) = (input(1), input(2)) else { return false };
+            [Some(b), Some(scales), input(3)].into_iter().flatten().all(|name| weights.contains_key(name) && exclusive(name))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let mut nodes = nodes;
+    let mut count = 0;
+    // One node at a time: each original is dropped as soon as its repack is
+    // stored, so the two layouts never all coexist and the allocator can reuse
+    // the freed memory for the next repack.
+    for idx in candidates {
+        let n = &mut nodes[idx];
+        let (b, scales, zp) = (n.inputs[1].clone(), n.inputs[2].clone(), n.inputs.get(3).filter(|z| !z.is_empty()).cloned());
         let packed = oxionnx_ops::registry::nbits_ops::pack_matmul_nbits(
             &n.attrs,
-            &weights[b],
-            &weights[scales],
-            zp.map(|z| &weights[z]),
+            &weights[&b],
+            &weights[&scales],
+            zp.as_ref().map(|z| &weights[z]),
         );
-        match packed {
-            Ok(words) => plan.push((idx, words)),
-            Err(e) => tracing::warn!(node = %n.name, error = %e, "MatMulNBits: weight not prepacked"),
-        }
-    }
-    if plan.is_empty() {
-        return nodes;
-    }
-    let count = plan.len();
-    let mut nodes = nodes;
-    for (idx, words) in plan {
-        let n = &mut nodes[idx];
-        let (b, scales, zp) = (n.inputs[1].clone(), n.inputs[2].clone(), n.inputs.get(3).cloned());
+        let words = match packed {
+            Ok(words) => words,
+            Err(e) => {
+                tracing::warn!(node = %n.name, error = %e, "MatMulNBits: weight not prepacked");
+                continue;
+            }
+        };
         let len = words.len();
         weights.insert(b.clone(), Tensor { data: words, shape: vec![len] });
         weights.remove(&scales);
-        if let Some(z) = zp.filter(|z| !z.is_empty()) {
+        if let Some(z) = zp {
             weights.remove(&z);
         }
         let mut inputs = vec![n.inputs[0].clone(), b];
@@ -103,6 +104,10 @@ pub fn prepack_matmul_nbits(nodes: Vec<Node>, weights: &mut HashMap<String, Tens
         }
         n.op = OpKind::Unknown("OxiMatMulNBits".into());
         n.inputs = inputs;
+        count += 1;
+    }
+    if count == 0 {
+        return nodes;
     }
     tracing::debug!(count, "prepacked MatMulNBits weights into OxiMatMulNBits");
     nodes
