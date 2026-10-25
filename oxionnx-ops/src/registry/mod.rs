@@ -7,6 +7,7 @@ pub mod cast_like;
 pub mod center_crop_pad;
 pub mod col2im;
 pub mod contrib_ops;
+pub mod nbits_ops;
 pub mod conv_ops;
 pub mod det;
 pub mod indexing_ops;
@@ -181,6 +182,9 @@ pub fn default_registry() -> OperatorRegistry {
     r.register(Box::new(contrib_ops::OxiAttentionOp));
     r.register(Box::new(contrib_ops::OxiMatMulActOp::default()));
     r.register(Box::new(contrib_ops::OxiMatMulSplitOp::default()));
+    r.register(Box::new(nbits_ops::MatMulNBitsOp::new(false)));
+    r.register(Box::new(nbits_ops::MatMulNBitsOp::new(true)));
+    r.register(Box::new(nbits_ops::GatherBlockQuantizedOp::default()));
 
     // ── Aliases (ONNX names that differ from our canonical op_type) ────────
     r.register_as("LayerNorm", Box::new(nn_ops::LayerNormOp));

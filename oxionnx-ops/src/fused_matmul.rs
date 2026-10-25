@@ -226,12 +226,13 @@ pub fn matmul_split_unfused(m: usize, product: &mut [f32], spec: &SplitSpec<'_>,
 }
 
 #[cfg(target_arch = "x86_64")]
-pub(crate) use packed::{matmul_act_packed, matmul_split_packed};
+pub(crate) use packed::{matmul_act_nbits, matmul_act_packed, matmul_split_nbits, matmul_split_packed};
 
 #[cfg(target_arch = "x86_64")]
 mod packed {
     use super::{finish, Spec, SplitSpec};
     use crate::gemm_packed::{gemm_epilogue, Epilogue, PackedB};
+    use crate::matmul_nbits::{isa as nbits_isa, matmul_epilogue, Packed};
 
     struct Out(*mut f32);
     unsafe impl Send for Out {}
@@ -290,6 +291,34 @@ mod packed {
         assert!(width <= 256 && spec.mul.map_or(true, |mul| mul.len() == m * b.n));
         let epi = ActEpilogue { spec: *spec, n: b.n, n_out, width, out: Out(out.as_mut_ptr()) };
         gemm_epilogue(m, x, b, &epi, threads);
+    }
+
+    /// [`matmul_act_packed`] for a block-quantized weight (unpermuted: the
+    /// gated halves are addressed per block instead of interleaved).
+    pub(crate) fn matmul_act_nbits(m: usize, x: &[f32], w: &Packed<'_>, width: usize, spec: &Spec<'_>, out: &mut [f32], threads: usize) {
+        let n = w.s.n;
+        let n_out = if spec.gate.is_some() { n / 2 } else { n };
+        assert_eq!(out.len(), m * n_out);
+        assert!(width <= 256 && spec.mul.map_or(true, |mul| mul.len() == m * n));
+        let epi = ActEpilogue { spec: *spec, n, n_out, width, out: Out(out.as_mut_ptr()) };
+        let gate = spec.gate;
+        let segs = move |u: usize| match gate {
+            Some(ah) => {
+                let (hb, h) = (width / 2, n / 2);
+                let (a0, b0) = if ah == 0 { (0, h) } else { (h, 0) };
+                [(a0 + u * hb, hb), (b0 + u * hb, hb)]
+            }
+            None => [(u * width, width), (0, 0)],
+        };
+        matmul_epilogue(nbits_isa(), m, x, w, &epi, segs, threads);
+    }
+
+    /// [`matmul_split_packed`] for a block-quantized weight; `block` a multiple of 16.
+    pub(crate) fn matmul_split_nbits(m: usize, x: &[f32], w: &Packed<'_>, spec: &SplitSpec<'_>, block: usize, outs: &mut [&mut [f32]], threads: usize) {
+        assert_eq!(spec.splits.iter().sum::<usize>(), w.s.n);
+        assert!(outs.iter().zip(&spec.splits).all(|(o, &ow)| o.len() == m * ow));
+        let epi = SplitEpilogue { spec, block, outs: outs.iter_mut().map(|o| Out(o.as_mut_ptr())).collect() };
+        matmul_epilogue(nbits_isa(), m, x, w, &epi, |u| [(u * block, block), (0, 0)], threads);
     }
 
     struct SplitEpilogue<'a, 'b> {

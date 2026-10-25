@@ -88,10 +88,10 @@ impl<'a> Matcher<'a> {
         let node = &self.nodes[mm];
         let (x, w) = (node.inputs.first()?.as_str(), node.inputs.get(1)?.as_str());
         let wt = self.weights.get(w)?;
-        if wt.shape.len() != 2 || node.outputs.len() != 1 || x.is_empty() {
+        let (n, nbits) = crate::optimizer::nbits::projection_cols(node, wt)?;
+        if node.outputs.len() != 1 || x.is_empty() {
             return None;
         }
-        let n = wt.shape[1];
         let mut remove = vec![mm];
         let mut y = self.out(mm);
         // Optional bias.
@@ -116,7 +116,7 @@ impl<'a> Matcher<'a> {
                 Some((m, z)) => (m, Some(z)),
                 None => (gelu, None),
             };
-            return Some(self.build(remove, at, [x, w, bias.unwrap_or(""), z.unwrap_or("")], approx, -1));
+            return Some(self.build(remove, at, [x, w, bias.unwrap_or(""), z.unwrap_or("")], approx, -1, nbits));
         }
         // Gated: Split into two equal halves along the last axis.
         let split = self.cons(y, OpKind::Split)?;
@@ -132,7 +132,7 @@ impl<'a> Matcher<'a> {
             return None;
         }
         remove.extend([split, gelu]);
-        Some(self.build(remove, mul, [x, w, bias.unwrap_or(""), ""], approx, h as i64))
+        Some(self.build(remove, mul, [x, w, bias.unwrap_or(""), ""], approx, h as i64, nbits))
     }
 
     /// `Split` node `i` cuts its input's last axis (of width `n`) into two equal halves.
@@ -149,7 +149,8 @@ impl<'a> Matcher<'a> {
         sizes.is_some_and(|v| v == [n as i64 / 2; 2])
     }
 
-    fn build(&self, remove: Vec<usize>, at: usize, inputs: [&str; 4], approx: &str, gate: i64) -> Fused {
+    #[allow(clippy::too_many_arguments)]
+    fn build(&self, remove: Vec<usize>, at: usize, inputs: [&str; 4], approx: &str, gate: i64, nbits: bool) -> Fused {
         let mut inputs: Vec<String> = inputs.iter().map(|s| s.to_string()).collect();
         while inputs.last().is_some_and(String::is_empty) {
             inputs.pop();
@@ -158,6 +159,9 @@ impl<'a> Matcher<'a> {
         attrs.strings.insert("activation".into(), "gelu".into());
         attrs.strings.insert("approximate".into(), approx.into());
         attrs.ints.insert("gate".into(), gate);
+        if nbits {
+            attrs.ints.insert("nbits".into(), 1);
+        }
         let last = &self.nodes[at];
         let remove = remove.into_iter().filter(|&i| i != at).collect();
         Fused {
@@ -181,7 +185,7 @@ pub fn fuse_matmul_act(nodes: Vec<Node>, weights: &HashMap<String, Tensor>, outp
         let mut claimed = HashSet::new();
         let mut out = Vec::new();
         for (i, n) in nodes.iter().enumerate() {
-            if n.op != OpKind::MatMul {
+            if !crate::optimizer::nbits::is_projection(n) {
                 continue;
             }
             if let Some(f) = m.try_fuse(i) {

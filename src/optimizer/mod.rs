@@ -8,6 +8,7 @@ pub mod dead_code;
 pub mod fusion;
 pub mod graph_diff;
 pub(crate) mod graph_utils;
+pub mod nbits;
 pub mod shape_inference;
 pub(crate) mod shape_inference_ext;
 pub mod symbolic_shape;
@@ -109,6 +110,13 @@ pub fn optimize_with_input_shapes(
     level: PassLevel,
     input_shapes: &HashMap<String, Vec<usize>>,
 ) -> Vec<Node> {
+    // Quantized weights go into their kernel layout first, so every later pass
+    // sees the final op and no ORT-layout copy outlives the build.
+    let nodes = if registry.get("OxiMatMulNBits").is_some() {
+        nbits::prepack_matmul_nbits(nodes, weights, output_names)
+    } else {
+        nodes
+    };
     let nodes = if level == PassLevel::All {
         let known_shapes = shape_inference::infer_shapes(&nodes, weights, input_shapes);
         materialize_shape_ops(&nodes, weights, &known_shapes);

@@ -297,6 +297,35 @@ pub struct OxiMatMulActOp {
     cache: WeightCache,
 }
 
+/// With the `nbits` attribute set, input 1 is a block-quantized weight in the
+/// [`crate::matmul_nbits::pack`] layout (from `OxiMatMulNBits`), not a `[K, N]` matrix.
+fn nbits_weight<'t>(attrs: &oxionnx_core::graph::Attributes, w: &'t Tensor) -> Result<Option<crate::matmul_nbits::Packed<'t>>, String> {
+    if attrs.i("nbits", 0) == 0 {
+        return Ok(None);
+    }
+    crate::matmul_nbits::Packed::from_words(&w.data).map(Some)
+}
+
+/// `(K, N)` of the weight, checked against `x`'s last axis.
+fn weight_dims(nbits: Option<&crate::matmul_nbits::Packed<'_>>, x: &Tensor, w: &Tensor) -> Result<(usize, usize), String> {
+    let (k, n) = match nbits {
+        Some(p) => (p.s.k, p.s.n),
+        None if w.ndim() == 2 => (w.shape[0], w.shape[1]),
+        None => return Err(format!("weight {:?} is not 2-D", w.shape)),
+    };
+    if x.ndim() == 0 || x.shape[x.ndim() - 1] != k {
+        return Err(format!("x {:?} @ w [{k}, {n}]", x.shape));
+    }
+    Ok((k, n))
+}
+
+/// The full `x @ W` product for a quantized weight (unfused fallbacks).
+fn nbits_product(m: usize, x: &Tensor, p: &crate::matmul_nbits::Packed<'_>) -> Vec<f32> {
+    let mut product = vec![0f32; m * p.s.n];
+    crate::matmul_nbits::matmul(crate::matmul_nbits::isa(), m, &x.data, p, None, &mut product, crate::par::threads());
+    product
+}
+
 /// Constant weights (input 1) packed once for [`crate::gemm_packed`], keyed by
 /// (weight name, layout tag) and checked against the source data pointer. Per
 /// session, like the registry; shared with `MatMulOp`.
@@ -447,10 +476,8 @@ impl OxiMatMulActOp {
             h @ (0 | 1) => Some(h as usize),
             h => return Err(bad(format!("gate must be -1, 0 or 1, got {h}"))),
         };
-        if w.ndim() != 2 || x.ndim() == 0 || x.shape[x.ndim() - 1] != w.shape[0] {
-            return Err(bad(format!("x {:?} @ w {:?}", x.shape, w.shape)));
-        }
-        let (k, n) = (w.shape[0], w.shape[1]);
+        let nbits = nbits_weight(attrs, w).map_err(bad)?;
+        let (k, n) = weight_dims(nbits.as_ref(), x, w).map_err(bad)?;
         if gate.is_some() && (n % 2 != 0 || mul.is_some()) {
             return Err(bad(format!("gated form needs an even N (got {n}) and no mul")));
         }
@@ -469,7 +496,18 @@ impl OxiMatMulActOp {
         let spec = Spec { act, gate, bias: bias.map(|b| &b.data[..]), mul: mul_fused.map(|t| &t.data[..]) };
         let mut res = Tensor { data: std::mem::take(&mut slots[0].data), shape: vec![] };
         shape_slot(&mut res, &out_shape);
-        if !self.packed(ctx, m, x, w, &spec, &mut res.data) {
+        if let Some(p) = &nbits {
+            match fm::block_cols(n, gate.is_some()) {
+                Some(cols) => {
+                    let width = if gate.is_some() { 2 * cols } else { cols };
+                    fm::matmul_act_nbits(m, &x.data, p, width, &spec, &mut res.data, crate::par::threads());
+                }
+                None => {
+                    let mut product = nbits_product(m, x, p);
+                    fm::matmul_act_unfused(m, n, &mut product, &spec, &mut res.data);
+                }
+            }
+        } else if !self.packed(ctx, m, x, w, &spec, &mut res.data) {
             let tag = gate.map_or(-1, |h| h as i64);
             let cols = || Some(fm::gate_columns(n, gate?, fm::block_cols(n, true)?));
             let w = dense_weight(&self.cache, ctx, w, tag, cols)?;
@@ -584,10 +622,8 @@ impl OxiMatMulSplitOp {
         let attrs = ctx.attrs();
         let bad = |m: String| err(format!("OxiMatMulSplit '{}': {m}", ctx.node.name));
         let splits: Vec<usize> = attrs.ints("split").iter().map(|&v| v.max(0) as usize).collect();
-        if w.ndim() != 2 || x.ndim() == 0 || x.shape[x.ndim() - 1] != w.shape[0] {
-            return Err(bad(format!("x {:?} @ w {:?}", x.shape, w.shape)));
-        }
-        let (k, n) = (w.shape[0], w.shape[1]);
+        let nbits = nbits_weight(attrs, w).map_err(bad)?;
+        let (k, n) = weight_dims(nbits.as_ref(), x, w).map_err(bad)?;
         if splits.iter().sum::<usize>() != n || splits.len() != slots.len() {
             return Err(bad(format!("split {splits:?} does not cover N={n} with {} outputs", slots.len())));
         }
@@ -648,6 +684,16 @@ impl OxiMatMulSplitOp {
             shape_slot(slot, &shape);
         }
         let mut outs: Vec<&mut [f32]> = slots.iter_mut().map(|t| &mut t.data[..]).collect();
+        if let Some(p) = &nbits {
+            if block % crate::matmul_nbits::NP == 0 {
+                fm::matmul_split_nbits(m, &x.data, p, &spec, block, &mut outs, crate::par::threads());
+            } else {
+                let mut product = nbits_product(m, x, p);
+                fm::matmul_split_unfused(m, &mut product, &spec, block, &mut outs);
+            }
+            return Ok(());
+        }
+        let _ = k;
         #[cfg(target_arch = "x86_64")]
         if block % 32 == 0 {
             if let Some(p) = self.cache.get(ctx, w, -1, |isa| crate::gemm_packed::PackedB::pack_for(isa, &w.data, k, n)) {

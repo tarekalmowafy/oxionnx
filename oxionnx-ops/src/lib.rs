@@ -22,6 +22,7 @@ pub(crate) mod gemm_packed;
 pub mod indexing;
 pub mod kv_cache;
 pub mod math;
+pub mod matmul_nbits;
 pub(crate) mod math_typed;
 pub mod ml;
 pub mod ml_svm;
