@@ -1,4 +1,3 @@
-use crate::math::broadcast_to;
 use oxionnx_core::Tensor;
 
 // ── Element-wise comparison ops ─────────────────────────────────────────────
@@ -6,18 +5,13 @@ use oxionnx_core::Tensor;
 fn comparison_binary(
     a: &Tensor,
     b: &Tensor,
-    op: impl Fn(f32, f32) -> bool,
+    op: impl Fn(f32, f32) -> bool + Copy + Send + Sync,
 ) -> Result<Tensor, String> {
-    let target = Tensor::broadcast_shape(&a.shape, &b.shape)?;
-    let ab = broadcast_to(a, &target);
-    let bb = broadcast_to(b, &target);
-    let data: Vec<f32> = ab
-        .data
-        .iter()
-        .zip(bb.data.iter())
-        .map(|(&x, &y)| if op(x, y) { 1.0 } else { 0.0 })
-        .collect();
-    Ok(Tensor::new(data, target))
+    // Prototype (onnx_spike): the row-wise broadcast kernel instead of
+    // materialising both operands at the output shape.
+    let mut out = Tensor { data: Vec::new(), shape: Vec::new() };
+    crate::math::binary_into(a, b, &mut out, move |x, y| if op(x, y) { 1.0 } else { 0.0 })?;
+    Ok(out)
 }
 
 /// Element-wise equal: 1.0 where a == b, 0.0 otherwise.
