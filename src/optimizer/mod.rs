@@ -59,7 +59,8 @@ pub fn optimize(
 ///     LayerNorm, spatial (InstanceNorm-style) normalization chains,
 ///     Transpose/Reshape cancellation, MatMul+Transpose, Add+MatMul→Gemm,
 ///     Gather composition, Conv+Add+Relu, and — when the registry has the
-///     fused kernels — attention (`OxiAttention`) and MatMul+GELU (`OxiMatMulAct`).
+///     fused kernels — attention (`OxiAttention`), MatMul+GELU (`OxiMatMulAct`)
+///     and MatMul+Split projections (`OxiMatMulSplit`).
 ///
 /// [`PassLevel::Extended`] runs step 3 and step 5; [`PassLevel::Basic`] runs
 /// step 3 only.  Every pass keeps the declared `output_names` produced.
@@ -140,6 +141,12 @@ pub fn optimize_with_input_shapes(
     // Before MatMul+Add→Gemm, which would take the bias Add this pass folds in.
     let nodes = if registry.get("OxiMatMulAct").is_some() {
         fusion::fuse_matmul_act(nodes, weights, output_names)
+    } else {
+        nodes
+    };
+    // After the gated-GELU fusion, whose `MatMul -> Split` prefix this also matches.
+    let nodes = if registry.get("OxiMatMulSplit").is_some() {
+        fusion::fuse_matmul_split(nodes, weights, output_names)
     } else {
         nodes
     };

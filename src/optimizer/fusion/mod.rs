@@ -4,14 +4,16 @@
 //! MatMul+Transpose fusion, Add+MatMul→Gemm fusion, Conv+Add+Relu (ResNet),
 //! Gather+Gather composition, Dropout elimination, Transpose+Reshape simplification,
 //! spatial (InstanceNorm-style) normalization chains, scaled dot-product attention,
-//! MatMul + GELU (plain and gated).
+//! MatMul + GELU (plain and gated), MatMul + Split projections (with head norm
+//! and rotary).
 //!
 //! All of them are wired into [`crate::optimizer::optimize_with_level`] at
 //! `PassLevel::Extended` and above, except `fuse_conv_add_relu`,
-//! `fuse_instance_norm`, `fuse_attention` and `fuse_matmul_act`, which emit the
-//! optimizer-only `ConvAddRelu` / `OxiInstanceNorm` / `OxiAttention` /
-//! `OxiMatMulAct` ops and therefore run only when the active `OperatorRegistry`
-//! provides a kernel for them.
+//! `fuse_instance_norm`, `fuse_attention`, `fuse_matmul_act` and
+//! `fuse_matmul_split`, which emit the optimizer-only `ConvAddRelu` /
+//! `OxiInstanceNorm` / `OxiAttention` / `OxiMatMulAct` / `OxiMatMulSplit` ops
+//! and therefore run only when the active `OperatorRegistry` provides a kernel
+//! for them.
 //!
 //! Every pass takes the graph's `output_names` and refuses to remove, rename or
 //! re-parent a tensor the model declares as an output.
@@ -21,11 +23,13 @@ mod conv;
 mod instance_norm;
 mod matmul;
 mod matmul_act;
+mod matmul_split;
 mod simplify;
 
 pub use attention::fuse_attention;
 pub use instance_norm::fuse_instance_norm;
 pub use matmul_act::fuse_matmul_act;
+pub use matmul_split::fuse_matmul_split;
 
 pub use conv::{
     fold_batch_norm_inference, fuse_conv_add_relu, fuse_conv_batchnorm,

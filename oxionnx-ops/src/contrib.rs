@@ -199,46 +199,7 @@ pub fn ms_rotary_into(
     if x.len() != n || out.len() < n {
         return Err(format!("com.microsoft::RotaryEmbedding: buffer sizes do not match {dims:?}"));
     }
-    let half = rotary_dim / 2;
-    let rows = if per_token_cache { batch * seq } else { cos.len() / half.max(1) };
-    if cos.len() != sin.len() || (half > 0 && cos.len() % half != 0) {
-        return Err("com.microsoft::RotaryEmbedding: cos/sin caches differ in size".into());
-    }
-    let single_offset = position_ids.len() == 1;
-    if per_token_cache {
-        if rows != batch * seq {
-            return Err(format!(
-                "com.microsoft::RotaryEmbedding: per-token cos cache has {rows} rows, expected {}",
-                batch * seq
-            ));
-        }
-    } else if single_offset {
-        if seq > 0 && (position_ids[0] < 0.0 || position_ids[0] as usize + seq > rows) {
-            return Err(format!(
-                "com.microsoft::RotaryEmbedding: positions {}..{} outside cos cache ({rows} rows)",
-                position_ids[0],
-                position_ids[0] as usize + seq
-            ));
-        }
-    } else if position_ids.len() != batch * seq {
-        return Err(format!(
-            "com.microsoft::RotaryEmbedding: position_ids has {} elements, expected 1 or {}",
-            position_ids.len(),
-            batch * seq
-        ));
-    } else if let Some(&p) = position_ids.iter().find(|&&p| p < 0.0 || p as usize >= rows) {
-        return Err(format!("com.microsoft::RotaryEmbedding: position {p} outside cos cache ({rows} rows)"));
-    }
-    // Cache row for token (b, s); in range by the checks above.
-    let cache_row = |b: usize, s: usize| -> usize {
-        if per_token_cache {
-            b * seq + s
-        } else if single_offset {
-            position_ids[0] as usize + s
-        } else {
-            position_ids[b * seq + s] as usize
-        }
-    };
+    let cache = RotaryCache::new(position_ids, cos, sin, per_token_cache, batch, seq, rotary_dim / 2)?;
     let total_heads = batch * seq * num_heads;
     let op = SendPtr(out.as_mut_ptr());
     let min_heads = (crate::par::MIN_ELEMS_PER_TASK / head_size.max(1)).max(1);
@@ -251,29 +212,104 @@ pub fn ms_rotary_into(
             } else {
                 (hrow / (seq * num_heads), (hrow / num_heads) % seq)
             };
-            let r = cache_row(b, s);
-            let (c, sn) = (&cos[r * half..(r + 1) * half], &sin[r * half..(r + 1) * half]);
+            let (c, sn) = cache.row(b, s);
             let xi = &x[hrow * head_size..(hrow + 1) * head_size];
             // SAFETY: head row `hrow` is written by this task only.
             let o = unsafe { std::slice::from_raw_parts_mut(op.0.add(hrow * head_size), head_size) };
-            if interleaved {
-                for i in 0..half {
-                    let (x1, x2) = (xi[2 * i], xi[2 * i + 1]);
-                    o[2 * i] = x1 * c[i] - x2 * sn[i];
-                    o[2 * i + 1] = x2 * c[i] + x1 * sn[i];
-                }
-            } else {
-                let (x1, x2) = (&xi[..half], &xi[half..rotary_dim]);
-                let (o1, o2) = o[..rotary_dim].split_at_mut(half);
-                for i in 0..half {
-                    o1[i] = x1[i] * c[i] - x2[i] * sn[i];
-                    o2[i] = x2[i] * c[i] + x1[i] * sn[i];
-                }
-            }
-            o[rotary_dim..].copy_from_slice(&xi[rotary_dim..]);
+            rotate_head(xi, c, sn, rotary_dim, interleaved, o);
         }
     });
     Ok(())
+}
+
+/// Validated cos/sin cache lookup for `com.microsoft::RotaryEmbedding`.
+#[derive(Clone, Copy)]
+pub struct RotaryCache<'a> {
+    position_ids: &'a [f32],
+    cos: &'a [f32],
+    sin: &'a [f32],
+    per_token: bool,
+    seq: usize,
+    half: usize,
+}
+
+impl<'a> RotaryCache<'a> {
+    /// `cos`/`sin` are `[max_pos, half]` (or `[B, S, half]` when `per_token`);
+    /// `position_ids` is one offset or `[B, S]`. Checks every position is in range.
+    pub fn new(
+        position_ids: &'a [f32],
+        cos: &'a [f32],
+        sin: &'a [f32],
+        per_token: bool,
+        batch: usize,
+        seq: usize,
+        half: usize,
+    ) -> Result<Self, String> {
+        let rows = if per_token { batch * seq } else { cos.len() / half.max(1) };
+        if cos.len() != sin.len() || (half > 0 && cos.len() % half != 0) {
+            return Err("com.microsoft::RotaryEmbedding: cos/sin caches differ in size".into());
+        }
+        if per_token {
+            if rows != batch * seq {
+                return Err(format!(
+                    "com.microsoft::RotaryEmbedding: per-token cos cache has {rows} rows, expected {}",
+                    batch * seq
+                ));
+            }
+        } else if position_ids.len() == 1 {
+            if seq > 0 && (position_ids[0] < 0.0 || position_ids[0] as usize + seq > rows) {
+                return Err(format!(
+                    "com.microsoft::RotaryEmbedding: positions {}..{} outside cos cache ({rows} rows)",
+                    position_ids[0],
+                    position_ids[0] as usize + seq
+                ));
+            }
+        } else if position_ids.len() != batch * seq {
+            return Err(format!(
+                "com.microsoft::RotaryEmbedding: position_ids has {} elements, expected 1 or {}",
+                position_ids.len(),
+                batch * seq
+            ));
+        } else if let Some(&p) = position_ids.iter().find(|&&p| p < 0.0 || p as usize >= rows) {
+            return Err(format!("com.microsoft::RotaryEmbedding: position {p} outside cos cache ({rows} rows)"));
+        }
+        Ok(Self { position_ids, cos, sin, per_token, seq, half })
+    }
+
+    /// The cos and sin rows for token `(b, s)`.
+    #[inline]
+    pub fn row(&self, b: usize, s: usize) -> (&'a [f32], &'a [f32]) {
+        let r = if self.per_token {
+            b * self.seq + s
+        } else if self.position_ids.len() == 1 {
+            self.position_ids[0] as usize + s
+        } else {
+            self.position_ids[b * self.seq + s] as usize
+        };
+        let h = self.half;
+        (&self.cos[r * h..(r + 1) * h], &self.sin[r * h..(r + 1) * h])
+    }
+}
+
+/// Rotate one head `xi` into `o` (the first `rotary_dim` elements; the rest are copied).
+#[inline]
+pub fn rotate_head(xi: &[f32], c: &[f32], sn: &[f32], rotary_dim: usize, interleaved: bool, o: &mut [f32]) {
+    let half = rotary_dim / 2;
+    if interleaved {
+        for i in 0..half {
+            let (x1, x2) = (xi[2 * i], xi[2 * i + 1]);
+            o[2 * i] = x1 * c[i] - x2 * sn[i];
+            o[2 * i + 1] = x2 * c[i] + x1 * sn[i];
+        }
+    } else {
+        let (x1, x2) = (&xi[..half], &xi[half..rotary_dim]);
+        let (o1, o2) = o[..rotary_dim].split_at_mut(half);
+        for i in 0..half {
+            o1[i] = x1[i] * c[i] - x2[i] * sn[i];
+            o2[i] = x2[i] * c[i] + x1[i] * sn[i];
+        }
+    }
+    o[rotary_dim..xi.len()].copy_from_slice(&xi[rotary_dim..]);
 }
 
 // ── Fused attention ──────────────────────────────────────────────────────────

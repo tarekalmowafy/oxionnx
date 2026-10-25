@@ -427,6 +427,130 @@ impl Operator for OxiMatMulActOp {
     }
 }
 
+// ── OxiMatMulSplit (optimizer-only) ──────────────────────────────────────────
+
+/// Projection by a constant 2-D weight, split along its columns into several
+/// outputs, emitted by the optimizer's MatMul-split fusion (see
+/// [`crate::fused_matmul::SplitSpec`]).
+///
+/// Inputs: `x` `[.., K]`, `w` `[K, N]`, then optional `bias` `[N]`,
+/// `head_gamma` `[D]` (per-head RMSNorm over `D`-wide heads, as
+/// `Reshape [0,-1,D] -> SimplifiedLayerNormalization -> Reshape [0,-1,N]`),
+/// `col_scale` `[N]`, and the `com.microsoft::RotaryEmbedding` inputs
+/// `position_ids`, `cos_cache`, `sin_cache`.
+/// Attributes: `split` (output widths), `epsilon`, `rotate` (per output, 1 =
+/// rotary), `interleaved`, `num_heads`, `rotary_embedding_dim` (as for the
+/// rotary op, applied to each rotated output).
+/// Outputs: `[.., split[o]]` each (`[d0, M/d0, split[o]]` with the head norm,
+/// as the norm's reshape pair produces).
+#[derive(Default)]
+pub struct OxiMatMulSplitOp {
+    cache: WeightCache,
+}
+
+impl OxiMatMulSplitOp {
+    fn run(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
+        use crate::fused_matmul::{self as fm, HeadNorm, SplitRotary, SplitSpec};
+        let (x, w) = (ctx.input(0)?, ctx.input(1)?);
+        let opt = |i| ctx.optional_input(i);
+        let (bias, gamma, col_scale) = (opt(2), opt(3), opt(4));
+        let attrs = ctx.attrs();
+        let bad = |m: String| err(format!("OxiMatMulSplit '{}': {m}", ctx.node.name));
+        let splits: Vec<usize> = attrs.ints("split").iter().map(|&v| v.max(0) as usize).collect();
+        if w.ndim() != 2 || x.ndim() == 0 || x.shape[x.ndim() - 1] != w.shape[0] {
+            return Err(bad(format!("x {:?} @ w {:?}", x.shape, w.shape)));
+        }
+        let (k, n) = (w.shape[0], w.shape[1]);
+        if splits.iter().sum::<usize>() != n || splits.len() != slots.len() {
+            return Err(bad(format!("split {splits:?} does not cover N={n} with {} outputs", slots.len())));
+        }
+        for (name, t) in [("bias", bias), ("col_scale", col_scale)] {
+            if t.is_some_and(|t| t.data.len() != n) {
+                return Err(bad(format!("{name} has {} elements, expected {n}", t.map_or(0, |t| t.data.len()))));
+            }
+        }
+        let m = x.data.len() / k.max(1);
+        // Output row geometry: the head norm's reshape pair yields [d0, M/d0, .].
+        let lead: Vec<usize> = if gamma.is_some() {
+            if x.ndim() < 2 {
+                return Err(bad("head norm needs x of rank >= 2".into()));
+            }
+            vec![x.shape[0], m / x.shape[0].max(1)]
+        } else {
+            x.shape[..x.ndim() - 1].to_vec()
+        };
+        let mut rotate: Vec<bool> = attrs.ints("rotate").iter().map(|&v| v != 0).collect();
+        rotate.resize(splits.len(), false);
+        let (mut rotary, mut head) = (None, None);
+        if rotate.iter().any(|&r| r) {
+            let (pos, cos, sin) = (ctx.input(5)?, ctx.input(6)?, ctx.input(7)?);
+            let [b, s] = lead[..] else { return Err(bad(format!("rotary needs 3-D outputs, got {lead:?}"))) };
+            let half = *cos.shape.last().ok_or_else(|| bad("scalar cos cache".into()))?;
+            let mut dims = None;
+            for (o, _) in rotate.iter().enumerate().filter(|(_, &r)| r) {
+                let d = RotaryDims::new(
+                    &[b, s, splits[o]],
+                    half,
+                    attrs.i("num_heads", 0).max(0) as usize,
+                    attrs.i("rotary_embedding_dim", 0).max(0) as usize,
+                    attrs.i("interleaved", 0) != 0,
+                )
+                .map_err(bad)?;
+                if dims.is_some_and(|p: RotaryDims| (p.head_size, p.rotary_dim) != (d.head_size, d.rotary_dim)) {
+                    return Err(bad("rotated outputs differ in head size".into()));
+                }
+                dims = Some(d);
+            }
+            let d = dims.expect("some output is rotated");
+            let cache = crate::contrib::RotaryCache::new(&pos.data, &cos.data, &sin.data, cos.ndim() == 3, b, s, d.rotary_dim / 2)
+                .map_err(bad)?;
+            rotary = Some(SplitRotary { cache, seq: s, rotary_dim: d.rotary_dim, interleaved: d.interleaved });
+            head = Some(d.head_size);
+        }
+        let spec = SplitSpec {
+            splits: splits.clone(),
+            bias: bias.map(|t| &t.data[..]),
+            norm: gamma.map(|g| HeadNorm { gamma: &g.data, eps: attrs.f("epsilon", 1e-5) }),
+            col_scale: col_scale.map(|t| &t.data[..]),
+            rotary,
+            rotate,
+        };
+        let block = spec.block(head).ok_or_else(|| bad(format!("no column block fits split {splits:?} / head {head:?}")))?;
+        for (slot, &w_o) in slots.iter_mut().zip(&splits) {
+            let shape: Vec<usize> = lead.iter().copied().chain([w_o]).collect();
+            shape_slot(slot, &shape);
+        }
+        let mut outs: Vec<&mut [f32]> = slots.iter_mut().map(|t| &mut t.data[..]).collect();
+        #[cfg(target_arch = "x86_64")]
+        if block % 32 == 0 {
+            if let Some(p) = self.cache.get(ctx, w, -1, || crate::gemm_packed::PackedB::pack(&w.data, k, n)) {
+                fm::matmul_split_packed(m, &x.data, &p, &spec, block, &mut outs, crate::par::threads());
+                return Ok(());
+            }
+        }
+        let mut product = crate::math::matmul(x, w).map_err(|e| bad(e.to_string()))?;
+        fm::matmul_split_unfused(m, &mut product.data, &spec, block, &mut outs);
+        Ok(())
+    }
+}
+
+impl Operator for OxiMatMulSplitOp {
+    fn op_type(&self) -> &str {
+        "OxiMatMulSplit"
+    }
+    fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+        let mut slots = empty_slots(ctx);
+        self.run(ctx, &mut slots)?;
+        Ok(slots)
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
+    fn execute_into_slots(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
+        self.run(ctx, slots)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
