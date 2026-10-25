@@ -36,6 +36,8 @@ pub struct SessionBuilder {
     pub(crate) cancellation: Option<CancellationToken>,
     /// [`SessionBuilder::with_bf16_weights`]; `None` follows `OXIONNX_BF16_WEIGHTS`.
     pub(crate) bf16_weights: Option<bool>,
+    /// [`SessionBuilder::with_keep_weights`].
+    pub(crate) keep_weights: bool,
 }
 
 impl SessionBuilder {
@@ -69,6 +71,7 @@ impl SessionBuilder {
             providers: Vec::new(),
             cancellation: None,
             bf16_weights: None,
+            keep_weights: false,
         }
     }
 
@@ -79,6 +82,7 @@ impl SessionBuilder {
         if let Some(on) = self.bf16_weights {
             registry.set_bf16_weights(on);
         }
+        registry.set_keep_weights(self.keep_weights);
         registry
     }
 
@@ -102,6 +106,20 @@ impl SessionBuilder {
     #[must_use]
     pub fn with_bf16_weights(mut self, enabled: bool) -> Self {
         self.bf16_weights = Some(enabled);
+        self
+    }
+
+    /// Keep the original data of the weights the GEMM operators pack when the
+    /// session is built. By default it is freed once every consumer has its
+    /// packed copy, so the session holds each weight once; [`Session::weights`]
+    /// then reports such a weight with its shape and empty data. Keep them
+    /// when that data is needed. [`Session::save_optimized`] works either way
+    /// for FP32 weights (they are rebuilt exactly from the packed copy).
+    ///
+    /// Default: `false`.
+    #[must_use]
+    pub fn with_keep_weights(mut self, keep: bool) -> Self {
+        self.keep_weights = keep;
         self
     }
 

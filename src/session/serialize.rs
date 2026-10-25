@@ -813,9 +813,13 @@ impl Session {
     ///
     /// [`OnnxError::InvalidModel`] if the graph nests subgraphs deeper than the
     /// format's 32-level limit; [`OnnxError::Unsupported`] for a session with
-    /// BF16 weights (their FP32 data was freed).
+    /// BF16 weights (their FP32 data was freed). Other weights the session
+    /// packed and freed at load time are rebuilt exactly from their packed copies.
     pub fn to_optimized_bytes(&self) -> Result<Vec<u8>, OnnxError> {
-        if let Some((name, _)) = self.weights.iter().find(|(_, t)| super::prepack::is_released(t)) {
+        // Weights packed at load time were freed; FP32 ones are rebuilt exactly
+        // from their packed copies, BF16 ones cannot be.
+        let rebuilt = super::prepack::rebuild_released(&self.sorted_nodes, &self.weights, &self.registry);
+        if let Some((name, _)) = self.weights.iter().find(|(n, t)| super::prepack::is_released(t) && !rebuilt.contains_key(*n)) {
             return Err(OnnxError::Unsupported(format!(
                 "session cache: weight '{name}' was released after BF16 packing; \
                  build the session without BF16 weights to save it"
@@ -842,7 +846,7 @@ impl Session {
         put_count(&mut out, weights.len());
         for (name, tensor) in weights {
             put_str(&mut out, name);
-            put_tensor(&mut out, tensor);
+            put_tensor(&mut out, rebuilt.get(name).unwrap_or(tensor));
         }
         Ok(out)
     }

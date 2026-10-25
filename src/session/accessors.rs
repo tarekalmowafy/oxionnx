@@ -177,9 +177,13 @@ impl Session {
 
     /// Return a reference to the model's weight tensors.
     ///
-    /// With [`SessionBuilder::with_bf16_weights`](super::SessionBuilder::with_bf16_weights)
-    /// on a CPU with AVX-512 BF16, weights read only by the BF16 GEMMs keep
-    /// their shape but have empty `data` (the session holds their packed BF16 copy).
+    /// Weights read only by the packed GEMMs (on x86-64 with AVX2 or AVX-512)
+    /// keep their shape but have empty `data`: the session holds their packed
+    /// copy instead (BF16 with
+    /// [`SessionBuilder::with_bf16_weights`](super::SessionBuilder::with_bf16_weights)).
+    /// Build with
+    /// [`SessionBuilder::with_keep_weights`](super::SessionBuilder::with_keep_weights)
+    /// to keep their data.
     pub fn weights(&self) -> &HashMap<String, Tensor> {
         &self.weights
     }

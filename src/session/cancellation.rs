@@ -253,6 +253,9 @@ impl Operator for CancellableOp {
     fn prepack(&self, ctx: &OpContext<'_>) -> Vec<usize> {
         self.inner_op().map_or_else(|_| Vec::new(), |op| op.prepack(ctx))
     }
+    fn released_weight(&self, ctx: &OpContext<'_>, input: usize) -> Option<Tensor> {
+        self.inner_op().ok()?.released_weight(ctx, input)
+    }
 }
 
 // ── The owned-operator guard ────────────────────────────────────────────────
@@ -325,6 +328,9 @@ impl Operator for CancellableBoxedOp {
     }
     fn prepack(&self, ctx: &OpContext<'_>) -> Vec<usize> {
         self.inner.prepack(ctx)
+    }
+    fn released_weight(&self, ctx: &OpContext<'_>, input: usize) -> Option<Tensor> {
+        self.inner.released_weight(ctx, input)
     }
 }
 
