@@ -14,9 +14,11 @@
 //! `packed` is a weight already in the [`crate::matmul_nbits::pack`] layout, so
 //! the session holds a single, kernel-ready copy of each quantized weight.
 //!
-//! `OXIONNX_NBITS_COMPUTE=f32` switches MatMulNBits from int8 activations to
-//! the f32 packed GEMM on weights dequantized once per session (FP32 memory),
-//! for accuracy and speed comparisons.
+//! `OXIONNX_NBITS_COMPUTE=f32` switches the (unfused) MatMulNBits /
+//! OxiMatMulNBits nodes from int8 activations to the f32 packed GEMM on
+//! weights dequantized once per session (FP32 memory), for accuracy and speed
+//! comparisons. Quantized projections fused into `OxiMatMulAct` /
+//! `OxiMatMulSplit` keep the int8 path.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
