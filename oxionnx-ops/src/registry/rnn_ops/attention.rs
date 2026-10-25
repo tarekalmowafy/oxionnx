@@ -1371,7 +1371,7 @@ mod tests {
             let ctx = OpContext { node: &node, inputs: vec![Some(&q), Some(&k), Some(&v)], outer_scope: None, weights: None, registry: None };
             let want = reference(scale);
             let got = MultiHeadAttentionOp.execute(&ctx).unwrap();
-            let mut slots = vec![Tensor::new(vec![], vec![])];
+            let mut slots = vec![Tensor::new(vec![], vec![0])];
             MultiHeadAttentionOp.execute_into_slots(&ctx, &mut slots).unwrap();
             for (g, w) in got[0].data.iter().zip(&want).chain(slots[0].data.iter().zip(&want)) {
                 assert!((g - w).abs() < 1e-5, "scale {scale}: {g} vs {w}");

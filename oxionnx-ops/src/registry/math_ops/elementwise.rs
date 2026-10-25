@@ -143,7 +143,7 @@ mod int_div_tests {
         let ctx = OpContext { node: &node, inputs: vec![Some(&a), Some(&b)], outer_scope: None, weights: None, registry: None };
         let want = vec![2.0, -2.0, 13.0, 2.0];
         assert_eq!(DivOp.execute(&ctx).unwrap()[0].data, want);
-        let mut slots = vec![Tensor::new(vec![], vec![])];
+        let mut slots = vec![Tensor::new(vec![], vec![0])];
         DivOp.execute_into_slots(&ctx, &mut slots).unwrap();
         assert_eq!(slots[0].data, want);
         assert_eq!(DivOp.execute_inplace(a.clone(), &ctx).unwrap()[0].data, want);
