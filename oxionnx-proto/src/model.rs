@@ -133,6 +133,7 @@ pub fn load_with_metadata_releasing(
     // Collect initializer (weight) tensors. Sidecar files are opened once and
     // read per tensor range; deferred inline payloads are decoded from `bytes`.
     let byte_names = crate::byte_tensor::plan(&mut graph_proto);
+    crate::int_div::mark(&mut graph_proto);
     let mut inline: HashMap<usize, Range<usize>> = deferred.into_iter().map(|d| (d.initializer, d.range)).collect();
     let mut files = ExternalFiles::default();
     let mut weights: HashMap<String, Tensor> = HashMap::new();

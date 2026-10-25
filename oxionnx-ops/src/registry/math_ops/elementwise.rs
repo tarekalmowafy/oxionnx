@@ -31,7 +31,13 @@ binary_op_inplace!(
     "Div",
     math::div,
     |a, b| a / b,
-    crate::typed_ops::typed_div
+    crate::typed_ops::typed_div,
+    // Integer `Div` (marked by the loader, see `oxionnx_proto::int_div`) truncates toward zero.
+    |ctx: &OpContext<'_>, t: &mut Tensor| {
+        if ctx.attrs().i("__oxi_int_div", 0) != 0 {
+            t.data.iter_mut().for_each(|v| *v = v.trunc());
+        }
+    }
 );
 binary_op_result!(PowOp, "Pow", math::pow);
 
@@ -121,3 +127,29 @@ unary_op_plain!(CoshOp, "Cosh", math::cosh_op);
 unary_op_plain!(AsinhOp, "Asinh", math::asinh_op);
 unary_op_plain!(AcoshOp, "Acosh", math::acosh_op);
 unary_op_plain!(AtanhOp, "Atanh", math::atanh_op);
+
+#[cfg(test)]
+mod int_div_tests {
+    use super::DivOp;
+    use oxionnx_core::{Attributes, Node, OpContext, OpKind, Operator, Tensor};
+
+    #[test]
+    fn marked_div_truncates_toward_zero() {
+        let mut attrs = Attributes::default();
+        attrs.ints.insert("__oxi_int_div".into(), 1);
+        let node = Node { name: "d".into(), op: OpKind::Div, inputs: vec![], outputs: vec![], attrs };
+        let a = Tensor::new(vec![7.0, -7.0, 41.0, 6.0], vec![4]);
+        let b = Tensor::new(vec![3.0], vec![1]);
+        let ctx = OpContext { node: &node, inputs: vec![Some(&a), Some(&b)], outer_scope: None, weights: None, registry: None };
+        let want = vec![2.0, -2.0, 13.0, 2.0];
+        assert_eq!(DivOp.execute(&ctx).unwrap()[0].data, want);
+        let mut slots = vec![Tensor::new(vec![], vec![])];
+        DivOp.execute_into_slots(&ctx, &mut slots).unwrap();
+        assert_eq!(slots[0].data, want);
+        assert_eq!(DivOp.execute_inplace(a.clone(), &ctx).unwrap()[0].data, want);
+
+        let plain = Node { name: "d".into(), op: OpKind::Div, inputs: vec![], outputs: vec![], attrs: Attributes::default() };
+        let ctx = OpContext { node: &plain, inputs: vec![Some(&a), Some(&b)], outer_scope: None, weights: None, registry: None };
+        assert_eq!(DivOp.execute(&ctx).unwrap()[0].data[0], 7.0 / 3.0);
+    }
+}
