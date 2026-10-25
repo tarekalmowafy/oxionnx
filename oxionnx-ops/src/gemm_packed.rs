@@ -12,13 +12,16 @@
 //! Row tails use the same kernel with fewer rows; the last partial panel goes
 //! through a scratch tile (AVX2) or masked stores (AVX-512).
 //! `OXIONNX_GEMM_ISA=avx2` forces the AVX2 kernel, for A/B comparisons.
+//!
+//! Opt-in BF16 weights ([`Isa::Avx512Bf16`], see [`crate::gemm_bf16`]) use the
+//! same blocking and task grid with K-pair panels, A converted to BF16 per call.
 
 #![allow(unsafe_code)]
 
 use rayon::prelude::*;
 use std::sync::OnceLock;
 
-const KC: usize = 512;
+pub(crate) const KC: usize = 512;
 /// Panels per B slice: 256 columns with the AVX-512 kernel, 128 with AVX2.
 const SLICE_PANELS: usize = 8;
 /// Fewest rows a task tile is split down to along M.
@@ -29,6 +32,8 @@ const MIN_MACS_PER_TASK: usize = 64 * 1024;
 pub enum Isa {
     Avx2,
     Avx512,
+    /// BF16 weights and activations, FP32 accumulation (`vdpbf16ps`); see [`crate::gemm_bf16`].
+    Avx512Bf16,
 }
 
 impl Isa {
@@ -36,7 +41,15 @@ impl Isa {
     const fn tile(self) -> (usize, usize) {
         match self {
             Isa::Avx2 => (6, 16),
-            Isa::Avx512 => (12, 32),
+            Isa::Avx512 | Isa::Avx512Bf16 => (12, 32),
+        }
+    }
+
+    /// K elements per packed 32-bit slot (BF16 packs K pairs).
+    const fn k_per_slot(self) -> usize {
+        match self {
+            Isa::Avx512Bf16 => 2,
+            _ => 1,
         }
     }
 }
@@ -58,6 +71,16 @@ pub fn isa() -> Option<Isa> {
 
 pub fn available() -> bool {
     isa().is_some()
+}
+
+/// The packing for a constant weight: [`Isa::Avx512Bf16`] when `bf16` is
+/// requested and the CPU supports it, else [`isa`].
+pub fn weight_isa(bf16: bool) -> Option<Isa> {
+    if bf16 && crate::gemm_bf16::hw_available() {
+        Some(Isa::Avx512Bf16)
+    } else {
+        isa()
+    }
 }
 
 pub struct PackedB {
@@ -91,6 +114,10 @@ impl PackedB {
         assert!(k == 0 || n == 0 || (k - 1) * rs + (n - 1) * cs < b.len());
         let nr = isa.tile().1;
         let panels = n.div_ceil(nr);
+        if isa == Isa::Avx512Bf16 {
+            let (buf, off) = crate::gemm_bf16::pack(k, n, nr, |p, j| b[p * rs + j * cs]);
+            return PackedB { k, n, isa, nr, panels, buf, off };
+        }
         let len = k * panels * nr;
         let mut buf = vec![0f32; len + 16];
         let off = buf.as_ptr().align_offset(64).min(16);
@@ -126,10 +153,17 @@ impl PackedB {
     /// column `j` is `b[:, cols[j]]` (e.g. to interleave the halves of a fused
     /// gate/up projection for [`gemm_epilogue`]).
     pub fn pack_cols(b: &[f32], k: usize, ld: usize, cols: &[usize]) -> Self {
-        let isa = isa().expect("gemm_packed: no AVX2/AVX-512");
+        Self::pack_cols_for(isa().expect("gemm_packed: no AVX2/AVX-512"), b, k, ld, cols)
+    }
+
+    pub fn pack_cols_for(isa: Isa, b: &[f32], k: usize, ld: usize, cols: &[usize]) -> Self {
         assert!(cols.iter().all(|&c| c < ld) && b.len() >= k * ld);
         let (nr, n) = (isa.tile().1, cols.len());
         let panels = n.div_ceil(nr);
+        if isa == Isa::Avx512Bf16 {
+            let (buf, off) = crate::gemm_bf16::pack(k, n, nr, |p, j| b[p * ld + cols[j]]);
+            return PackedB { k, n, isa, nr, panels, buf, off };
+        }
         let len = k * panels * nr;
         let mut buf = vec![0f32; len + 16];
         let off = buf.as_ptr().align_offset(64).min(16);
@@ -151,12 +185,18 @@ impl PackedB {
         PackedB { k, n, isa, nr, panels, buf, off }
     }
 
+    pub fn isa(&self) -> Isa {
+        self.isa
+    }
+
     /// Start of panel `j` in the k-block starting at row `k0`.
     #[inline]
     fn panel(&self, k0: usize, j: usize) -> *const f32 {
-        let kc = KC.min(self.k - k0);
-        // SAFETY: k0 < k and j < panels, so the offset is inside the packed data.
-        unsafe { self.buf.as_ptr().add(self.off + k0 * self.panels * self.nr + j * kc * self.nr) }
+        let s = self.isa.k_per_slot();
+        let kc = KC.min(self.k - k0).div_ceil(s);
+        // SAFETY: k0 < k and j < panels, so the offset is inside the packed data
+        // (k0 is a multiple of the even KC, so k0 / s slots precede its block).
+        unsafe { self.buf.as_ptr().add(self.off + k0 / s * self.panels * self.nr + j * kc * self.nr) }
     }
 }
 
@@ -184,13 +224,22 @@ pub fn gemm(m: usize, a: &[f32], b: &PackedB, c: &mut [f32], threads: usize) {
     let grid = Grid::new(m, b.isa.tile().0, b.panels.div_ceil(unit), tasks);
     let cp = SendPtr(c.as_mut_ptr());
     let cp = &cp;
-    grid.run(tasks, |i0, mb, u0, u1| {
-        let (p0, p1) = (u0 * unit, (u1 * unit).min(b.panels));
-        // SAFETY: tiles cover disjoint (row, column) ranges of C; all pointer
-        // offsets stay within a/b/c bounds (checked by the asserts above), and
-        // `b.isa` was detected on this CPU.
-        unsafe { tile(a.as_ptr().add(i0 * k), k, mb, b, p0, p1, cp.0.add(i0 * n), n) };
-    });
+    let run = |ap: *const f32, lda: usize| {
+        let ap = ap as usize;
+        grid.run(tasks, |i0, mb, u0, u1| {
+            let (p0, p1) = (u0 * unit, (u1 * unit).min(b.panels));
+            // SAFETY: tiles cover disjoint (row, column) ranges of C; all pointer
+            // offsets stay within a/b/c bounds (checked by the asserts above), and
+            // `b.isa` was detected on this CPU.
+            unsafe { tile((ap as *const f32).add(i0 * lda), lda, mb, b, p0, p1, cp.0.add(i0 * n), n) };
+        });
+    };
+    if b.isa == Isa::Avx512Bf16 {
+        // SAFETY: `a` is m x k (asserted above).
+        unsafe { crate::gemm_bf16::with_a(m, a.as_ptr(), k, k, threads, run) };
+    } else {
+        run(a.as_ptr(), k);
+    }
 }
 
 /// Receives each finished block of C while it is still in L1, instead of C
@@ -217,44 +266,56 @@ pub fn gemm_epilogue<E: Epilogue>(m: usize, a: &[f32], b: &PackedB, epi: &E, thr
     let (mr, nr) = b.isa.tile();
     let tasks = (m * n * k / MIN_MACS_PER_TASK).clamp(1, threads.max(1));
     let grid = Grid::new(m, mr, n / w, tasks);
-    grid.run(tasks, |i0, mb, u0, u1| {
-        let mut block = vec![0f32; mr * w];
-        for u in u0..u1 {
-            let mut i = 0;
-            while i < mb {
-                let r = mr.min(mb - i);
-                if k == 0 {
-                    block.fill(0.0);
-                }
-                for k0 in (0..k).step_by(KC) {
-                    let kc = KC.min(k - k0);
-                    for jj in 0..w / nr {
-                        let kernel = Kernel {
-                            kc,
-                            a: unsafe { a.as_ptr().add((i0 + i) * k + k0) },
-                            rs: k,
-                            bp: b.panel(k0, u * w / nr + jj),
-                            c: unsafe { block.as_mut_ptr().add(jj * nr) },
-                            ldc: w,
-                            nb: nr,
-                            accumulate: k0 > 0,
-                        };
-                        // SAFETY: rows i0+i..i0+i+r of `a` and panel u*w/nr+jj of `b` exist
-                        // (n % w == 0), `block` holds mr x w, and `b.isa` was detected here.
-                        unsafe {
-                            match b.isa {
-                                Isa::Avx512 => avx512::dispatch(r, &kernel),
-                                Isa::Avx2 => avx2::dispatch(r, &kernel),
+    let s = b.isa.k_per_slot();
+    let run = |ap: *const f32, lda: usize| {
+        let ap = ap as usize;
+        grid.run(tasks, |i0, mb, u0, u1| {
+            let ap = ap as *const f32;
+            let mut block = vec![0f32; mr * w];
+            for u in u0..u1 {
+                let mut i = 0;
+                while i < mb {
+                    let r = mr.min(mb - i);
+                    if k == 0 {
+                        block.fill(0.0);
+                    }
+                    for k0 in (0..k).step_by(KC) {
+                        let kc = KC.min(k - k0);
+                        for jj in 0..w / nr {
+                            let kernel = Kernel {
+                                kc,
+                                a: unsafe { ap.add((i0 + i) * lda + k0 / s) },
+                                rs: lda,
+                                bp: b.panel(k0, u * w / nr + jj),
+                                c: unsafe { block.as_mut_ptr().add(jj * nr) },
+                                ldc: w,
+                                nb: nr,
+                                accumulate: k0 > 0,
+                            };
+                            // SAFETY: rows i0+i..i0+i+r of `a` and panel u*w/nr+jj of `b` exist
+                            // (n % w == 0), `block` holds mr x w, and `b.isa` was detected here.
+                            unsafe {
+                                match b.isa {
+                                    Isa::Avx512 => avx512::dispatch(r, &kernel),
+                                    Isa::Avx2 => avx2::dispatch(r, &kernel),
+                                    Isa::Avx512Bf16 => crate::gemm_bf16::dispatch(r, &kernel),
+                                }
                             }
                         }
                     }
+                    // SAFETY: each (row strip, column block) is visited by exactly one task.
+                    unsafe { epi.apply(i0 + i, r, u * w, &mut block[..r * w]) };
+                    i += r;
                 }
-                // SAFETY: each (row strip, column block) is visited by exactly one task.
-                unsafe { epi.apply(i0 + i, r, u * w, &mut block[..r * w]) };
-                i += r;
             }
-        }
-    });
+        });
+    };
+    if b.isa == Isa::Avx512Bf16 {
+        // SAFETY: `a` is m x k (asserted above).
+        unsafe { crate::gemm_bf16::with_a(m, a.as_ptr(), k, k, threads, run) };
+    } else {
+        run(a.as_ptr(), k);
+    }
 }
 
 /// Task tiles: one per task (equal tiles balance better than more, smaller
@@ -325,13 +386,19 @@ pub unsafe fn gemm_strided_serial(m: usize, a: *const f32, lda: usize, b: &Packe
         }
         return;
     }
-    tile(a, lda, m, b, 0, b.panels, c, ldc);
+    if b.isa == Isa::Avx512Bf16 {
+        crate::gemm_bf16::with_a(m, a, lda, b.k, 1, |ap, lda| tile(ap, lda, m, b, 0, b.panels, c, ldc));
+    } else {
+        tile(a, lda, m, b, 0, b.panels, c, ldc);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `a` is FP32, or BF16 pairs (row stride `lda` pairs) for [`Isa::Avx512Bf16`].
 unsafe fn tile(a: *const f32, lda: usize, mb: usize, b: &PackedB, p0: usize, p1: usize, c: *mut f32, ldc: usize) {
     let (k, n, nr) = (b.k, b.n, b.nr);
     let mr = b.isa.tile().0;
+    let s = b.isa.k_per_slot();
     let mut s0 = p0;
     while s0 < p1 {
         let s1 = (s0 + SLICE_PANELS).min(p1);
@@ -344,7 +411,7 @@ unsafe fn tile(a: *const f32, lda: usize, mb: usize, b: &PackedB, p0: usize, p1:
                     let j0 = j * nr;
                     let kernel = Kernel {
                         kc,
-                        a: a.add(i * lda + k0),
+                        a: a.add(i * lda + k0 / s),
                         rs: lda,
                         bp: b.panel(k0, j),
                         c: c.add(i * ldc + j0),
@@ -355,6 +422,7 @@ unsafe fn tile(a: *const f32, lda: usize, mb: usize, b: &PackedB, p0: usize, p1:
                     match b.isa {
                         Isa::Avx512 => avx512::dispatch(r, &kernel),
                         Isa::Avx2 => avx2::dispatch(r, &kernel),
+                        Isa::Avx512Bf16 => crate::gemm_bf16::dispatch(r, &kernel),
                     }
                 }
                 i += r;
@@ -365,17 +433,17 @@ unsafe fn tile(a: *const f32, lda: usize, mb: usize, b: &PackedB, p0: usize, p1:
 }
 
 /// One micro-kernel call: `C[R, nb] (+)= A[R, kc] @ Bpanel[kc, NR]`, with
-/// `A[r, p] = a[r * rs + p]`.
+/// `A[r, p] = a[r * rs + p]` (BF16: `a` holds K pairs, `rs` counts pairs).
 #[derive(Clone, Copy)]
-struct Kernel {
-    kc: usize,
-    a: *const f32,
-    rs: usize,
-    bp: *const f32,
-    c: *mut f32,
-    ldc: usize,
-    nb: usize,
-    accumulate: bool,
+pub(crate) struct Kernel {
+    pub(crate) kc: usize,
+    pub(crate) a: *const f32,
+    pub(crate) rs: usize,
+    pub(crate) bp: *const f32,
+    pub(crate) c: *mut f32,
+    pub(crate) ldc: usize,
+    pub(crate) nb: usize,
+    pub(crate) accumulate: bool,
 }
 
 mod avx2 {
