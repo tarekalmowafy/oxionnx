@@ -18,7 +18,9 @@
 //! OxiMatMulNBits nodes from int8 activations to the f32 packed GEMM on
 //! weights dequantized once per session (FP32 memory), for accuracy and speed
 //! comparisons. Quantized projections fused into `OxiMatMulAct` /
-//! `OxiMatMulSplit` keep the int8 path.
+//! `OxiMatMulSplit` keep the int8 path. The int8 path stays the default on
+//! AVX2-only CPUs too: on embeddinggemma (1 and 8 threads) it beat both this
+//! mode and the FP32 model on the AVX2 FP32 GEMM, with half the memory.
 
 use std::borrow::Cow;
 use std::collections::HashMap;

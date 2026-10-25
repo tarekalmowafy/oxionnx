@@ -25,16 +25,22 @@
 //! ```
 //!
 //! with the integer dot products done by `vpdpbusd` (AVX-512 VNNI: unsigned
-//! weights × signed activations, 6 rows × 32 columns per micro-tile), by
-//! `vpmaddubsw` (AVX2: 4 rows × 8 columns; 8-bit weights are recentred to
-//! signed and multiplied through the sign trick so pair sums cannot saturate),
-//! or by plain integer loops. All three quantize the activations identically.
+//! weights × signed activations, 6 rows × 32 columns per micro-tile), by the
+//! VEX-encoded 256-bit `vpdpbusd` (AVX-VNNI, for CPUs without AVX-512: 4 rows ×
+//! 16 columns), by `vpmaddubsw` (AVX2: 4 rows × 8 columns; 8-bit weights are
+//! recentred to signed and multiplied through the sign trick so pair sums
+//! cannot saturate), or by plain integer loops. All of them quantize the
+//! activations identically, and the int32 block sums are exact; the scalar,
+//! AVX-VNNI and AVX-512 VNNI kernels also apply the scales in the same order,
+//! so their outputs are bit-identical. AVX2 matches them bit for bit on 4-bit
+//! weights; on 8-bit weights its recentred zero-point term rounds differently.
 //!
 //! Tasks split rows and panel pairs like [`crate::gemm_packed`]'s grid; each
 //! task walks slices of [`SLICE_PANELS`] panels (L2-resident) and, inside, MR
 //! row strips whose quantized activations stay in L1.
 //!
-//! `OXIONNX_NBITS_ISA=scalar|avx2` caps the kernel ISA, for A/B comparisons.
+//! `OXIONNX_NBITS_ISA=scalar|avx2|avxvnni|avx512` caps the kernel ISA, for A/B
+//! comparisons: the best supported kernel at or below the cap is used.
 
 #![allow(unsafe_code)]
 
@@ -301,11 +307,18 @@ impl<'a> Packed<'a> {
 
 // ── ISA selection ────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Kernel ISAs, in increasing order of preference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Isa {
     Scalar,
+    /// AVX2 + FMA, `vpmaddubsw` / `vpmaddwd`.
     #[cfg(target_arch = "x86_64")]
     Avx2,
+    /// AVX2 + FMA + AVX-VNNI (VEX `vpdpbusd` on 256 bits): Alder Lake and later
+    /// Intel client cores, Sierra Forest, Zen 5.
+    #[cfg(target_arch = "x86_64")]
+    AvxVnni,
+    /// AVX-512 F/BW/VNNI.
     #[cfg(target_arch = "x86_64")]
     Avx512Vnni,
 }
@@ -317,6 +330,8 @@ impl Isa {
             Isa::Scalar => 4,
             #[cfg(target_arch = "x86_64")]
             Isa::Avx2 => 4,
+            #[cfg(target_arch = "x86_64")]
+            Isa::AvxVnni => avxvnni::MR,
             #[cfg(target_arch = "x86_64")]
             Isa::Avx512Vnni => 6,
         }
@@ -332,36 +347,47 @@ pub fn isa() -> Isa {
     })
 }
 
-#[cfg(target_arch = "x86_64")]
+/// The best supported ISA at or below `cap` (`scalar`, `avx2`, `avxvnni`,
+/// `avx512`; anything else means no cap).
 fn detect(cap: &str) -> Isa {
-    let vnni = is_x86_feature_detected!("avx512f")
-        && is_x86_feature_detected!("avx512bw")
-        && is_x86_feature_detected!("avx512vnni");
-    let avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
-    match cap {
+    let cap = match cap {
         "scalar" => Isa::Scalar,
-        "avx2" if avx2 => Isa::Avx2,
-        _ if vnni && cap != "avx2" => Isa::Avx512Vnni,
-        _ if avx2 => Isa::Avx2,
-        _ => Isa::Scalar,
-    }
+        #[cfg(target_arch = "x86_64")]
+        "avx2" => Isa::Avx2,
+        #[cfg(target_arch = "x86_64")]
+        "avxvnni" => Isa::AvxVnni,
+        _ => Isa::MAX,
+    };
+    supported_isas().into_iter().filter(|&i| i <= cap).max().unwrap_or(Isa::Scalar)
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn detect(_: &str) -> Isa {
-    Isa::Scalar
+impl Isa {
+    #[cfg(target_arch = "x86_64")]
+    const MAX: Isa = Isa::Avx512Vnni;
+    #[cfg(not(target_arch = "x86_64"))]
+    const MAX: Isa = Isa::Scalar;
 }
 
-/// Every ISA this CPU can run (for tests).
+/// Every ISA this CPU can run, in increasing order (the CPU may lack AVX-VNNI
+/// but have AVX-512 VNNI, e.g. Ice Lake / Zen 4).
 pub fn supported_isas() -> Vec<Isa> {
     #[allow(unused_mut)]
     let mut v = vec![Isa::Scalar];
     #[cfg(target_arch = "x86_64")]
     {
-        if detect("avx2") == Isa::Avx2 {
+        // Every SIMD kernel also uses the AVX2 quantizer (and FMA).
+        let avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+        if avx2 {
             v.push(Isa::Avx2);
         }
-        if detect("") == Isa::Avx512Vnni {
+        if avx2 && is_x86_feature_detected!("avxvnni") {
+            v.push(Isa::AvxVnni);
+        }
+        if avx2
+            && is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni")
+        {
             v.push(Isa::Avx512Vnni);
         }
     }
@@ -431,8 +457,8 @@ fn quantize_row(isa: Isa, a: &[f32], block: usize, aq: &mut [i8], sa: &mut [f32]
         *sa = amax / 127.0;
         let sum = match isa {
             #[cfg(target_arch = "x86_64")]
-            Isa::Avx2 | Isa::Avx512Vnni if src.len() == block && block % 32 == 0 => {
-                // SAFETY: AVX2 is implied by both ISAs (checked at detection).
+            Isa::Avx2 | Isa::AvxVnni | Isa::Avx512Vnni if src.len() == block && block % 32 == 0 => {
+                // SAFETY: every SIMD ISA is detected together with AVX2.
                 unsafe { quantize_block_avx2(src, inv, q) }
             }
             _ => {
@@ -657,6 +683,8 @@ unsafe fn micro(
         #[cfg(target_arch = "x86_64")]
         Isa::Avx2 => avx2::dispatch(r, s.bits, &k),
         #[cfg(target_arch = "x86_64")]
+        Isa::AvxVnni => avxvnni::dispatch(r, s.bits, &k),
+        #[cfg(target_arch = "x86_64")]
         Isa::Avx512Vnni => avx512::dispatch(r, nv, s.bits, &k),
     }
 }
@@ -855,6 +883,114 @@ mod avx2 {
                 for (c, &v) in tmp.iter().enumerate().take(k.nb) {
                     *cr.add(c) = if k.bias.is_null() { v } else { v + *k.bias.add(c) };
                 }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::needless_range_loop)]
+mod avxvnni {
+    //! The AVX-512 kernel's math on 256-bit vectors: `vpdpbusd` (VEX) takes the
+    //! unsigned weights and signed activations directly and sums the four
+    //! products into i32 without saturation (|q * a| <= 255 * 127), so unlike
+    //! the AVX2 kernel there is no recentring of 8-bit weights, and the int32
+    //! block sums and the float steps applied to them are exactly those of
+    //! the scalar and AVX-512 kernels: the results are bit-identical.
+    use super::{Micro, NP};
+    use std::arch::x86_64::*;
+
+    /// Rows per micro-tile (each row keeps two i32 and two f32 accumulators).
+    pub const MR: usize = 4;
+
+    pub unsafe fn dispatch(r: usize, bits: usize, k: &Micro) {
+        match (r, bits) {
+            (4, 8) => kernel::<4, false>(k),
+            (3, 8) => kernel::<3, false>(k),
+            (2, 8) => kernel::<2, false>(k),
+            (_, 8) => kernel::<1, false>(k),
+            (4, _) => kernel::<4, true>(k),
+            (3, _) => kernel::<3, true>(k),
+            (2, _) => kernel::<2, true>(k),
+            _ => kernel::<1, true>(k),
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn bcast(p: *const i8) -> __m256i {
+        _mm256_set1_epi32(std::ptr::read_unaligned(p.cast::<i32>()))
+    }
+
+    /// R rows x one panel of 16 columns (two 8-column halves).
+    #[target_feature(enable = "avx2,fma,avxvnni")]
+    unsafe fn kernel<const R: usize, const B4: bool>(k: &Micro) {
+        let low = _mm256_set1_epi8(0x0f);
+        let mut acc = [[_mm256_setzero_ps(); 2]; R];
+        for b in 0..k.kb {
+            let mut isum = [[_mm256_setzero_si256(); 2]; R];
+            let ab = k.a.add(b * k.block);
+            let qb = k.q[0].add(b * k.qblock);
+            if B4 {
+                for g in 0..k.block / 8 {
+                    let mut lo = [_mm256_setzero_si256(); 2];
+                    let mut hi = [_mm256_setzero_si256(); 2];
+                    for h in 0..2 {
+                        let raw = _mm256_loadu_si256(qb.add(g * 64 + h * 32).cast());
+                        lo[h] = _mm256_and_si256(raw, low);
+                        hi[h] = _mm256_and_si256(_mm256_srli_epi16(raw, 4), low);
+                    }
+                    for r in 0..R {
+                        let ap = ab.add(r * k.lda + g * 8);
+                        let (a0, a1) = (bcast(ap), bcast(ap.add(4)));
+                        for h in 0..2 {
+                            isum[r][h] = _mm256_dpbusd_avx_epi32(isum[r][h], lo[h], a0);
+                            isum[r][h] = _mm256_dpbusd_avx_epi32(isum[r][h], hi[h], a1);
+                        }
+                    }
+                }
+            } else {
+                for g in 0..k.block / 4 {
+                    let q0 = _mm256_loadu_si256(qb.add(g * 64).cast());
+                    let q1 = _mm256_loadu_si256(qb.add(g * 64 + 32).cast());
+                    for r in 0..R {
+                        let av = bcast(ab.add(r * k.lda + g * 4));
+                        isum[r][0] = _mm256_dpbusd_avx_epi32(isum[r][0], q0, av);
+                        isum[r][1] = _mm256_dpbusd_avx_epi32(isum[r][1], q1, av);
+                    }
+                }
+            }
+            for h in 0..2 {
+                let sb = _mm256_loadu_ps(k.sb[0].add(b * NP + h * 8));
+                let zb = _mm256_loadu_ps(k.zb[0].add(b * NP + h * 8));
+                for r in 0..R {
+                    let sa = _mm256_set1_ps(*k.sa.add(r * k.kb + b));
+                    let ss = _mm256_set1_ps(-*k.ss.add(r * k.kb + b));
+                    acc[r][h] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(isum[r][h]), _mm256_mul_ps(sb, sa), acc[r][h]);
+                    acc[r][h] = _mm256_fmadd_ps(ss, zb, acc[r][h]);
+                }
+            }
+        }
+        let mut bias = [_mm256_setzero_ps(); 2];
+        if !k.bias.is_null() {
+            if k.nb == NP {
+                bias = [_mm256_loadu_ps(k.bias), _mm256_loadu_ps(k.bias.add(8))];
+            } else {
+                let mut tmp = [0f32; NP];
+                tmp[..k.nb].copy_from_slice(std::slice::from_raw_parts(k.bias, k.nb));
+                bias = [_mm256_loadu_ps(tmp.as_ptr()), _mm256_loadu_ps(tmp.as_ptr().add(8))];
+            }
+        }
+        for r in 0..R {
+            let x = [_mm256_add_ps(acc[r][0], bias[0]), _mm256_add_ps(acc[r][1], bias[1])];
+            let cr = k.c.add(r * k.ldc);
+            if k.nb == NP {
+                _mm256_storeu_ps(cr, x[0]);
+                _mm256_storeu_ps(cr.add(8), x[1]);
+            } else {
+                let mut tmp = [0f32; NP];
+                _mm256_storeu_ps(tmp.as_mut_ptr(), x[0]);
+                _mm256_storeu_ps(tmp.as_mut_ptr().add(8), x[1]);
+                std::ptr::copy_nonoverlapping(tmp.as_ptr(), cr, k.nb);
             }
         }
     }
@@ -1161,6 +1297,209 @@ mod tests {
                             assert!(rel < 0.02, "{isa:?} {s:?} m={m} zp={zp_kind}: RMS error {rel} vs exact");
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// A random packed weight with zero points of kind `zp_kind` (0 default,
+    /// 1 packed uint8, 2 float).
+    fn packed_words(s: Shape, zp_kind: u8, rng: &mut Lcg) -> Vec<f32> {
+        let (b, scales, zpu, zpf) = weight(s, zp_kind, rng);
+        let zp = match zp_kind {
+            1 => ZeroPoints::Packed(&zpu),
+            2 => ZeroPoints::Float(&zpf),
+            _ => ZeroPoints::Default,
+        };
+        pack(s, &Source { b: &b, scales: &scales, zp }).unwrap()
+    }
+
+    /// The ISAs whose results must equal the scalar kernel's bit for bit.
+    fn exact_isas(bits: usize) -> Vec<Isa> {
+        let isas = supported_isas();
+        #[cfg(target_arch = "x86_64")]
+        if !isas.contains(&Isa::AvxVnni) {
+            eprintln!("note: this CPU has no AVX-VNNI; its kernel is not exercised");
+        }
+        // AVX2 recentres 8-bit weights, which changes the rounding.
+        #[cfg(target_arch = "x86_64")]
+        let isas: Vec<Isa> = isas.into_iter().filter(|&i| !(i == Isa::Avx2 && bits == 8)).collect();
+        let _ = bits;
+        isas
+    }
+
+    #[test]
+    fn cap_picks_the_best_supported_isa_below_it() {
+        let isas = supported_isas();
+        assert_eq!(detect("scalar"), Isa::Scalar);
+        assert_eq!(detect(""), *isas.last().unwrap());
+        assert_eq!(detect("avx512"), *isas.last().unwrap());
+        #[cfg(target_arch = "x86_64")]
+        for (cap, top) in [("avx2", Isa::Avx2), ("avxvnni", Isa::AvxVnni)] {
+            let want = isas.iter().copied().filter(|&i| i <= top).max().unwrap();
+            assert_eq!(detect(cap), want, "cap {cap}");
+        }
+    }
+
+    #[test]
+    fn int8_kernels_are_bit_identical() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let mut rng = Lcg(23);
+        // (m, k, bits, block, n): M = 1, M within / past one micro-tile and past
+        // a task row tile, odd K and N, partial K blocks and column panels.
+        let cases = [
+            (1, 768, 8, 32, 64),
+            (1, 100, 4, 32, 33),
+            (3, 513, 8, 32, 47),
+            (5, 7, 4, 16, 17),
+            (7, 96, 8, 16, 1),
+            (9, 200, 4, 64, 70),
+            (13, 256, 8, 128, 31),
+            (250, 160, 8, 32, 50),
+            (250, 72, 4, 32, 96),
+        ];
+        for &(m, k, bits, block, n) in &cases {
+            let s = Shape::new(n, k, bits, block).unwrap();
+            for zp_kind in 0..3 {
+                let words = packed_words(s, zp_kind, &mut rng);
+                let w = Packed::from_words(&words).unwrap();
+                let a: Vec<f32> = (0..m * k).map(|_| rng.f() * 3.0).collect();
+                let bias: Vec<f32> = (0..n).map(|_| rng.f()).collect();
+                for with_bias in [false, true] {
+                    let bias = with_bias.then_some(&bias[..]);
+                    let mut want = vec![f32::NAN; m * n];
+                    matmul(Isa::Scalar, m, &a, &w, bias, &mut want, 1);
+                    for isa in exact_isas(bits) {
+                        for threads in [1, 4] {
+                            let mut c = vec![f32::NAN; m * n];
+                            pool.install(|| matmul(isa, m, &a, &w, bias, &mut c, threads));
+                            for i in 0..m * n {
+                                assert!(
+                                    c[i].to_bits() == want[i].to_bits(),
+                                    "{isa:?} {s:?} m={m} zp={zp_kind} bias={with_bias} t={threads} [{i}]: {} vs scalar {}",
+                                    c[i],
+                                    want[i]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Collects the blocks [`matmul_epilogue`] hands out, block `u` at columns
+    /// `u * width..` of an `m x N` matrix.
+    #[cfg(target_arch = "x86_64")]
+    struct Collect {
+        width: usize,
+        n: usize,
+        out: *mut f32,
+        seen: std::sync::Mutex<Vec<(usize, usize, usize)>>,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe impl Sync for Collect {}
+
+    #[cfg(target_arch = "x86_64")]
+    impl crate::gemm_packed::Epilogue for Collect {
+        fn width(&self) -> usize {
+            self.width
+        }
+        unsafe fn apply(&self, i0: usize, rows: usize, j0: usize, block: &mut [f32]) {
+            self.seen.lock().unwrap().push((i0, rows, j0));
+            for (r, row) in block.chunks(self.width).take(rows).enumerate() {
+                std::ptr::copy_nonoverlapping(row.as_ptr(), self.out.add((i0 + r) * self.n + j0), self.width);
+            }
+        }
+    }
+
+    /// The epilogue path as used by `OxiMatMulAct` (plain and gated: each
+    /// block takes matching columns of both weight halves) and by
+    /// `OxiMatMulSplit` (one segment per block): every ISA hands out the same
+    /// blocks, bit-identical to the scalar kernel and to [`matmul`].
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn epilogue_paths_are_bit_identical() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let mut rng = Lcg(31);
+        // (m, k, bits, block, n, width, gated)
+        let cases = [
+            (1, 96, 8, 32, 96, 32, true),
+            (6, 100, 4, 32, 96, 32, true),
+            (130, 64, 8, 16, 192, 64, true),
+            (1, 72, 4, 16, 128, 64, false),
+            (11, 160, 8, 32, 96, 32, false),
+            (250, 96, 4, 32, 64, 16, false),
+        ];
+        for &(m, k, bits, block, n, width, gated) in &cases {
+            let s = Shape::new(n, k, bits, block).unwrap();
+            for zp_kind in [0, 1] {
+                let words = packed_words(s, zp_kind, &mut rng);
+                let w = Packed::from_words(&words).unwrap();
+                let a: Vec<f32> = (0..m * k).map(|_| rng.f() * 3.0).collect();
+                let (hb, h) = (width / 2, n / 2);
+                let segs = |u: usize| {
+                    if gated {
+                        [(u * hb, hb), (h + u * hb, hb)]
+                    } else {
+                        [(u * width, width), (0, 0)]
+                    }
+                };
+                // Where block u's column j comes from in a @ W.
+                let col = |j: usize| {
+                    let (u, c) = (j / width, j % width);
+                    if gated && c >= hb { h + u * hb + c - hb } else if gated { u * hb + c } else { j }
+                };
+                let mut want = vec![f32::NAN; m * n];
+                matmul(Isa::Scalar, m, &a, &w, None, &mut want, 1);
+                for isa in exact_isas(bits) {
+                    for threads in [1, 4] {
+                        let mut got = vec![f32::NAN; m * n];
+                        let epi = Collect { width, n, out: got.as_mut_ptr(), seen: Default::default() };
+                        pool.install(|| matmul_epilogue(isa, m, &a, &w, &epi, segs, threads));
+                        let mut seen = epi.seen.into_inner().unwrap();
+                        seen.sort_unstable();
+                        let rows: usize = seen.iter().filter(|b| b.2 == 0).map(|b| b.1).sum();
+                        assert_eq!(rows, m, "{isa:?}: blocks of column 0 do not cover the rows once");
+                        assert_eq!(seen.len() % (n / width), 0);
+                        for i in 0..m {
+                            for j in 0..n {
+                                let (x, y) = (got[i * n + j], want[i * n + col(j)]);
+                                assert!(
+                                    x.to_bits() == y.to_bits(),
+                                    "{isa:?} {s:?} m={m} width={width} gated={gated} zp={zp_kind} t={threads} [{i}, {j}]: {x} vs scalar {y}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Single-thread kernel throughput per ISA, on embeddinggemma-sized weights:
+    /// `cargo test --release -p oxionnx-ops nbits_kernel_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn nbits_kernel_throughput() {
+        let mut rng = Lcg(5);
+        for &(bits, k, n) in &[(8, 768, 1152), (4, 768, 1152), (8, 1152, 768), (4, 1152, 768)] {
+            let s = Shape::new(n, k, bits, 32).unwrap();
+            let words = packed_words(s, 0, &mut rng);
+            let w = Packed::from_words(&words).unwrap();
+            for m in [1, 32, 512] {
+                let a: Vec<f32> = (0..m * k).map(|_| rng.f()).collect();
+                let mut c = vec![0f32; m * n];
+                for isa in supported_isas().into_iter().skip(1) {
+                    let reps = (2_000_000_000 / (m * n * k)).max(3);
+                    matmul(isa, m, &a, &w, None, &mut c, 1);
+                    let t = std::time::Instant::now();
+                    for _ in 0..reps {
+                        matmul(isa, m, &a, &w, None, &mut c, 1);
+                    }
+                    let gmacs = (m * n * k * reps) as f64 / t.elapsed().as_secs_f64() / 1e9;
+                    println!("bits={bits} m={m:4} k={k} n={n}: {isa:?} {gmacs:7.1} GMAC/s");
                 }
             }
         }
