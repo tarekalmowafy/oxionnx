@@ -12,6 +12,7 @@
 //! truncated file yields an `Err`, never a panic, and nesting is depth-bounded by
 //! [`MAX_NESTING_DEPTH`].
 
+use std::ops::Range;
 use crate::types::*;
 
 /// Maximum protobuf message nesting depth accepted by the parser.
@@ -34,6 +35,27 @@ enum WireValue<'a> {
     /// A group (wire types 3/4). Groups are a deprecated protobuf encoding that no
     /// ONNX message uses, but a conformant parser must skip them rather than abort.
     Group,
+}
+
+/// `raw_data` payloads at least this large are left in the model buffer by
+/// [`parse_model_deferred`] instead of being copied.
+pub const DEFER_RAW_BYTES: usize = 4096;
+
+/// An initializer of the main graph whose `raw_data` [`parse_model_deferred`]
+/// left in the buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredRaw {
+    /// Index into `GraphProto::initializers`.
+    pub initializer: usize,
+    /// Byte range of the payload within the parsed buffer.
+    pub range: Range<usize>,
+}
+
+/// Position of `inner` within `outer`; `inner` must be a sub-slice of `outer`.
+fn offset_in(outer: &[u8], inner: &[u8]) -> usize {
+    let off = inner.as_ptr() as usize - outer.as_ptr() as usize;
+    debug_assert!(off + inner.len() <= outer.len());
+    off
 }
 
 /// Read a base-128 varint, rejecting encodings that do not fit in 64 bits.
@@ -239,7 +261,15 @@ fn for_each_packed_varint<F: FnMut(u64)>(b: &[u8], mut push: F) -> Result<(), St
 /// required by the protobuf spec (ONNX's own .proto is proto2, where `floats`-style
 /// fields are emitted unpacked unless explicitly marked `[packed = true]`).
 pub fn parse_tensor_proto(buf: &[u8]) -> Result<TensorProto, String> {
+    Ok(parse_tensor_proto_impl(buf, false)?.0)
+}
+
+/// [`parse_tensor_proto`], optionally leaving a `raw_data` payload of at least
+/// [`DEFER_RAW_BYTES`] in `buf`: it is then not copied, and its range within
+/// `buf` is returned instead (`raw_data` stays empty).
+fn parse_tensor_proto_impl(buf: &[u8], defer: bool) -> Result<(TensorProto, Option<Range<usize>>), String> {
     let mut t = TensorProto::default();
+    let mut deferred = None;
     let mut pos = 0;
     while pos < buf.len() {
         let (field, value, next) = read_field(buf, pos)?;
@@ -312,7 +342,14 @@ pub fn parse_tensor_proto(buf: &[u8]) -> Result<TensorProto, String> {
                 for_each_packed_varint(b, |v| t.uint64_data.push(v))?;
             }
             (11, WireValue::Varint(v)) => t.uint64_data.push(v),
-            (9, WireValue::Bytes(b)) => t.raw_data = b.to_vec(),
+            (9, WireValue::Bytes(b)) if defer && b.len() >= DEFER_RAW_BYTES => {
+                t.raw_data = Vec::new();
+                deferred = Some(offset_in(buf, b)..offset_in(buf, b) + b.len());
+            }
+            (9, WireValue::Bytes(b)) => {
+                t.raw_data = b.to_vec();
+                deferred = None;
+            }
             (13, WireValue::Bytes(b)) => {
                 // ONNX spec: field 13 = repeated StringStringEntryProto external_data.
                 // StringStringEntryProto: field 1 = key, field 2 = value.
@@ -334,7 +371,7 @@ pub fn parse_tensor_proto(buf: &[u8]) -> Result<TensorProto, String> {
             _ => {} // ignore unknown fields
         }
     }
-    Ok(t)
+    Ok((t, deferred))
 }
 
 /// Parse a `TensorProto.Segment` sub-message, returning `(begin, end)`.
@@ -476,6 +513,12 @@ pub fn parse_graph(buf: &[u8]) -> Result<GraphProto, String> {
 }
 
 fn parse_graph_at(buf: &[u8], depth: u32) -> Result<GraphProto, String> {
+    parse_graph_impl(buf, depth, None)
+}
+
+/// `deferred`, when set, collects the initializers whose `raw_data` was left in
+/// the buffer, as ranges offset by `base` (the position of `buf` in the model).
+fn parse_graph_impl(buf: &[u8], depth: u32, mut deferred: Option<(&mut Vec<DeferredRaw>, usize)>) -> Result<GraphProto, String> {
     if depth > MAX_NESTING_DEPTH {
         return Err(format!(
             "graph nesting exceeds maximum depth {MAX_NESTING_DEPTH}"
@@ -489,7 +532,17 @@ fn parse_graph_at(buf: &[u8], depth: u32) -> Result<GraphProto, String> {
         match (field, value) {
             (1, WireValue::Bytes(b)) => graph.nodes.push(parse_node_at(b, depth)?),
             (2, WireValue::Bytes(b)) => graph.name = String::from_utf8_lossy(b).into_owned(),
-            (5, WireValue::Bytes(b)) => graph.initializers.push(parse_tensor_proto(b)?),
+            (5, WireValue::Bytes(b)) => match deferred.as_mut() {
+                Some((out, base)) => {
+                    let (t, raw) = parse_tensor_proto_impl(b, true)?;
+                    if let Some(r) = raw {
+                        let at = *base + offset_in(buf, b);
+                        out.push(DeferredRaw { initializer: graph.initializers.len(), range: at + r.start..at + r.end });
+                    }
+                    graph.initializers.push(t);
+                }
+                None => graph.initializers.push(parse_tensor_proto(b)?),
+            },
             (11, WireValue::Bytes(b)) => {
                 // ValueInfoProto for graph inputs — parse full info and extract name
                 let vi = parse_value_info_proto(b)?;
@@ -643,6 +696,22 @@ fn parse_dimension(buf: &[u8]) -> Result<(Option<i64>, Option<String>), String> 
 
 /// Parse an ONNX model file (`.onnx`) from its raw bytes.
 pub fn parse_model(buf: &[u8]) -> Result<ModelProto, String> {
+    parse_model_impl(buf, None)
+}
+
+/// [`parse_model`] without copying the large `raw_data` payloads of the main
+/// graph's initializers: those stay empty in the returned model, and their
+/// byte ranges within `buf` are returned instead, so a loader can decode each
+/// one straight from `buf` (for example a memory map) and then release it.
+/// Payloads smaller than [`DEFER_RAW_BYTES`], and every tensor in subgraphs,
+/// attributes and functions, are copied as usual.
+pub fn parse_model_deferred(buf: &[u8]) -> Result<(ModelProto, Vec<DeferredRaw>), String> {
+    let mut deferred = Vec::new();
+    let model = parse_model_impl(buf, Some(&mut deferred))?;
+    Ok((model, deferred))
+}
+
+fn parse_model_impl(buf: &[u8], mut deferred: Option<&mut Vec<DeferredRaw>>) -> Result<ModelProto, String> {
     let mut model = ModelProto::default();
     let mut pos = 0;
     while pos < buf.len() {
@@ -663,7 +732,15 @@ pub fn parse_model(buf: &[u8]) -> Result<ModelProto, String> {
             (6, WireValue::Bytes(b)) => {
                 model.doc_string = String::from_utf8_lossy(b).into_owned();
             }
-            (7, WireValue::Bytes(b)) => model.graph = parse_graph(b)?,
+            (7, WireValue::Bytes(b)) => {
+                let at = offset_in(buf, b);
+                // A repeated graph field replaces the earlier one, ranges included.
+                let d = deferred.as_deref_mut().map(|d| {
+                    d.clear();
+                    (d, at)
+                });
+                model.graph = parse_graph_impl(b, 0, d)?;
+            }
             (8, WireValue::Bytes(b)) => {
                 let import = parse_opset_import(b)?;
                 // Backwards compat: set opset_version from default domain

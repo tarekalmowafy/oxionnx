@@ -103,7 +103,6 @@ matrixmultiply = { workspace = true }
 bytemuck = { workspace = true }
 tracing = { workspace = true }
 aes-gcm = { workspace = true, optional = true }
-memmap2 = { workspace = true, optional = true }
 wasm-bindgen = { workspace = true, optional = true }
 js-sys = { workspace = true, optional = true }
 console_error_panic_hook = { workspace = true, optional = true }
@@ -112,6 +111,8 @@ wgpu = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = { workspace = true }
+# SessionBuilder::load / Session::from_file map the model file (see session::loading::parse_file).
+memmap2 = { workspace = true }
 # Native-only blocking executor for the `gpu` feature's `wgpu` adapter/device
 # requests (see `oxionnx-gpu`'s own `Cargo.toml`, which target-gates it the
 # same way). wasm32 cannot block a thread at all, so a wasm+gpu build must
@@ -129,7 +130,7 @@ directml = ["dep:oxionnx-directml"]
 coreml = ["dep:oxionnx-coreml"]
 simd = ["oxionnx-ops/simd"]
 encryption = ["dep:aes-gcm"]
-mmap = ["dep:memmap2", "oxionnx-proto/mmap"]
+mmap = ["oxionnx-proto/mmap"]
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_error_panic_hook"]
 # Opt-in wasm32 threading: re-enables rayon inside the operator kernels (the
 # 349 GFLOP/frame of conv + GEMM that dominate a browser run). Pure

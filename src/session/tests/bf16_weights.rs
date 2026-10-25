@@ -8,7 +8,15 @@ use std::collections::HashMap;
 const K: usize = 96;
 const N: usize = 70;
 
+fn weight() -> Vec<f32> {
+    (0..K * N).map(|i| ((i * 53) % 89) as f32 / 89.0 - 0.5).collect()
+}
+
 fn session(bf16: Option<bool>) -> Session {
+    session_with(bf16, false)
+}
+
+fn session_with(bf16: Option<bool>, keep: bool) -> Session {
     let graph = Graph {
         nodes: vec![Node {
             op: OpKind::MatMul,
@@ -21,9 +29,8 @@ fn session(bf16: Option<bool>) -> Session {
         output_names: vec!["y".into()],
         ..Default::default()
     };
-    let w: Vec<f32> = (0..K * N).map(|i| ((i * 53) % 89) as f32 / 89.0 - 0.5).collect();
-    let weights = HashMap::from([("w".to_string(), Tensor::new(w, vec![K, N]))]);
-    let builder = Session::builder().with_optimization_level(OptLevel::None);
+    let weights = HashMap::from([("w".to_string(), Tensor::new(weight(), vec![K, N]))]);
+    let builder = Session::builder().with_optimization_level(OptLevel::None).with_keep_weights(keep);
     let builder = match bf16 {
         Some(on) => builder.with_bf16_weights(on),
         None => builder,
@@ -52,7 +59,6 @@ fn close(a: &[f32], b: &[f32]) {
 fn bf16_weights_option() {
     let fp32 = session(Some(false));
     let want = run(&fp32, &[2, 5, K]);
-    assert_eq!(fp32.weights()["w"].data.len(), K * N, "FP32 sessions keep their weights");
     if std::env::var("OXIONNX_BF16_WEIGHTS").is_err() {
         assert_eq!(run(&session(None), &[2, 5, K]), want, "the default must stay FP32");
     }
@@ -61,7 +67,6 @@ fn bf16_weights_option() {
     let hw = is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bf16");
     if !hw {
         assert_eq!(got, want, "without AVX-512 BF16 the weights stay FP32");
-        assert_eq!(bf16.weights()["w"].data.len(), K * N);
         return;
     }
     assert_ne!(got, want, "BF16 weights should change the low bits");
@@ -82,4 +87,31 @@ fn bf16_weights_option() {
     // The session cache cannot hold freed weights.
     assert!(bf16.to_optimized_bytes().is_err());
     assert!(fp32.to_optimized_bytes().is_ok());
+}
+
+/// The packed GEMM is in use, so constant MatMul weights are packed at load.
+fn packs_at_load() -> bool {
+    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+}
+
+#[test]
+fn fp32_weights_are_packed_at_load_and_rebuilt_exactly_for_the_cache() {
+    let s = session(Some(false));
+    let want = run(&s, &[2, 5, K]);
+    let kept = session_with(Some(false), true);
+    assert_eq!(run(&kept, &[2, 5, K]), want, "keeping the weights changes nothing else");
+    assert_eq!(kept.weights()["w"].data, weight());
+    if !packs_at_load() {
+        assert_eq!(s.weights()["w"].data, weight());
+        return;
+    }
+    // The FP32 copy is freed; the shape stays.
+    assert!(s.weights()["w"].data.is_empty());
+    assert_eq!(s.weights()["w"].shape, vec![K, N]);
+    // The session cache holds the exact original weight, and reloads to the same results.
+    let bytes = s.to_optimized_bytes().expect("save");
+    assert_eq!(bytes, kept.to_optimized_bytes().expect("save kept"), "cache bytes match a session that kept its weights");
+    let reloaded = Session::builder().with_keep_weights(true).load_optimized_from_bytes(&bytes).expect("reload");
+    assert_eq!(reloaded.weights()["w"].data, weight());
+    assert_eq!(run(&reloaded, &[2, 5, K]), want);
 }

@@ -64,6 +64,10 @@ impl Operator for MatMulOp {
         let (k, n) = (b.shape[0], b.shape[1]);
         self.cache.prepack(ctx, -1, |isa| crate::gemm_packed::PackedB::pack_for(isa, &b.data, k, n))
     }
+    #[cfg(target_arch = "x86_64")]
+    fn released_weight(&self, ctx: &OpContext<'_>, input: usize) -> Option<Tensor> {
+        (input == 1).then(|| self.cache.exact_dense(ctx, -1, None)).flatten()
+    }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let a = ctx.input(0)?;
         let b = ctx.input(1)?;
