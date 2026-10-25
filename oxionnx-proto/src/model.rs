@@ -346,10 +346,13 @@ pub fn build_graph(
 /// Op types are otherwise looked up by name alone, so a `com.microsoft` contrib op
 /// whose semantics differ from a same-named ONNX op gets a domain-qualified name
 /// (`com.microsoft.RotaryEmbedding` takes `(input, position_ids, cos, sin)` on
-/// `[B, S, N*D]` input; ONNX's takes `(X, cos, sin, position_ids)`).
+/// `[B, S, N*D]` input; ONNX's takes `(X, cos, sin, position_ids)`;
+/// `com.microsoft.MultiHeadAttention` takes `(query, key, value, bias,
+/// key_padding_mask, attention_bias, past_key, past_value, ..)`, oxionnx's own
+/// `MultiHeadAttention` projects Q/K/V from `(.., qkv_weight, qkv_bias, ..)`).
 fn op_kind_for(domain: &str, op_type: &str) -> OpKind {
     match (domain, op_type) {
-        ("com.microsoft", "RotaryEmbedding") => OpKind::Unknown(format!("{domain}.{op_type}")),
+        ("com.microsoft", "RotaryEmbedding" | "MultiHeadAttention") => OpKind::Unknown(format!("{domain}.{op_type}")),
         _ => OpKind::parse(op_type),
     }
 }
@@ -1015,6 +1018,16 @@ pub(crate) fn inline_local_functions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contrib_ops_with_clashing_names_are_domain_qualified() {
+        for op in ["RotaryEmbedding", "MultiHeadAttention"] {
+            assert_eq!(op_kind_for("com.microsoft", op).as_str(), format!("com.microsoft.{op}"));
+            assert_ne!(op_kind_for("", op).as_str(), format!("com.microsoft.{op}"));
+        }
+        assert_eq!(op_kind_for("", "MultiHeadAttention"), OpKind::MultiHeadAttention);
+        assert_eq!(op_kind_for("com.microsoft", "GroupQueryAttention").as_str(), "GroupQueryAttention");
+    }
 
     /// Helper: encode a varint into bytes.
     fn encode_varint(mut val: u64) -> Vec<u8> {
