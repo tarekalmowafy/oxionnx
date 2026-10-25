@@ -186,9 +186,36 @@ impl PackedB {
         PackedB { k, n, isa, nr, panels, buf, off }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn isa(&self) -> Isa {
         self.isa
+    }
+
+    /// The packed matrix back as row-major `k x n` FP32 (in packed column
+    /// order; BF16 values widened), for fallbacks once the source is freed.
+    pub fn unpack(&self) -> Vec<f32> {
+        let (k, n, nr) = (self.k, self.n, self.nr);
+        let mut out = vec![0f32; k * n];
+        for k0 in (0..k).step_by(KC) {
+            for j in 0..self.panels {
+                let panel = self.panel(k0, j);
+                for p in k0..KC.min(k - k0) + k0 {
+                    for jj in 0..nr.min(n - j * nr) {
+                        // SAFETY: (p - k0, jj) lies inside panel j of this k block.
+                        let v = unsafe {
+                            match self.isa {
+                                Isa::Avx512Bf16 => {
+                                    let pair = *panel.cast::<u32>().add((p - k0) / 2 * nr + jj);
+                                    crate::gemm_bf16::from_bf16((pair >> (16 * ((p - k0) % 2))) as u16)
+                                }
+                                _ => *panel.add((p - k0) * nr + jj),
+                            }
+                        };
+                        out[p * n + j * nr + jj] = v;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Start of panel `j` in the k-block starting at row `k0`.

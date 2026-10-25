@@ -371,6 +371,18 @@ impl Session {
         #[cfg(target_arch = "wasm32")]
         let _ = num_threads;
 
+        // Load-time weight packing (BF16 weights); runs after shape inference
+        // and planning, which may still read initializer data.
+        let prepack_started = crate::time_compat::Instant::now();
+        let released_bytes = super::prepack::prepack_weights(&sorted_nodes, &mut weights, &output_names, &registry);
+        tracing::debug!(
+            target: LOAD_TARGET,
+            stage = "prepack",
+            released_bytes,
+            elapsed_us = prepack_started.elapsed().as_micros() as u64,
+            "weight prepacking complete",
+        );
+
         tracing::debug!(
             target: LOAD_TARGET,
             stage = "build",

@@ -297,41 +297,137 @@ pub struct OxiMatMulActOp {
     cache: WeightCache,
 }
 
-/// Constant weights packed once for [`crate::gemm_packed`], keyed by (data
-/// pointer, layout tag), as in `MatMulOp`. Per session, like the registry.
+/// Constant weights (input 1) packed once for [`crate::gemm_packed`], keyed by
+/// (weight name, layout tag) and checked against the source data pointer. Per
+/// session, like the registry; shared with `MatMulOp`.
+///
+/// With BF16 weights the session packs them at load time
+/// ([`Operator::prepack`]) and may then free the FP32 data: such a *released*
+/// weight (shape kept, data empty, see [`released`]) is served from here by
+/// name, or rebuilt with [`WeightCache::dense`] for the rare unpacked path.
 #[derive(Default)]
-struct WeightCache {
+pub(crate) struct WeightCache {
     #[cfg(target_arch = "x86_64")]
-    packed: std::sync::RwLock<std::collections::HashMap<(usize, i64), std::sync::Arc<crate::gemm_packed::PackedB>>>,
+    packed: std::sync::RwLock<std::collections::HashMap<String, Vec<CacheEntry>>>,
+}
+
+#[cfg(target_arch = "x86_64")]
+struct CacheEntry {
+    tag: i64,
+    /// Data pointer of the source weight when it was packed.
+    src: usize,
+    packed: std::sync::Arc<crate::gemm_packed::PackedB>,
+}
+
+/// A weight whose data the session freed after packing it (see [`WeightCache`]).
+pub(crate) fn released(w: &Tensor) -> bool {
+    w.data.len() != w.shape.iter().product::<usize>()
 }
 
 #[cfg(target_arch = "x86_64")]
 impl WeightCache {
+    fn lookup(&self, name: &str, tag: i64, src: Option<usize>) -> Option<std::sync::Arc<crate::gemm_packed::PackedB>> {
+        let cache = self.packed.read().ok()?;
+        let e = cache.get(name)?.iter().find(|e| e.tag == tag && src.is_none_or(|s| s == e.src))?;
+        Some(e.packed.clone())
+    }
+
     /// The packed form of input 1 when it is a 2-D session weight and the packed
     /// GEMM is available; `pack(isa)` builds it on first use (BF16 when the
     /// session enables BF16 weights).
-    fn get(
+    pub(crate) fn get(
         &self,
         ctx: &OpContext<'_>,
         w: &Tensor,
         tag: i64,
         pack: impl FnOnce(crate::gemm_packed::Isa) -> crate::gemm_packed::PackedB,
     ) -> Option<std::sync::Arc<crate::gemm_packed::PackedB>> {
-        let is_weight = ctx.weights.and_then(|ws| ws.get(ctx.node.inputs.get(1)?)).is_some_and(|t| std::ptr::eq(t, w));
+        let name = ctx.node.inputs.get(1)?;
+        if released(w) {
+            return self.lookup(name, tag, None).filter(|p| [p.k, p.n] == w.shape[..]);
+        }
+        let is_weight = ctx.weights.and_then(|ws| ws.get(name)).is_some_and(|t| std::ptr::eq(t, w));
         if !crate::gemm_packed::available() || !is_weight || w.ndim() != 2 {
             return None;
         }
-        let key = (w.data.as_ptr() as usize, tag);
-        if let Some(p) = self.packed.read().ok().and_then(|c| c.get(&key).cloned()) {
+        let src = w.data.as_ptr() as usize;
+        if let Some(p) = self.lookup(name, tag, Some(src)) {
             if (p.k, p.n) == (w.shape[0], w.shape[1]) {
                 return Some(p);
             }
         }
         let p = std::sync::Arc::new(pack(crate::gemm_packed::weight_isa(crate::gemm_bf16::weights_enabled(ctx.registry))?));
         if let Ok(mut c) = self.packed.write() {
-            c.insert(key, p.clone());
+            let entries = c.entry(name.clone()).or_default();
+            entries.retain(|e| e.tag != tag);
+            entries.push(CacheEntry { tag, src, packed: p.clone() });
         }
         Some(p)
+    }
+
+    /// [`Operator::prepack`] for input 1: when the session uses BF16 weights,
+    /// pack it now and report it as no longer needed in FP32.
+    pub(crate) fn prepack(
+        &self,
+        ctx: &OpContext<'_>,
+        tag: i64,
+        pack: impl FnOnce(crate::gemm_packed::Isa) -> crate::gemm_packed::PackedB,
+    ) -> Vec<usize> {
+        if !crate::gemm_bf16::weights_enabled(ctx.registry) {
+            return vec![];
+        }
+        match ctx.optional_input(1).and_then(|w| self.get(ctx, w, tag, pack)) {
+            Some(p) if p.isa() == crate::gemm_packed::Isa::Avx512Bf16 => vec![1],
+            _ => vec![],
+        }
+    }
+
+    /// The FP32 matrix of a released input 1 rebuilt from its packed copy (BF16
+    /// values), with packed column `j` stored at column `cols[j]` (identity if
+    /// `None`).
+    pub(crate) fn dense(&self, ctx: &OpContext<'_>, tag: i64, cols: Option<&[usize]>) -> Result<Tensor, OnnxError> {
+        let p = ctx.node.inputs.get(1).and_then(|name| self.lookup(name, tag, None)).ok_or_else(|| {
+            OnnxError::Internal(format!("'{}': released weight has no packed copy", ctx.node.name))
+        })?;
+        let packed = p.unpack();
+        let (k, n) = (p.k, p.n);
+        let data = match cols {
+            None => packed,
+            Some(cols) => {
+                let mut full = vec![0f32; k * n];
+                for (src, dst) in packed.chunks(n.max(1)).zip(full.chunks_mut(n.max(1))) {
+                    for (j, &c) in cols.iter().enumerate() {
+                        dst[c] = src[j];
+                    }
+                }
+                full
+            }
+        };
+        Ok(Tensor { data, shape: vec![k, n] })
+    }
+}
+
+/// The weight to use on an unpacked path: `w`, or its rebuilt FP32 form when
+/// the session released it.
+fn dense_weight<'t>(
+    cache: &WeightCache,
+    ctx: &OpContext<'_>,
+    w: &'t Tensor,
+    tag: i64,
+    cols: impl FnOnce() -> Option<Vec<usize>>,
+) -> Result<std::borrow::Cow<'t, Tensor>, OnnxError> {
+    if !released(w) {
+        return Ok(std::borrow::Cow::Borrowed(w));
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let cols = cols();
+        Ok(std::borrow::Cow::Owned(cache.dense(ctx, tag, cols.as_deref())?))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (cache, tag, cols);
+        Err(OnnxError::Internal(format!("'{}': released weight", ctx.node.name)))
     }
 }
 
@@ -374,7 +470,10 @@ impl OxiMatMulActOp {
         let mut res = Tensor { data: std::mem::take(&mut slots[0].data), shape: vec![] };
         shape_slot(&mut res, &out_shape);
         if !self.packed(ctx, m, x, w, &spec, &mut res.data) {
-            let mut product = crate::math::matmul(x, w).map_err(|e| bad(e.to_string()))?;
+            let tag = gate.map_or(-1, |h| h as i64);
+            let cols = || Some(fm::gate_columns(n, gate?, fm::block_cols(n, true)?));
+            let w = dense_weight(&self.cache, ctx, w, tag, cols)?;
+            let mut product = crate::math::matmul(x, &w).map_err(|e| bad(e.to_string()))?;
             fm::matmul_act_unfused(m, n, &mut product.data, &spec, &mut res.data);
         }
         match mul.filter(|_| mul_fused.is_none()) {
@@ -409,11 +508,38 @@ impl OxiMatMulActOp {
     fn packed(&self, _: &OpContext<'_>, _: usize, _: &Tensor, _: &Tensor, _: &crate::fused_matmul::Spec<'_>, _: &mut [f32]) -> bool {
         false
     }
+
+    /// Load-time BF16 packing, exactly as [`Self::packed`] packs.
+    #[cfg(target_arch = "x86_64")]
+    fn prepack_weight(&self, ctx: &OpContext<'_>) -> Vec<usize> {
+        use crate::fused_matmul as fm;
+        use crate::gemm_packed::PackedB;
+        let Some(w) = ctx.optional_input(1).filter(|w| w.ndim() == 2) else { return vec![] };
+        let gate = match ctx.attrs().i("gate", -1) {
+            -1 => None,
+            h @ (0 | 1) => Some(h as usize),
+            _ => return vec![],
+        };
+        let (k, n) = (w.shape[0], w.shape[1]);
+        let Some(cols) = fm::block_cols(n, gate.is_some()) else { return vec![] };
+        self.cache.prepack(ctx, gate.map_or(-1, |h| h as i64), |isa| match gate {
+            Some(h) => PackedB::pack_cols_for(isa, &w.data, k, n, &fm::gate_columns(n, h, cols)),
+            None => PackedB::pack_for(isa, &w.data, k, n),
+        })
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn prepack_weight(&self, _: &OpContext<'_>) -> Vec<usize> {
+        vec![]
+    }
 }
 
 impl Operator for OxiMatMulActOp {
     fn op_type(&self) -> &str {
         "OxiMatMulAct"
+    }
+    fn prepack(&self, ctx: &OpContext<'_>) -> Vec<usize> {
+        self.prepack_weight(ctx)
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let mut slots = empty_slots(ctx);
@@ -529,7 +655,8 @@ impl OxiMatMulSplitOp {
                 return Ok(());
             }
         }
-        let mut product = crate::math::matmul(x, w).map_err(|e| bad(e.to_string()))?;
+        let w = dense_weight(&self.cache, ctx, w, -1, || None)?;
+        let mut product = crate::math::matmul(x, &w).map_err(|e| bad(e.to_string()))?;
         fm::matmul_split_unfused(m, &mut product.data, &spec, block, &mut outs);
         Ok(())
     }
@@ -538,6 +665,12 @@ impl OxiMatMulSplitOp {
 impl Operator for OxiMatMulSplitOp {
     fn op_type(&self) -> &str {
         "OxiMatMulSplit"
+    }
+    #[cfg(target_arch = "x86_64")]
+    fn prepack(&self, ctx: &OpContext<'_>) -> Vec<usize> {
+        let Some(w) = ctx.optional_input(1).filter(|w| w.ndim() == 2) else { return vec![] };
+        let (k, n) = (w.shape[0], w.shape[1]);
+        self.cache.prepack(ctx, -1, |isa| crate::gemm_packed::PackedB::pack_for(isa, &w.data, k, n))
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let mut slots = empty_slots(ctx);
@@ -555,6 +688,42 @@ impl Operator for OxiMatMulSplitOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn released_weight_is_served_and_rebuilt_from_its_packed_copy() {
+        use crate::gemm_packed::{Isa, PackedB};
+        use oxionnx_core::graph::{Attributes, Node, OpKind};
+        if !crate::gemm_packed::available() {
+            return;
+        }
+        let (k, n) = (5, 64);
+        let w = crate::gemm_bf16::tests::rand(k * n, 3);
+        let weights = std::collections::HashMap::from([("w".to_string(), Tensor { data: w.clone(), shape: vec![k, n] })]);
+        let node = Node {
+            op: OpKind::MatMul,
+            name: "mm".into(),
+            inputs: vec!["x".into(), "w".into()],
+            outputs: vec!["y".into()],
+            attrs: Attributes::default(),
+        };
+        fn ctx<'a>(node: &'a Node, t: &'a Tensor, ws: Option<&'a std::collections::HashMap<String, Tensor>>) -> OpContext<'a> {
+            OpContext { node, inputs: vec![None, Some(t)], outer_scope: None, weights: ws, registry: None }
+        }
+        let cols = crate::fused_matmul::gate_columns(n, 1, 16);
+        let cache = WeightCache::default();
+        let pack = |_| PackedB::pack_cols_for(Isa::Avx512Bf16, &w, k, n, &cols);
+        assert!(cache.get(&ctx(&node, &weights["w"], Some(&weights)), &weights["w"], 1, pack).is_some());
+        let gone = Tensor { data: vec![], shape: vec![k, n] };
+        assert!(released(&gone) && !released(&weights["w"]));
+        let c = ctx(&node, &gone, None);
+        let p = cache.get(&c, &gone, 1, |_| unreachable!()).expect("served by name");
+        assert_eq!(p.isa(), Isa::Avx512Bf16);
+        assert!(cache.get(&c, &gone, 0, |_| unreachable!()).is_none(), "other tags miss");
+        let dense = cache.dense(&c, 1, Some(&cols)).unwrap();
+        assert_eq!(dense.shape, vec![k, n]);
+        assert_eq!(dense.data, crate::gemm_bf16::tests::round(&w));
+    }
 
     #[test]
     fn reshape_and_broadcast_helpers() {

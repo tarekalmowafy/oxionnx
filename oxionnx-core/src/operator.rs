@@ -177,6 +177,16 @@ pub trait Operator: Send + Sync {
         self.execute(ctx)
     }
 
+    /// Load-time hook, called by the session once per node after graph
+    /// optimization, with the node's initializer inputs in `ctx.inputs` (the
+    /// others `None`) and `ctx.weights` set. An operator that keeps its own
+    /// packed copy of a constant input (e.g. BF16 weights) may build it now; it
+    /// returns the input indices whose tensor data it will never read again,
+    /// which the session may then free. Default: nothing.
+    fn prepack(&self, _ctx: &OpContext<'_>) -> Vec<usize> {
+        Vec::new()
+    }
+
     // ── Phase D: native typed dispatch ─────────────────────────────────────────
 
     /// Dtypes this operator can execute without an f32 round-trip.

@@ -392,6 +392,16 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn unpack_round_trips() {
+        use crate::gemm_packed::{Isa, PackedB};
+        for &(k, n) in &[(1usize, 1usize), (7, 33), (513, 70), (1025, 64)] {
+            let b = rand(k * n, 5);
+            assert_eq!(PackedB::pack_for(Isa::Avx512Bf16, &b, k, n).unpack(), round(&b), "k={k} n={n}");
+            assert_eq!(PackedB::pack_for(Isa::Avx2, &b, k, n).unpack(), b, "k={k} n={n}");
+        }
+    }
+
+    #[test]
     fn bf16_error_vs_fp32_is_small() {
         use crate::gemm_packed::{gemm, Isa, PackedB};
         let (m, k, n) = (16, 1024, 96);
@@ -428,8 +438,9 @@ pub(crate) mod tests {
             std::env::var("BENCH_THREADS").unwrap_or("1".into()).split(',').map(|t| t.parse().unwrap()).collect();
         for &th in &threads {
             let pool = rayon::ThreadPoolBuilder::new().num_threads(th).build().unwrap();
-            for &m in &[32usize, 256, 2048] {
-                for &(k, n) in &[(512usize, 512usize), (512, 2048), (2048, 512), (512, 4096), (1024, 512), (512, 3072)] {
+            let ms: Vec<usize> = std::env::var("BENCH_M").unwrap_or("32,256,2048".into()).split(',').map(|t| t.parse().unwrap()).collect();
+            for &m in &ms {
+                for &(k, n) in &[(512usize, 512usize), (512, 2048), (2048, 512), (512, 4096), (1024, 512), (512, 3072), (512, 12288)] {
                     let (a, b) = (rand(m * k, 1), rand(k * n, 2));
                     // Enough weight copies to spill L3 when M is small, as in a model run.
                     let copies = if m <= 256 { ((256usize << 20) / (k * n * 4)).max(1) } else { 1 };

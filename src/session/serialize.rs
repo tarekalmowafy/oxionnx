@@ -812,8 +812,15 @@ impl Session {
     /// # Errors
     ///
     /// [`OnnxError::InvalidModel`] if the graph nests subgraphs deeper than the
-    /// format's 32-level limit.
+    /// format's 32-level limit; [`OnnxError::Unsupported`] for a session with
+    /// BF16 weights (their FP32 data was freed).
     pub fn to_optimized_bytes(&self) -> Result<Vec<u8>, OnnxError> {
+        if let Some((name, _)) = self.weights.iter().find(|(_, t)| super::prepack::is_released(t)) {
+            return Err(OnnxError::Unsupported(format!(
+                "session cache: weight '{name}' was released after BF16 packing; \
+                 build the session without BF16 weights to save it"
+            )));
+        }
         let mut out = Vec::new();
         out.extend_from_slice(SESSION_CACHE_MAGIC);
         put_u32(&mut out, SESSION_CACHE_FORMAT_VERSION);

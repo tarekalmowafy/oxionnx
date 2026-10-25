@@ -112,6 +112,16 @@ impl Session {
                 && node.inputs.iter().zip(&sources).all(|(name, source)| {
                     let dtype = match source {
                         InputSource::Absent => return true,
+                        // A weight released after BF16 packing has no f32 data
+                        // to copy; only the f32 path (borrowing it) can run it.
+                        InputSource::Weight
+                            if self
+                                .weights
+                                .get(name)
+                                .is_some_and(crate::session::prepack::is_released) =>
+                        {
+                            return false
+                        }
                         InputSource::Weight => DType::F32,
                         InputSource::Intermediate => match state.get(name) {
                             Some(t) => t.dtype(),

@@ -36,6 +36,7 @@ mod gpu_owner;
 // unresolvable. Keeping the docs in one place keeps the links working.
 pub mod gpu_residency;
 mod loading;
+mod prepack;
 pub(crate) mod mixed_precision;
 mod run;
 pub mod serialize;

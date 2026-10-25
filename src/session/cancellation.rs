@@ -250,6 +250,9 @@ impl Operator for CancellableOp {
         self.token.check(&ctx.node.name, &self.op_type)?;
         self.inner_op()?.execute_into_slots(ctx, slots)
     }
+    fn prepack(&self, ctx: &OpContext<'_>) -> Vec<usize> {
+        self.inner_op().map_or_else(|_| Vec::new(), |op| op.prepack(ctx))
+    }
 }
 
 // ── The owned-operator guard ────────────────────────────────────────────────
@@ -319,6 +322,9 @@ impl Operator for CancellableBoxedOp {
     ) -> Result<(), OnnxError> {
         self.token.check(&ctx.node.name, &self.op_type)?;
         self.inner.execute_into_slots(ctx, slots)
+    }
+    fn prepack(&self, ctx: &OpContext<'_>) -> Vec<usize> {
+        self.inner.prepack(ctx)
     }
 }
 

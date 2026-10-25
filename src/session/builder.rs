@@ -83,12 +83,16 @@ impl SessionBuilder {
     }
 
     /// Opt in to BF16 weights: constant FP32 MatMul weights (plain `MatMul`
-    /// and the fused projection / MLP ops) are repacked to BF16 when first
-    /// used, and those GEMMs run on AVX-512 BF16 dot products with FP32
-    /// accumulation. This halves the packed weights' memory and bandwidth and
-    /// roughly doubles GEMM throughput, at BF16 precision for the weights and
-    /// the activations entering those GEMMs (typically cosine > 0.999 against
-    /// FP32 outputs). Activation x activation products (attention) stay FP32.
+    /// and the fused projection / MLP ops) are repacked to BF16 when the
+    /// session is built, and those GEMMs run on AVX-512 BF16 dot products with
+    /// FP32 accumulation. Initializers used only by those GEMMs then have their
+    /// FP32 data freed ([`Session::weights`] reports them with their shape and
+    /// empty data), so they take half the memory and bandwidth; GEMM
+    /// throughput roughly doubles. Precision is BF16 for the weights and for
+    /// the activations entering those GEMMs (typically cosine > 0.9999
+    /// against FP32 outputs); activation x activation products (attention)
+    /// stay FP32. Such a session cannot be saved with
+    /// [`Session::save_optimized`].
     ///
     /// Only on CPUs with `avx512f` + `avx512bf16`; elsewhere the weights stay
     /// FP32 and results are bit-identical to the default.
