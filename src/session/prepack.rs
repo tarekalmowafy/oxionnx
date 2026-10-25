@@ -64,7 +64,29 @@ pub(crate) fn prepack_weights(
             }
         }
     }
+    if bytes > 0 {
+        return_freed_memory();
+    }
     bytes
+}
+
+/// Hand the freed weights back to the OS. glibc keeps them in its heap: after
+/// the first large free its mmap threshold rises, so later weight-sized blocks
+/// live in the heap rather than in their own mappings, and freeing them does
+/// not lower RSS (BF16 sessions kept the size of their FP32 weights resident).
+fn return_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        #[allow(unsafe_code)]
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: plain glibc call with no pointers; it only releases free pages.
+        #[allow(unsafe_code)]
+        unsafe {
+            malloc_trim(0);
+        }
+    }
 }
 
 /// The original data of every released weight that some consumer can rebuild
