@@ -89,6 +89,7 @@ pub fn load_with_metadata(
     inline_local_functions(&mut graph_proto, &functions)?;
 
     // Collect initializer (weight) tensors first (needed for input_names filter and node attrs).
+    let byte_names = crate::byte_tensor::plan(&mut graph_proto);
     let mut weights: HashMap<String, Tensor> = HashMap::new();
     for init in &graph_proto.initializers {
         // Same external-data predicate as `reader::OnnxReader`, so both APIs
@@ -96,7 +97,13 @@ pub fn load_with_metadata(
         if reader::is_external(init) {
             return Err("External data requires load_with_path()".to_string());
         }
-        weights.insert(init.name.clone(), decode_tensor_proto(init)?);
+        let tensor = if byte_names.contains(&init.name) {
+            crate::byte_tensor::pack(&init.name, &init.dims, &crate::byte_tensor::inline_bytes(init))
+                .map_err(|e| e.to_string())?
+        } else {
+            decode_tensor_proto(init)?
+        };
+        weights.insert(init.name.clone(), tensor);
     }
 
     let (graph, weights_out) = build_graph_and_weights(graph_proto, weights, None)?;
@@ -146,13 +153,25 @@ pub fn load_with_metadata_and_path(
     let mut graph_proto = model.graph;
     inline_local_functions(&mut graph_proto, &functions)?;
 
-    // Collect initializer (weight) tensors
+    // Collect initializer (weight) tensors. Sidecar files are opened once and
+    // read per tensor range.
+    let byte_names = crate::byte_tensor::plan(&mut graph_proto);
+    let mut files = ExternalFiles::default();
     let mut weights: HashMap<String, Tensor> = HashMap::new();
     for init in &graph_proto.initializers {
-        let tensor = if reader::is_external(init) {
-            load_external_tensor(init, base_path)?
-        } else {
-            decode_tensor_proto(init)?
+        let as_bytes = byte_names.contains(&init.name);
+        let tensor = match (reader::is_external(init), as_bytes) {
+            (true, false) => {
+                let bytes = files.read(init, base_path)?;
+                init.tensor_from_raw_bytes(&bytes).map_err(|e| e.to_string())?
+            }
+            (true, true) => {
+                let bytes = files.read(init, base_path)?;
+                crate::byte_tensor::pack(&init.name, &init.dims, &bytes).map_err(|e| e.to_string())?
+            }
+            (false, true) => crate::byte_tensor::pack(&init.name, &init.dims, &crate::byte_tensor::inline_bytes(init))
+                .map_err(|e| e.to_string())?,
+            (false, false) => decode_tensor_proto(init)?,
         };
         weights.insert(init.name.clone(), tensor);
     }
@@ -199,76 +218,99 @@ fn decode_tensor_proto_ext(tp: &TensorProto, base_path: Option<&Path>) -> Result
 
 /// Load tensor data from an external file referenced by the TensorProto.
 fn load_external_tensor(tensor_proto: &TensorProto, base_path: &Path) -> Result<Tensor, String> {
-    let mut location = None;
-    let mut offset: u64 = 0;
-    let mut length: Option<u64> = None;
-
-    for (key, value) in &tensor_proto.external_data {
-        match key.as_str() {
-            "location" => location = Some(value.clone()),
-            "offset" => {
-                offset = value
-                    .parse::<u64>()
-                    .map_err(|e| format!("Invalid offset '{}': {}", value, e))?;
-            }
-            "length" => {
-                length = Some(
-                    value
-                        .parse::<u64>()
-                        .map_err(|e| format!("Invalid length '{}': {}", value, e))?,
-                );
-            }
-            _ => {} // ignore "checksum" and others
-        }
-    }
-
-    let location = location.ok_or_else(|| {
-        format!(
-            "External tensor '{}' missing 'location' field",
-            tensor_proto.name
-        )
-    })?;
-
-    // `location` is attacker-controlled: sandbox it inside the model directory
-    // before touching the filesystem.
-    let file_path = reader::resolve_external_path(base_path, &location, &tensor_proto.name)
-        .map_err(|e| e.to_string())?;
-    let file_data = std::fs::read(&file_path).map_err(|e| {
-        format!(
-            "Cannot read external data file '{}': {}",
-            file_path.display(),
-            e
-        )
-    })?;
-
-    let range_err = |detail: String| {
-        format!(
-            "External data for '{}': {detail} (file size {})",
-            tensor_proto.name,
-            file_data.len()
-        )
-    };
-    let start = usize::try_from(offset)
-        .map_err(|_| range_err(format!("offset {offset} is not addressable")))?;
-    let end = match length {
-        Some(len) => {
-            let len = usize::try_from(len)
-                .map_err(|_| range_err(format!("length {len} is not addressable")))?;
-            start
-                .checked_add(len)
-                .ok_or_else(|| range_err(format!("offset {start} + length {len} overflows")))?
-        }
-        // No explicit length: the tensor owns the tail of the file.
-        None => file_data.len(),
-    };
-    if start > end || end > file_data.len() {
-        return Err(range_err(format!("byte range {start}..{end} is invalid")));
-    }
-
-    // One shared dtype table with the inline path, plus the dims/length check.
+    let bytes = ExternalFiles::default().read(tensor_proto, base_path)?;
     tensor_proto
-        .tensor_from_raw_bytes(&file_data[start..end])
+        .tensor_from_raw_bytes(&bytes)
         .map_err(|e| e.to_string())
+}
+
+/// Open sidecar files, kept across the initializers of one load so each
+/// tensor reads only its own byte range (reading the whole file per tensor is
+/// quadratic in the number of external tensors).
+#[derive(Default)]
+struct ExternalFiles {
+    files: HashMap<std::path::PathBuf, (std::fs::File, u64)>,
+}
+
+impl ExternalFiles {
+    /// The raw bytes of an external-data tensor.
+    fn read(&mut self, tensor_proto: &TensorProto, base_path: &Path) -> Result<Vec<u8>, String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut location = None;
+        let mut offset: u64 = 0;
+        let mut length: Option<u64> = None;
+
+        for (key, value) in &tensor_proto.external_data {
+            match key.as_str() {
+                "location" => location = Some(value.clone()),
+                "offset" => {
+                    offset = value
+                        .parse::<u64>()
+                        .map_err(|e| format!("Invalid offset '{}': {}", value, e))?;
+                }
+                "length" => {
+                    length = Some(
+                        value
+                            .parse::<u64>()
+                            .map_err(|e| format!("Invalid length '{}': {}", value, e))?,
+                    );
+                }
+                _ => {} // ignore "checksum" and others
+            }
+        }
+
+        let location = location.ok_or_else(|| {
+            format!(
+                "External tensor '{}' missing 'location' field",
+                tensor_proto.name
+            )
+        })?;
+
+        // `location` is attacker-controlled: sandbox it inside the model directory
+        // before touching the filesystem.
+        let file_path = reader::resolve_external_path(base_path, &location, &tensor_proto.name)
+            .map_err(|e| e.to_string())?;
+        if !self.files.contains_key(&file_path) {
+            let file = std::fs::File::open(&file_path).map_err(|e| {
+                format!(
+                    "Cannot read external data file '{}': {}",
+                    file_path.display(),
+                    e
+                )
+            })?;
+            let size = file
+                .metadata()
+                .map_err(|e| format!("Cannot stat external data file '{}': {e}", file_path.display()))?
+                .len();
+            self.files.insert(file_path.clone(), (file, size));
+        }
+        let (file, size) = self.files.get_mut(&file_path).expect("inserted above");
+        let size = *size;
+
+        let range_err = |detail: String| {
+            format!(
+                "External data for '{}': {detail} (file size {size})",
+                tensor_proto.name
+            )
+        };
+        // No explicit length: the tensor owns the tail of the file.
+        let end = match length {
+            Some(len) => offset
+                .checked_add(len)
+                .ok_or_else(|| range_err(format!("offset {offset} + length {len} overflows")))?,
+            None => size,
+        };
+        if offset > end || end > size {
+            return Err(range_err(format!("byte range {offset}..{end} is invalid")));
+        }
+        let len = usize::try_from(end - offset)
+            .map_err(|_| range_err(format!("length {} is not addressable", end - offset)))?;
+        let mut bytes = vec![0u8; len];
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(&mut bytes))
+            .map_err(|e| range_err(format!("read failed: {e}")))?;
+        Ok(bytes)
+    }
 }
 
 /// Build an oxionnx-core `Graph` from a `GraphProto` and pre-extracted weights.
