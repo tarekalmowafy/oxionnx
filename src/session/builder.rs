@@ -34,6 +34,8 @@ pub struct SessionBuilder {
     /// one.  Applied after the graph is optimized, because the guard registry is
     /// built from the *final* node list.  See [`crate::session::cancellation`].
     pub(crate) cancellation: Option<CancellationToken>,
+    /// [`SessionBuilder::with_bf16_weights`]; `None` follows `OXIONNX_BF16_WEIGHTS`.
+    pub(crate) bf16_weights: Option<bool>,
 }
 
 impl SessionBuilder {
@@ -66,7 +68,41 @@ impl SessionBuilder {
             op_placement: OpPlacement::default(),
             providers: Vec::new(),
             cancellation: None,
+            bf16_weights: None,
         }
+    }
+
+    /// The registry to build with (the custom one or the default), carrying
+    /// this builder's session-level operator options.
+    fn take_registry(&mut self) -> OperatorRegistry {
+        let registry = self.registry.take().unwrap_or_else(oxionnx_ops::default_registry);
+        if let Some(on) = self.bf16_weights {
+            registry.set_bf16_weights(on);
+        }
+        registry
+    }
+
+    /// Opt in to BF16 weights: constant FP32 MatMul weights (plain `MatMul`
+    /// and the fused projection / MLP ops) are repacked to BF16 when the
+    /// session is built, and those GEMMs run on AVX-512 BF16 dot products with
+    /// FP32 accumulation. Initializers used only by those GEMMs then have their
+    /// FP32 data freed ([`Session::weights`] reports them with their shape and
+    /// empty data), so they take half the memory and bandwidth; GEMM
+    /// throughput roughly doubles. Precision is BF16 for the weights and for
+    /// the activations entering those GEMMs (typically cosine > 0.9999
+    /// against FP32 outputs); activation x activation products (attention)
+    /// stay FP32. Such a session cannot be saved with
+    /// [`Session::save_optimized`].
+    ///
+    /// Only on CPUs with `avx512f` + `avx512bf16`; elsewhere the weights stay
+    /// FP32 and results are bit-identical to the default.
+    ///
+    /// Default: off, unless the `OXIONNX_BF16_WEIGHTS` environment variable is
+    /// `1` (or `true` / `on` / `yes`); an explicit call overrides the variable.
+    #[must_use]
+    pub fn with_bf16_weights(mut self, enabled: bool) -> Self {
+        self.bf16_weights = Some(enabled);
+        self
     }
 
     /// Bind a [`CancellationToken`] to the session this builder produces.
@@ -159,12 +195,12 @@ impl SessionBuilder {
 
     /// Load an ONNX model from a file path.
     /// Supports models with external data by resolving paths relative to the file's directory.
-    pub fn load(self, path: &Path) -> Result<Session, OnnxError> {
+    pub fn load(mut self, path: &Path) -> Result<Session, OnnxError> {
         let bytes = std::fs::read(path).map_err(|e| {
             OnnxError::Parse(format!("Cannot read ONNX file {}: {e}", path.display()))
         })?;
         let base_path = path.parent().unwrap_or_else(|| Path::new("."));
-        let registry = self.registry.unwrap_or_else(oxionnx_ops::default_registry);
+        let registry = self.take_registry();
         let (raw_meta, graph, weights) = super::loading::parse_stage("file", bytes.len(), || {
             crate::model::load_with_metadata_and_path(&bytes, base_path)
         })
@@ -207,7 +243,7 @@ impl SessionBuilder {
     /// agrees with what `load`/`load_from_bytes` report for identical model
     /// bytes, instead of silently reporting [`ModelMetadata::default`].
     #[cfg(feature = "mmap")]
-    pub fn load_mmap(self, path: &Path) -> Result<Session, OnnxError> {
+    pub fn load_mmap(mut self, path: &Path) -> Result<Session, OnnxError> {
         let (raw_meta, graph, weights) = super::loading::parse_stage("mmap", 0, || {
             let file = std::fs::File::open(path)
                 .map_err(|e| format!("Cannot open '{}': {}", path.display(), e))?;
@@ -223,7 +259,7 @@ impl SessionBuilder {
         })
         .map_err(OnnxError::Parse)?;
         let metadata = raw_meta_to_model_metadata(raw_meta);
-        let registry = self.registry.unwrap_or_else(oxionnx_ops::default_registry);
+        let registry = self.take_registry();
         let built = Session::build_from_graph(
             graph,
             weights,
@@ -242,8 +278,8 @@ impl SessionBuilder {
     }
 
     /// Load an ONNX model from raw bytes.
-    pub fn load_from_bytes(self, bytes: &[u8]) -> Result<Session, OnnxError> {
-        let registry = self.registry.unwrap_or_else(oxionnx_ops::default_registry);
+    pub fn load_from_bytes(mut self, bytes: &[u8]) -> Result<Session, OnnxError> {
+        let registry = self.take_registry();
         let (raw_meta, graph, weights) = super::loading::parse_stage("bytes", bytes.len(), || {
             crate::model::load_with_metadata(bytes)
         })
@@ -270,8 +306,8 @@ impl SessionBuilder {
     ///
     /// Parses the model incrementally from the reader without loading the entire
     /// file into memory at once. Useful for multi-GB models.
-    pub fn load_from_reader<R: std::io::Read>(self, reader: R) -> Result<Session, OnnxError> {
-        let registry = self.registry.unwrap_or_else(oxionnx_ops::default_registry);
+    pub fn load_from_reader<R: std::io::Read>(mut self, reader: R) -> Result<Session, OnnxError> {
+        let registry = self.take_registry();
         let (graph, weights) = super::loading::parse_stage("reader", 0, || {
             let (graph_proto, weights) = oxionnx_proto::parse_streaming(reader)?;
             let graph = oxionnx_proto::build_graph(&graph_proto, &weights)?;
@@ -300,14 +336,14 @@ impl SessionBuilder {
     /// The `weight_filter` closure receives each weight's name and shape.
     /// If it returns `true`, the weight is loaded; if `false`, it is skipped.
     /// This is useful for loading only needed layers from a large model.
-    pub fn load_filtered<F>(self, path: &Path, weight_filter: F) -> Result<Session, OnnxError>
+    pub fn load_filtered<F>(mut self, path: &Path, weight_filter: F) -> Result<Session, OnnxError>
     where
         F: FnMut(&str, &[usize]) -> bool,
     {
         let file = std::fs::File::open(path).map_err(|e| {
             OnnxError::Parse(format!("Cannot read ONNX file {}: {e}", path.display()))
         })?;
-        let registry = self.registry.unwrap_or_else(oxionnx_ops::default_registry);
+        let registry = self.take_registry();
         let (graph, weights) = super::loading::parse_stage("filtered", 0, || {
             let (graph_proto, weights) =
                 oxionnx_proto::parse_with_weight_filter(file, weight_filter)?;
@@ -334,11 +370,11 @@ impl SessionBuilder {
 
     /// Build a Session from a pre-parsed Graph and weights.
     pub fn build_from_graph(
-        self,
+        mut self,
         graph: Graph,
         weights: HashMap<String, Tensor>,
     ) -> Result<Session, OnnxError> {
-        let registry = self.registry.unwrap_or_else(oxionnx_ops::default_registry);
+        let registry = self.take_registry();
         let built = Session::build_from_graph(
             graph,
             weights,
@@ -381,11 +417,11 @@ impl SessionBuilder {
     }
 
     /// [`SessionBuilder::load_optimized`] from bytes already in memory.
-    pub fn load_optimized_from_bytes(self, bytes: &[u8]) -> Result<Session, OnnxError> {
+    pub fn load_optimized_from_bytes(mut self, bytes: &[u8]) -> Result<Session, OnnxError> {
         let cached =
             super::loading::parse_stage("cache", bytes.len(), || super::serialize::decode(bytes))?;
         let expected_nodes = cached.graph.nodes.len();
-        let registry = self.registry.unwrap_or_else(oxionnx_ops::default_registry);
+        let registry = self.take_registry();
         let built = Session::build_from_graph(
             cached.graph,
             cached.weights,

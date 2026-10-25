@@ -439,3 +439,20 @@ fn test_batched_matmul_large_batch() {
         );
     }
 }
+
+#[test]
+fn reduce_sum_contiguous_axes_match_generic_path() {
+    let shape = vec![3, 4, 5, 6];
+    let x = Tensor::new((0..360).map(|i| ((i * 37) % 101) as f32 / 10.0 - 5.0).collect(), shape);
+    for axes in [vec![1], vec![-1], vec![0], vec![1, 2], vec![2, 1], vec![0, 1, 2], vec![-2]] {
+        for keepdims in [false, true] {
+            let fast = reduce_sum(&x, &axes, keepdims).unwrap();
+            let generic = super::reduce::reduce_with(&x, &axes, keepdims, 0.0, |a, v| a + v, |s, _| s).unwrap();
+            assert_eq!(fast.shape, generic.shape, "axes {axes:?} keepdims {keepdims}");
+            assert_eq!(fast.data, generic.data, "axes {axes:?} keepdims {keepdims}");
+            let mut into = vec![f32::NAN; generic.data.len()];
+            let shape = super::reduce::reduce_sum_into(&x, &axes, keepdims, &mut into).unwrap();
+            assert_eq!((shape, into), (generic.shape.clone(), generic.data.clone()));
+        }
+    }
+}

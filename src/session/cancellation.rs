@@ -250,6 +250,9 @@ impl Operator for CancellableOp {
         self.token.check(&ctx.node.name, &self.op_type)?;
         self.inner_op()?.execute_into_slots(ctx, slots)
     }
+    fn prepack(&self, ctx: &OpContext<'_>) -> Vec<usize> {
+        self.inner_op().map_or_else(|_| Vec::new(), |op| op.prepack(ctx))
+    }
 }
 
 // ── The owned-operator guard ────────────────────────────────────────────────
@@ -320,6 +323,9 @@ impl Operator for CancellableBoxedOp {
         self.token.check(&ctx.node.name, &self.op_type)?;
         self.inner.execute_into_slots(ctx, slots)
     }
+    fn prepack(&self, ctx: &OpContext<'_>) -> Vec<usize> {
+        self.inner.prepack(ctx)
+    }
 }
 
 /// Wrap one owned operator so it consults `token` before it runs.
@@ -381,9 +387,13 @@ pub(crate) fn wrap_registry(
     token: &CancellationToken,
 ) -> OperatorRegistry {
     let opset = inner.model_opset();
+    let bf16_weights = inner.bf16_weights();
     let inner = Arc::new(inner);
     let mut wrapped = OperatorRegistry::new();
     wrapped.set_model_opset(opset);
+    if let Some(on) = bf16_weights {
+        wrapped.set_bf16_weights(on);
+    }
     for op_type in reachable_op_types(nodes) {
         // `contains` and `get` agree by construction; the `let ... else` keeps
         // the snapshot below infallible without an unwrap.

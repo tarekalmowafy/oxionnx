@@ -3,17 +3,17 @@
 use oxionnx_core::{OnnxError, OpContext, Operator, Tensor};
 
 use crate::math;
+use crate::registry::contrib_ops::{released, WeightCache};
 
 // ── MatMul ──────────────────────────────────────────────────────────────────
 
 /// `cache` (prototype, onnx_spike): constant weights (B inputs that are session
-/// initializers) packed once for [`crate::gemm_packed`], keyed by the weight's
-/// data pointer. The registry, and therefore this cache, is per session, and
-/// session weights are immutable while it lives.
+/// initializers) packed once for [`crate::gemm_packed`] (see
+/// [`WeightCache`]). The registry, and therefore this cache, is per session,
+/// and session weights are immutable while it lives.
 #[derive(Default)]
 pub struct MatMulOp {
-    #[cfg(target_arch = "x86_64")]
-    cache: std::sync::RwLock<std::collections::HashMap<usize, std::sync::Arc<crate::gemm_packed::PackedB>>>,
+    cache: WeightCache,
 }
 
 impl MatMulOp {
@@ -25,24 +25,11 @@ impl MatMulOp {
         if b.ndim() != 2 || a.ndim() < 2 || !gemm_packed::available() {
             return None;
         }
-        let w = ctx.weights?.get(ctx.node.inputs.get(1)?)?;
-        if !std::ptr::eq(w, b) {
-            return None;
-        }
         let (k, n) = (b.shape[0], b.shape[1]);
         if a.shape[a.ndim() - 1] != k {
             return None;
         }
-        let key = b.data.as_ptr() as usize;
-        let cached = self.cache.read().ok()?.get(&key).cloned();
-        let packed = match cached {
-            Some(p) if p.k == k && p.n == n => p,
-            _ => {
-                let p = std::sync::Arc::new(PackedB::pack(&b.data, k, n));
-                self.cache.write().ok()?.insert(key, p.clone());
-                p
-            }
-        };
+        let packed = self.cache.get(ctx, b, -1, |isa| PackedB::pack_for(isa, &b.data, k, n))?;
         let m = a.data.len() / k.max(1);
         out.resize(m * n, 0.0);
         gemm_packed::gemm(m, &a.data, &packed, &mut out[..], crate::par::threads());
@@ -55,11 +42,27 @@ impl MatMulOp {
     fn try_packed(&self, _: &OpContext<'_>, _: &Tensor, _: &Tensor, _: &mut Vec<f32>) -> Option<Vec<usize>> {
         None
     }
+
+    /// B for the generic kernel (rebuilt when the session released it).
+    fn dense_b<'t>(&self, ctx: &OpContext<'_>, b: &'t Tensor) -> Result<std::borrow::Cow<'t, Tensor>, OnnxError> {
+        #[cfg(target_arch = "x86_64")]
+        if released(b) {
+            return Ok(std::borrow::Cow::Owned(self.cache.dense(ctx, -1, None)?));
+        }
+        let _ = ctx;
+        Ok(std::borrow::Cow::Borrowed(b))
+    }
 }
 
 impl Operator for MatMulOp {
     fn op_type(&self) -> &str {
         "MatMul"
+    }
+    #[cfg(target_arch = "x86_64")]
+    fn prepack(&self, ctx: &OpContext<'_>) -> Vec<usize> {
+        let Some(b) = ctx.optional_input(1).filter(|b| b.ndim() == 2) else { return vec![] };
+        let (k, n) = (b.shape[0], b.shape[1]);
+        self.cache.prepack(ctx, -1, |isa| crate::gemm_packed::PackedB::pack_for(isa, &b.data, k, n))
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let a = ctx.input(0)?;
@@ -68,7 +71,7 @@ impl Operator for MatMulOp {
         if let Some(shape) = self.try_packed(ctx, a, b, &mut out) {
             return Ok(vec![Tensor::new(out, shape)]);
         }
-        Ok(vec![math::matmul(a, b)?])
+        Ok(vec![math::matmul(a, &*self.dense_b(ctx, b)?)?])
     }
     fn supports_output_slots(&self) -> bool {
         true
@@ -86,7 +89,7 @@ impl Operator for MatMulOp {
             .ok_or_else(|| OnnxError::InvalidModel("MatMul: no output slot provided".into()))?;
         let out_shape = match self.try_packed(ctx, a, b, &mut slot.data) {
             Some(shape) => shape,
-            None => math::matmul_into(a, b, &mut slot.data).map_err(OnnxError::ShapeMismatch)?,
+            None => math::matmul_into(a, &*self.dense_b(ctx, b)?, &mut slot.data).map_err(OnnxError::ShapeMismatch)?,
         };
         slot.shape = out_shape;
         Ok(())
@@ -115,6 +118,11 @@ impl Operator for MatMulOp {
         let b = ctx
             .input(1)
             .ok_or_else(|| OnnxError::TensorNotFound("MatMul: missing input[1]".into()))?;
+
+        // A weight the session released after packing: the f32 path finds its packed copy.
+        if matches!(&b.storage, TensorStorage::F32(d) if d.len() != b.shape.iter().product::<usize>()) {
+            return oxionnx_core::default_typed_via_f32(self, ctx);
+        }
 
         match (&a.storage, &b.storage) {
             // ── F32: borrow both operands directly and call the shared

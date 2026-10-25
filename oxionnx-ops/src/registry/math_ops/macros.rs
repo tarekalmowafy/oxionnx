@@ -356,7 +356,7 @@ macro_rules! binary_op_inplace {
                 // Prototype: same row-wise broadcast kernel as the slot path (used when
                 // the output shape was not statically resolved).
                 let f = crate::math::binary_fn($inplace_fn);
-                let mut out = Tensor::new(Vec::new(), Vec::new());
+                let mut out = Tensor { data: Vec::new(), shape: Vec::new() };
                 crate::math::binary_into(ctx.input(0)?, ctx.input(1)?, &mut out, f)?;
                 Ok(vec![out])
             }
@@ -374,7 +374,7 @@ macro_rules! binary_op_inplace {
                 if crate::math::binary_inplace(&mut input, other, f)? {
                     return Ok(vec![input]);
                 }
-                let mut out = Tensor::new(Vec::new(), Vec::new());
+                let mut out = Tensor { data: Vec::new(), shape: Vec::new() };
                 crate::math::binary_into(&input, other, &mut out, f)?;
                 Ok(vec![out])
             }

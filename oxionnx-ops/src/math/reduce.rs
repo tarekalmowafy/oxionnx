@@ -258,6 +258,9 @@ pub(crate) fn reduce_sum_into(
             }
         }
     }
+    if let Some(shape) = reduce_sum_contiguous(x, axes, keepdims, |_| &mut *out) {
+        return Ok(shape);
+    }
     reduce_with_into(x, axes, keepdims, 0.0, |a, v| a + v, |s, _| s, out)
 }
 
@@ -546,7 +549,52 @@ pub fn reduce_sum(x: &Tensor, axes: &[i64], keepdims: bool) -> Result<Tensor, St
             return Ok(Tensor::new(vec![val], shape));
         }
     }
+    let mut data = Vec::new();
+    if let Some(shape) = reduce_sum_contiguous(x, axes, keepdims, |n| {
+        data.resize(n, 0.0);
+        &mut data[..]
+    }) {
+        return Ok(Tensor::new(data, shape));
+    }
     reduce_with(x, axes, keepdims, 0.0, |a, v| a + v, |s, _| s)
+}
+
+/// Prototype (onnx_spike): `ReduceSum` over one contiguous run of axes, viewed
+/// as `[outer, reduced, inner]` and summed row by row (parallel over `outer`)
+/// into `out(len)`. Each output accumulates in the same order as
+/// [`reduce_with`]. Returns the output shape, or `None` (without calling `out`)
+/// when the axes are not one contiguous run.
+fn reduce_sum_contiguous<'a>(x: &Tensor, axes: &[i64], keepdims: bool, out: impl FnOnce(usize) -> &'a mut [f32]) -> Option<Vec<usize>> {
+    let ndim = x.ndim();
+    if axes.is_empty() || ndim == 0 {
+        return None;
+    }
+    let mut ax: Vec<usize> = axes.iter().map(|&a| normalize_axis(a, ndim).ok()).collect::<Option<_>>()?;
+    ax.sort_unstable();
+    ax.dedup();
+    let (lo, hi) = (ax[0], *ax.last()?);
+    if hi - lo + 1 != ax.len() || x.data.len() != x.shape.iter().product::<usize>() {
+        return None;
+    }
+    let outer: usize = x.shape[..lo].iter().product();
+    let red: usize = x.shape[lo..=hi].iter().product();
+    let inner: usize = x.shape[hi + 1..].iter().product();
+    let data = &mut out(outer * inner)[..outer * inner];
+    data.fill(0.0);
+    if red > 0 && inner > 0 {
+        let src = &x.data[..];
+        crate::par::for_each_row(data, inner, |o, row| {
+            let block = &src[o * red * inner..(o + 1) * red * inner];
+            if inner == 1 {
+                row[0] = block.iter().fold(0.0, |a, &v| a + v);
+            } else {
+                for r in block.chunks_exact(inner) {
+                    row.iter_mut().zip(r).for_each(|(a, &v)| *a += v);
+                }
+            }
+        });
+    }
+    Some(x.shape.iter().enumerate().filter_map(|(d, &n)| if !(lo..=hi).contains(&d) { Some(n) } else { keepdims.then_some(1) }).collect())
 }
 
 pub fn reduce_max(x: &Tensor, axes: &[i64], keepdims: bool) -> Result<Tensor, String> {

@@ -58,7 +58,9 @@ pub fn optimize(
 ///     Conv+Relu, Conv+ReLU6, SiLU, Div+Sqrt→Rsqrt, standalone BN folding,
 ///     LayerNorm, spatial (InstanceNorm-style) normalization chains,
 ///     Transpose/Reshape cancellation, MatMul+Transpose, Add+MatMul→Gemm,
-///     Gather composition, Conv+Add+Relu.
+///     Gather composition, Conv+Add+Relu, and — when the registry has the
+///     fused kernels — attention (`OxiAttention`), MatMul+GELU (`OxiMatMulAct`)
+///     and MatMul+Split projections (`OxiMatMulSplit`).
 ///
 /// [`PassLevel::Extended`] runs step 3 and step 5; [`PassLevel::Basic`] runs
 /// step 3 only.  Every pass keeps the declared `output_names` produced.
@@ -129,6 +131,25 @@ pub fn optimize_with_input_shapes(
     // Inference-mode Dropout is the identity; removing it first lets the
     // downstream patterns (e.g. Softmax → Dropout → MatMul) match.
     let nodes = fusion::eliminate_dropout_inference(nodes, weights, output_names);
+    // Before the MatMul/Transpose fusions, which would otherwise absorb pieces of
+    // the attention chain (e.g. an unscaled `MatMul(q, k) + mask`).
+    let nodes = if registry.get("OxiAttention").is_some() {
+        fusion::fuse_attention(nodes, weights, output_names)
+    } else {
+        nodes
+    };
+    // Before MatMul+Add→Gemm, which would take the bias Add this pass folds in.
+    let nodes = if registry.get("OxiMatMulAct").is_some() {
+        fusion::fuse_matmul_act(nodes, weights, output_names)
+    } else {
+        nodes
+    };
+    // After the gated-GELU fusion, whose `MatMul -> Split` prefix this also matches.
+    let nodes = if registry.get("OxiMatMulSplit").is_some() {
+        fusion::fuse_matmul_split(nodes, weights, output_names)
+    } else {
+        nodes
+    };
 
     let shapes = shape_inference::infer_shapes(&nodes, weights, input_shapes);
     let nodes = fusion::fuse_matmul_add(nodes, weights, &shapes, output_names);

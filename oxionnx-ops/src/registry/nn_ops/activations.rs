@@ -364,7 +364,7 @@ fn gelu_approximate_is_tanh(attrs: &oxionnx_core::Attributes) -> bool {
 /// `x * 0.5 * (1 + erf(x / sqrt(2)))`. Reuses `erf_approx` below, whose
 /// Abramowitz & Stegun approximation is accurate to ~1.5e-7 -- comfortably
 /// inside the 1e-5 tolerance ONNX's own `test_gelu_default_*` node tests use.
-fn gelu_exact(x: f32) -> f32 {
+pub(crate) fn gelu_exact(x: f32) -> f32 {
     x * 0.5 * (1.0 + erf_approx(x * std::f32::consts::FRAC_1_SQRT_2))
 }
 
@@ -450,7 +450,12 @@ impl Operator for GeluOp {
         let input = ctx.input(0)?;
         let use_tanh = gelu_approximate_is_tanh(ctx.attrs());
         let slot = &mut slots[0];
-        if slot.shape == input.shape && slot.data.len() == input.data.len() {
+        if use_tanh && cfg!(feature = "simd") && crate::gelu::vectorized() {
+            // Same kernel as `nn::gelu_slice`, without the copy into the slot first.
+            slot.data.resize(input.data.len(), 0.0);
+            crate::gelu::gelu_mul_par(&input.data, None, &mut slot.data);
+            slot.shape.clone_from(&input.shape);
+        } else if slot.shape == input.shape && slot.data.len() == input.data.len() {
             slot.data.copy_from_slice(&input.data);
             if use_tanh {
                 nn::gelu_slice(&mut slot.data);

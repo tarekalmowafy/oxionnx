@@ -176,6 +176,10 @@ impl Session {
     }
 
     /// Return a reference to the model's weight tensors.
+    ///
+    /// With [`SessionBuilder::with_bf16_weights`](super::SessionBuilder::with_bf16_weights)
+    /// on a CPU with AVX-512 BF16, weights read only by the BF16 GEMMs keep
+    /// their shape but have empty `data` (the session holds their packed BF16 copy).
     pub fn weights(&self) -> &HashMap<String, Tensor> {
         &self.weights
     }
@@ -195,7 +199,12 @@ impl Session {
 
     /// Return summary information about the loaded model.
     pub fn model_info(&self) -> ModelInfo {
-        let parameter_count: usize = self.weights.values().map(|t| t.numel()).sum();
+        // Released (BF16-packed) weights keep their shape but not their data.
+        let parameter_count: usize = self
+            .weights
+            .values()
+            .map(|t| if super::prepack::is_released(t) { t.shape.iter().product() } else { t.numel() })
+            .sum();
         let mut op_histogram = HashMap::new();
         for node in &self.sorted_nodes {
             *op_histogram

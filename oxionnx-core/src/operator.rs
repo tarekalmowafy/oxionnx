@@ -21,7 +21,7 @@ use hashbrown::HashMap;
 #[cfg(feature = "std")]
 use std::collections::HashMap;
 
-use core::sync::atomic::{AtomicI64, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 
 use crate::dtype::{DType, TypedTensor};
 use crate::error::OnnxError;
@@ -177,6 +177,16 @@ pub trait Operator: Send + Sync {
         self.execute(ctx)
     }
 
+    /// Load-time hook, called by the session once per node after graph
+    /// optimization, with the node's initializer inputs in `ctx.inputs` (the
+    /// others `None`) and `ctx.weights` set. An operator that keeps its own
+    /// packed copy of a constant input (e.g. BF16 weights) may build it now; it
+    /// returns the input indices whose tensor data it will never read again,
+    /// which the session may then free. Default: nothing.
+    fn prepack(&self, _ctx: &OpContext<'_>) -> Vec<usize> {
+        Vec::new()
+    }
+
     // ── Phase D: native typed dispatch ─────────────────────────────────────────
 
     /// Dtypes this operator can execute without an f32 round-trip.
@@ -292,6 +302,10 @@ pub struct OperatorRegistry {
     /// to operators — and to rayon workers — behind `&self` for the whole of a
     /// run; the binding itself happens once, before any node executes.
     model_opset: AtomicI64,
+    /// Session option: pack constant MatMul weights as BF16 (0 = unset, so the
+    /// kernels consult `OXIONNX_BF16_WEIGHTS`; 1 = off; 2 = on). See
+    /// [`OperatorRegistry::set_bf16_weights`].
+    bf16_weights: AtomicU8,
 }
 
 impl OperatorRegistry {
@@ -299,6 +313,24 @@ impl OperatorRegistry {
         Self {
             ops: hashbrown::HashMap::new(),
             model_opset: AtomicI64::new(DEFAULT_OPSET),
+            bf16_weights: AtomicU8::new(0),
+        }
+    }
+
+    /// Opt in to (or out of) BF16 weights for the session bound to this
+    /// registry: constant FP32 MatMul weights are packed as BF16 and multiplied
+    /// with FP32 accumulation, on CPUs with AVX-512 BF16 (elsewhere they stay
+    /// FP32). Set by `SessionBuilder::with_bf16_weights` before the first run.
+    pub fn set_bf16_weights(&self, enabled: bool) {
+        self.bf16_weights.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+    }
+
+    /// The BF16-weights option, or `None` when it was never set (the kernels
+    /// then follow the `OXIONNX_BF16_WEIGHTS` environment variable).
+    pub fn bf16_weights(&self) -> Option<bool> {
+        match self.bf16_weights.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v == 2),
         }
     }
 

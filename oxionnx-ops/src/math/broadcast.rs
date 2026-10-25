@@ -443,6 +443,11 @@ pub(crate) fn binary_into(a: &Tensor, b: &Tensor, out: &mut Tensor, f: impl Bina
     if numel == 0 {
         return Ok(());
     }
+    if numel == 1 {
+        // Scalars (including rank 0, which `RowPlan` does not model).
+        out.data[0] = f(a.data[0], b.data[0]);
+        return Ok(());
+    }
     let plan = RowPlan::new(&a.shape, &b.shape, &out.shape);
     let (au, bu) = (plan.a_inner == 1, plan.b_inner == 1);
     let (ad, bd) = (&a.data[..], &b.data[..]);
@@ -458,6 +463,11 @@ pub(crate) fn binary_inplace(a: &mut Tensor, b: &Tensor, f: impl BinaryFn) -> Re
     let out_shape = Tensor::broadcast_shape(&a.shape, &b.shape)?;
     if out_shape != a.shape {
         return Ok(false);
+    }
+    if a.data.len() == 1 {
+        // Scalars (including rank 0, which `RowPlan` does not model).
+        a.data[0] = f(a.data[0], b.data[0]);
+        return Ok(true);
     }
     let plan = RowPlan::new(&a.shape, &b.shape, &out_shape);
     debug_assert_eq!(plan.a_inner, 1);
