@@ -15,6 +15,8 @@ pub mod dsp;
 pub mod einsum;
 pub mod flash;
 #[cfg(target_arch = "x86_64")]
+pub mod fused_matmul;
+pub mod gelu;
 pub(crate) mod gemm_packed;
 pub mod indexing;
 pub mod kv_cache;

@@ -122,6 +122,35 @@ impl PackedB {
         PackedB { k, n, isa, nr, panels, buf, off }
     }
 
+    /// Pack a column selection of the row-major `k x ld` matrix `b`: packed
+    /// column `j` is `b[:, cols[j]]` (e.g. to interleave the halves of a fused
+    /// gate/up projection for [`gemm_epilogue`]).
+    pub fn pack_cols(b: &[f32], k: usize, ld: usize, cols: &[usize]) -> Self {
+        let isa = isa().expect("gemm_packed: no AVX2/AVX-512");
+        assert!(cols.iter().all(|&c| c < ld) && b.len() >= k * ld);
+        let (nr, n) = (isa.tile().1, cols.len());
+        let panels = n.div_ceil(nr);
+        let len = k * panels * nr;
+        let mut buf = vec![0f32; len + 16];
+        let off = buf.as_ptr().align_offset(64).min(16);
+        let dst = &mut buf[off..off + len];
+        let mut base = 0;
+        for k0 in (0..k).step_by(KC) {
+            let kc = KC.min(k - k0);
+            for (j, panel_cols) in cols.chunks(nr).enumerate() {
+                let panel = &mut dst[base + j * kc * nr..base + (j + 1) * kc * nr];
+                for p in 0..kc {
+                    let row = &b[(k0 + p) * ld..(k0 + p + 1) * ld];
+                    for (jj, &c) in panel_cols.iter().enumerate() {
+                        panel[p * nr + jj] = row[c];
+                    }
+                }
+            }
+            base += kc * panels * nr;
+        }
+        PackedB { k, n, isa, nr, panels, buf, off }
+    }
+
     /// Start of panel `j` in the k-block starting at row `k0`.
     #[inline]
     fn panel(&self, k0: usize, j: usize) -> *const f32 {
@@ -161,6 +190,70 @@ pub fn gemm(m: usize, a: &[f32], b: &PackedB, c: &mut [f32], threads: usize) {
         // offsets stay within a/b/c bounds (checked by the asserts above), and
         // `b.isa` was detected on this CPU.
         unsafe { tile(a.as_ptr().add(i0 * k), k, mb, b, p0, p1, cp.0.add(i0 * n), n) };
+    });
+}
+
+/// Receives each finished block of C while it is still in L1, instead of C
+/// being written out (see [`gemm_epilogue`]).
+pub trait Epilogue: Sync {
+    /// Columns per block: a multiple of 32 (both kernels' NR) that divides `n`.
+    fn width(&self) -> usize;
+    /// `block` holds rows `i0..i0 + rows`, columns `j0..j0 + width()` of C,
+    /// row-major with row stride `width()`.
+    ///
+    /// # Safety
+    /// Called concurrently from several threads, for disjoint blocks.
+    unsafe fn apply(&self, i0: usize, rows: usize, j0: usize, block: &mut [f32]);
+}
+
+/// `epi` receives every block of `a` (m x k, row-major) @ `b`. Uses up to `threads` rayon tasks.
+pub fn gemm_epilogue<E: Epilogue>(m: usize, a: &[f32], b: &PackedB, epi: &E, threads: usize) {
+    let (k, n, w) = (b.k, b.n, epi.width());
+    assert_eq!(a.len(), m * k);
+    assert!(w > 0 && w % 32 == 0 && n % w == 0, "gemm_epilogue: width {w} must be a multiple of 32 dividing n={n}");
+    if m == 0 || n == 0 {
+        return;
+    }
+    let (mr, nr) = b.isa.tile();
+    let tasks = (m * n * k / MIN_MACS_PER_TASK).clamp(1, threads.max(1));
+    let grid = Grid::new(m, mr, n / w, tasks);
+    grid.run(tasks, |i0, mb, u0, u1| {
+        let mut block = vec![0f32; mr * w];
+        for u in u0..u1 {
+            let mut i = 0;
+            while i < mb {
+                let r = mr.min(mb - i);
+                if k == 0 {
+                    block.fill(0.0);
+                }
+                for k0 in (0..k).step_by(KC) {
+                    let kc = KC.min(k - k0);
+                    for jj in 0..w / nr {
+                        let kernel = Kernel {
+                            kc,
+                            a: unsafe { a.as_ptr().add((i0 + i) * k + k0) },
+                            rs: k,
+                            bp: b.panel(k0, u * w / nr + jj),
+                            c: unsafe { block.as_mut_ptr().add(jj * nr) },
+                            ldc: w,
+                            nb: nr,
+                            accumulate: k0 > 0,
+                        };
+                        // SAFETY: rows i0+i..i0+i+r of `a` and panel u*w/nr+jj of `b` exist
+                        // (n % w == 0), `block` holds mr x w, and `b.isa` was detected here.
+                        unsafe {
+                            match b.isa {
+                                Isa::Avx512 => avx512::dispatch(r, &kernel),
+                                Isa::Avx2 => avx2::dispatch(r, &kernel),
+                            }
+                        }
+                    }
+                }
+                // SAFETY: each (row strip, column block) is visited by exactly one task.
+                unsafe { epi.apply(i0 + i, r, u * w, &mut block[..r * w]) };
+                i += r;
+            }
+        }
     });
 }
 

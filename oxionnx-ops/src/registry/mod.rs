@@ -179,6 +179,7 @@ pub fn default_registry() -> OperatorRegistry {
     r.register(Box::new(contrib_ops::SkipSimplifiedLayerNormOp));
     r.register(Box::new(contrib_ops::MsRotaryEmbeddingOp));
     r.register(Box::new(contrib_ops::OxiAttentionOp));
+    r.register(Box::new(contrib_ops::OxiMatMulActOp::default()));
 
     // ── Aliases (ONNX names that differ from our canonical op_type) ────────
     r.register_as("LayerNorm", Box::new(nn_ops::LayerNormOp));

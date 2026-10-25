@@ -1,5 +1,6 @@
 //! Operators for ONNX Runtime contrib ops (`com.microsoft` domain) and the
-//! optimizer-only fused attention op. Kernels live in [`crate::contrib`].
+//! optimizer-only fused ops (attention, MatMul + activation). Kernels live in
+//! [`crate::contrib`] and [`crate::fused_matmul`].
 //!
 //! The model loader keeps op types whose `com.microsoft` semantics differ from a
 //! same-named ONNX op apart by prefixing the domain (`com.microsoft.RotaryEmbedding`);
@@ -267,6 +268,151 @@ impl OxiAttentionOp {
 impl Operator for OxiAttentionOp {
     fn op_type(&self) -> &str {
         "OxiAttention"
+    }
+    fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+        let mut slots = empty_slots(ctx);
+        self.run(ctx, &mut slots)?;
+        Ok(slots)
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
+    fn execute_into_slots(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
+        self.run(ctx, slots)
+    }
+}
+
+// ── OxiMatMulAct (optimizer-only) ────────────────────────────────────────────
+
+/// `MatMul` by a constant 2-D weight with a fused activation epilogue, emitted
+/// by the optimizer's MatMul-activation fusion (see [`crate::fused_matmul`]).
+///
+/// Inputs: `x` `[.., K]`, `w` `[K, N]`, optional `bias` `[N]`, optional `mul`.
+/// Attributes: `activation` (`"gelu"`), `approximate` (`"tanh"` or `"none"`),
+/// `gate` (`-1`: `act(x@w + bias) * mul`, output `[.., N]`; `0`/`1`: gated, the
+/// activation applies to that half of the `N` columns and multiplies the other
+/// half, output `[.., N/2]`, no `mul`).
+#[derive(Default)]
+pub struct OxiMatMulActOp {
+    cache: WeightCache,
+}
+
+/// Constant weights packed once for [`crate::gemm_packed`], keyed by (data
+/// pointer, layout tag), as in `MatMulOp`. Per session, like the registry.
+#[derive(Default)]
+struct WeightCache {
+    #[cfg(target_arch = "x86_64")]
+    packed: std::sync::RwLock<std::collections::HashMap<(usize, i64), std::sync::Arc<crate::gemm_packed::PackedB>>>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl WeightCache {
+    /// The packed form of input 1 when it is a 2-D session weight and the packed
+    /// GEMM is available; `pack` builds it on first use.
+    fn get(
+        &self,
+        ctx: &OpContext<'_>,
+        w: &Tensor,
+        tag: i64,
+        pack: impl FnOnce() -> crate::gemm_packed::PackedB,
+    ) -> Option<std::sync::Arc<crate::gemm_packed::PackedB>> {
+        let is_weight = ctx.weights.and_then(|ws| ws.get(ctx.node.inputs.get(1)?)).is_some_and(|t| std::ptr::eq(t, w));
+        if !crate::gemm_packed::available() || !is_weight || w.ndim() != 2 {
+            return None;
+        }
+        let key = (w.data.as_ptr() as usize, tag);
+        if let Some(p) = self.packed.read().ok().and_then(|c| c.get(&key).cloned()) {
+            if (p.k, p.n) == (w.shape[0], w.shape[1]) {
+                return Some(p);
+            }
+        }
+        let p = std::sync::Arc::new(pack());
+        if let Ok(mut c) = self.packed.write() {
+            c.insert(key, p.clone());
+        }
+        Some(p)
+    }
+}
+
+impl OxiMatMulActOp {
+    fn run(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
+        use crate::fused_matmul::{self as fm, Act, Spec};
+        let (x, w) = (ctx.input(0)?, ctx.input(1)?);
+        let (bias, mul) = (ctx.optional_input(2), ctx.optional_input(3));
+        let attrs = ctx.attrs();
+        let bad = |m: String| err(format!("OxiMatMulAct '{}': {m}", ctx.node.name));
+        if attrs.s("activation") != "gelu" {
+            return Err(bad(format!("unsupported activation {:?}", attrs.s("activation"))));
+        }
+        let act = if attrs.s("approximate") == "tanh" { Act::GeluTanh } else { Act::GeluErf };
+        let gate = match attrs.i("gate", -1) {
+            -1 => None,
+            h @ (0 | 1) => Some(h as usize),
+            h => return Err(bad(format!("gate must be -1, 0 or 1, got {h}"))),
+        };
+        if w.ndim() != 2 || x.ndim() == 0 || x.shape[x.ndim() - 1] != w.shape[0] {
+            return Err(bad(format!("x {:?} @ w {:?}", x.shape, w.shape)));
+        }
+        let (k, n) = (w.shape[0], w.shape[1]);
+        if gate.is_some() && (n % 2 != 0 || mul.is_some()) {
+            return Err(bad(format!("gated form needs an even N (got {n}) and no mul")));
+        }
+        if let Some(b) = bias {
+            if b.data.len() != n || b.shape.last() != Some(&n) {
+                return Err(bad(format!("bias {:?} is not [{n}]", b.shape)));
+            }
+        }
+        let n_out = if gate.is_some() { n / 2 } else { n };
+        let m = x.data.len() / k.max(1);
+        let mut out_shape = x.shape.clone();
+        *out_shape.last_mut().unwrap() = n_out;
+        // A multiplier that does not match the output elementwise is applied
+        // afterwards with ONNX broadcasting.
+        let mul_fused = mul.filter(|t| t.shape == out_shape);
+        let spec = Spec { act, gate, bias: bias.map(|b| &b.data[..]), mul: mul_fused.map(|t| &t.data[..]) };
+        let mut res = Tensor { data: std::mem::take(&mut slots[0].data), shape: vec![] };
+        shape_slot(&mut res, &out_shape);
+        if !self.packed(ctx, m, x, w, &spec, &mut res.data) {
+            let mut product = crate::math::matmul(x, w).map_err(|e| bad(e.to_string()))?;
+            fm::matmul_act_unfused(m, n, &mut product.data, &spec, &mut res.data);
+        }
+        match mul.filter(|_| mul_fused.is_none()) {
+            Some(mt) => {
+                let mut out = Tensor { data: vec![], shape: vec![] };
+                crate::math::binary_into(&res, mt, &mut out, |a, b| a * b).map_err(bad)?;
+                slots[0] = out;
+            }
+            None => slots[0] = res,
+        }
+        Ok(())
+    }
+
+    /// Packed-GEMM epilogue path; `false` when it does not apply.
+    #[cfg(target_arch = "x86_64")]
+    fn packed(&self, ctx: &OpContext<'_>, m: usize, x: &Tensor, w: &Tensor, spec: &crate::fused_matmul::Spec<'_>, out: &mut [f32]) -> bool {
+        use crate::fused_matmul as fm;
+        use crate::gemm_packed::PackedB;
+        let (k, n) = (w.shape[0], w.shape[1]);
+        let Some(cols) = fm::block_cols(n, spec.gate.is_some()) else { return false };
+        let packed = self.cache.get(ctx, w, spec.gate.map_or(-1, |h| h as i64), || match spec.gate {
+            Some(h) => PackedB::pack_cols(&w.data, k, n, &fm::gate_columns(n, h, cols)),
+            None => PackedB::pack(&w.data, k, n),
+        });
+        let Some(packed) = packed else { return false };
+        let width = if spec.gate.is_some() { 2 * cols } else { cols };
+        fm::matmul_act_packed(m, &x.data, &packed, width, spec, out, crate::par::threads());
+        true
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn packed(&self, _: &OpContext<'_>, _: usize, _: &Tensor, _: &Tensor, _: &crate::fused_matmul::Spec<'_>, _: &mut [f32]) -> bool {
+        false
+    }
+}
+
+impl Operator for OxiMatMulActOp {
+    fn op_type(&self) -> &str {
+        "OxiMatMulAct"
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let mut slots = empty_slots(ctx);

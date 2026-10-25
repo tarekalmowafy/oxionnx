@@ -58,7 +58,8 @@ pub fn optimize(
 ///     Conv+Relu, Conv+ReLU6, SiLU, Div+Sqrt→Rsqrt, standalone BN folding,
 ///     LayerNorm, spatial (InstanceNorm-style) normalization chains,
 ///     Transpose/Reshape cancellation, MatMul+Transpose, Add+MatMul→Gemm,
-///     Gather composition, Conv+Add+Relu.
+///     Gather composition, Conv+Add+Relu, and — when the registry has the
+///     fused kernels — attention (`OxiAttention`) and MatMul+GELU (`OxiMatMulAct`).
 ///
 /// [`PassLevel::Extended`] runs step 3 and step 5; [`PassLevel::Basic`] runs
 /// step 3 only.  Every pass keeps the declared `output_names` produced.
@@ -133,6 +134,12 @@ pub fn optimize_with_input_shapes(
     // the attention chain (e.g. an unscaled `MatMul(q, k) + mask`).
     let nodes = if registry.get("OxiAttention").is_some() {
         fusion::fuse_attention(nodes, weights, output_names)
+    } else {
+        nodes
+    };
+    // Before MatMul+Add→Gemm, which would take the bias Add this pass folds in.
+    let nodes = if registry.get("OxiMatMulAct").is_some() {
+        fusion::fuse_matmul_act(nodes, weights, output_names)
     } else {
         nodes
     };
