@@ -308,13 +308,14 @@ struct WeightCache {
 #[cfg(target_arch = "x86_64")]
 impl WeightCache {
     /// The packed form of input 1 when it is a 2-D session weight and the packed
-    /// GEMM is available; `pack` builds it on first use.
+    /// GEMM is available; `pack(isa)` builds it on first use (BF16 when the
+    /// session enables BF16 weights).
     fn get(
         &self,
         ctx: &OpContext<'_>,
         w: &Tensor,
         tag: i64,
-        pack: impl FnOnce() -> crate::gemm_packed::PackedB,
+        pack: impl FnOnce(crate::gemm_packed::Isa) -> crate::gemm_packed::PackedB,
     ) -> Option<std::sync::Arc<crate::gemm_packed::PackedB>> {
         let is_weight = ctx.weights.and_then(|ws| ws.get(ctx.node.inputs.get(1)?)).is_some_and(|t| std::ptr::eq(t, w));
         if !crate::gemm_packed::available() || !is_weight || w.ndim() != 2 {
@@ -326,7 +327,7 @@ impl WeightCache {
                 return Some(p);
             }
         }
-        let p = std::sync::Arc::new(pack());
+        let p = std::sync::Arc::new(pack(crate::gemm_packed::weight_isa(crate::gemm_bf16::weights_enabled(ctx.registry))?));
         if let Ok(mut c) = self.packed.write() {
             c.insert(key, p.clone());
         }
@@ -394,9 +395,9 @@ impl OxiMatMulActOp {
         use crate::gemm_packed::PackedB;
         let (k, n) = (w.shape[0], w.shape[1]);
         let Some(cols) = fm::block_cols(n, spec.gate.is_some()) else { return false };
-        let packed = self.cache.get(ctx, w, spec.gate.map_or(-1, |h| h as i64), || match spec.gate {
-            Some(h) => PackedB::pack_cols(&w.data, k, n, &fm::gate_columns(n, h, cols)),
-            None => PackedB::pack(&w.data, k, n),
+        let packed = self.cache.get(ctx, w, spec.gate.map_or(-1, |h| h as i64), |isa| match spec.gate {
+            Some(h) => PackedB::pack_cols_for(isa, &w.data, k, n, &fm::gate_columns(n, h, cols)),
+            None => PackedB::pack_for(isa, &w.data, k, n),
         });
         let Some(packed) = packed else { return false };
         let width = if spec.gate.is_some() { 2 * cols } else { cols };
@@ -523,7 +524,7 @@ impl OxiMatMulSplitOp {
         let mut outs: Vec<&mut [f32]> = slots.iter_mut().map(|t| &mut t.data[..]).collect();
         #[cfg(target_arch = "x86_64")]
         if block % 32 == 0 {
-            if let Some(p) = self.cache.get(ctx, w, -1, || crate::gemm_packed::PackedB::pack(&w.data, k, n)) {
+            if let Some(p) = self.cache.get(ctx, w, -1, |isa| crate::gemm_packed::PackedB::pack_for(isa, &w.data, k, n)) {
                 fm::matmul_split_packed(m, &x.data, &p, &spec, block, &mut outs, crate::par::threads());
                 return Ok(());
             }

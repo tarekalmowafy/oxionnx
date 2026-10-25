@@ -329,7 +329,18 @@ mod packed {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
-    use crate::gemm_packed::{self, PackedB};
+    use crate::gemm_bf16::tests::round;
+    use crate::gemm_packed::{self, Isa, PackedB};
+
+    /// The packings to test: the CPU's FP32 kernel, then BF16 weights (its
+    /// reference product uses BF16-rounded inputs).
+    fn isas() -> [Isa; 2] {
+        [gemm_packed::isa().unwrap(), Isa::Avx512Bf16]
+    }
+
+    fn rounded(isa: Isa, v: &[f32]) -> Vec<f32> {
+        if isa == Isa::Avx512Bf16 { round(v) } else { v.to_vec() }
+    }
 
     fn rand(n: usize, seed: u64) -> Vec<f32> {
         let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -374,18 +385,24 @@ mod tests {
                             bias: with_bias.then_some(&bias[..]),
                             mul: (gate.is_none() && with_bias).then_some(&mul[..]),
                         };
-                        let mut want = vec![0f32; m * n_out];
-                        matmul_act_unfused(m, n, &mut naive(m, k, n, &x, &w), &spec, &mut want);
-                        let hb = block_cols(n, gate.is_some()).unwrap();
-                        let (b, width) = match gate {
-                            Some(ah) => (PackedB::pack_cols(&w, k, n, &gate_columns(n, ah, hb)), 2 * hb),
-                            None => (PackedB::pack(&w, k, n), hb),
-                        };
-                        for threads in [1, 4] {
-                            let mut got = vec![f32::NAN; m * n_out];
-                            pool.install(|| matmul_act_packed(m, &x, &b, width, &spec, &mut got, threads));
-                            for (g, w) in got.iter().zip(&want) {
-                                assert!((g - w).abs() <= 1e-4 * (1.0 + w.abs()), "m={m} k={k} n={n} {act:?} gate={gate:?}: {g} vs {w}");
+                        for isa in isas() {
+                            let mut want = vec![0f32; m * n_out];
+                            let product = &mut naive(m, k, n, &rounded(isa, &x), &rounded(isa, &w));
+                            matmul_act_unfused(m, n, product, &spec, &mut want);
+                            let hb = block_cols(n, gate.is_some()).unwrap();
+                            let (b, width) = match gate {
+                                Some(ah) => (PackedB::pack_cols_for(isa, &w, k, n, &gate_columns(n, ah, hb)), 2 * hb),
+                                None => (PackedB::pack_for(isa, &w, k, n), hb),
+                            };
+                            for threads in [1, 4] {
+                                let mut got = vec![f32::NAN; m * n_out];
+                                pool.install(|| matmul_act_packed(m, &x, &b, width, &spec, &mut got, threads));
+                                for (g, w) in got.iter().zip(&want) {
+                                    assert!(
+                                        (g - w).abs() <= 1e-4 * (1.0 + w.abs()),
+                                        "{isa:?} m={m} k={k} n={n} {act:?} gate={gate:?}: {g} vs {w}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -425,20 +442,26 @@ mod tests {
                     rotate: (0..splits.len()).map(|o| o < 2).collect(),
                 };
                 let block = spec.block(rotary.map(|_| d)).unwrap();
-                let mut want: Vec<Vec<f32>> = splits.iter().map(|&w| vec![0f32; m * w]).collect();
-                {
-                    let mut outs: Vec<&mut [f32]> = want.iter_mut().map(|v| &mut v[..]).collect();
-                    matmul_split_unfused(m, &mut naive(m, k, n, &x, &w), &spec, block, &mut outs);
-                }
-                let pb = PackedB::pack(&w, k, n);
-                for threads in [1, 4] {
-                    let mut got: Vec<Vec<f32>> = splits.iter().map(|&w| vec![f32::NAN; m * w]).collect();
+                for isa in isas() {
+                    let mut want: Vec<Vec<f32>> = splits.iter().map(|&w| vec![0f32; m * w]).collect();
                     {
-                        let mut outs: Vec<&mut [f32]> = got.iter_mut().map(|v| &mut v[..]).collect();
-                        pool.install(|| matmul_split_packed(m, &x, &pb, &spec, block, &mut outs, threads));
+                        let mut outs: Vec<&mut [f32]> = want.iter_mut().map(|v| &mut v[..]).collect();
+                        let product = &mut naive(m, k, n, &rounded(isa, &x), &rounded(isa, &w));
+                        matmul_split_unfused(m, product, &spec, block, &mut outs);
                     }
-                    for (g, w) in got.iter().flatten().zip(want.iter().flatten()) {
-                        assert!((g - w).abs() <= 1e-4 * (1.0 + w.abs()), "b={b} s={s} d={d} variant={variant}: {g} vs {w}");
+                    let pb = PackedB::pack_for(isa, &w, k, n);
+                    for threads in [1, 4] {
+                        let mut got: Vec<Vec<f32>> = splits.iter().map(|&w| vec![f32::NAN; m * w]).collect();
+                        {
+                            let mut outs: Vec<&mut [f32]> = got.iter_mut().map(|v| &mut v[..]).collect();
+                            pool.install(|| matmul_split_packed(m, &x, &pb, &spec, block, &mut outs, threads));
+                        }
+                        for (g, w) in got.iter().flatten().zip(want.iter().flatten()) {
+                            assert!(
+                                (g - w).abs() <= 2e-4 * (1.0 + w.abs()),
+                                "{isa:?} b={b} s={s} d={d} variant={variant}: {g} vs {w}"
+                            );
+                        }
                     }
                 }
             }

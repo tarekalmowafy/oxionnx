@@ -152,6 +152,7 @@ impl PackedB {
     /// Pack a column selection of the row-major `k x ld` matrix `b`: packed
     /// column `j` is `b[:, cols[j]]` (e.g. to interleave the halves of a fused
     /// gate/up projection for [`gemm_epilogue`]).
+    #[allow(dead_code)]
     pub fn pack_cols(b: &[f32], k: usize, ld: usize, cols: &[usize]) -> Self {
         Self::pack_cols_for(isa().expect("gemm_packed: no AVX2/AVX-512"), b, k, ld, cols)
     }
@@ -185,6 +186,7 @@ impl PackedB {
         PackedB { k, n, isa, nr, panels, buf, off }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn isa(&self) -> Isa {
         self.isa
     }

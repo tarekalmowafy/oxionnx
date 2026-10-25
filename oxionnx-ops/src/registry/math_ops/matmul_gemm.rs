@@ -38,7 +38,8 @@ impl MatMulOp {
         let packed = match cached {
             Some(p) if p.k == k && p.n == n => p,
             _ => {
-                let p = std::sync::Arc::new(PackedB::pack(&b.data, k, n));
+                let isa = gemm_packed::weight_isa(crate::gemm_bf16::weights_enabled(ctx.registry))?;
+                let p = std::sync::Arc::new(PackedB::pack_for(isa, &b.data, k, n));
                 self.cache.write().ok()?.insert(key, p.clone());
                 p
             }

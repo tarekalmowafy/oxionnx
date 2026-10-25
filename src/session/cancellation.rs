@@ -381,9 +381,13 @@ pub(crate) fn wrap_registry(
     token: &CancellationToken,
 ) -> OperatorRegistry {
     let opset = inner.model_opset();
+    let bf16_weights = inner.bf16_weights();
     let inner = Arc::new(inner);
     let mut wrapped = OperatorRegistry::new();
     wrapped.set_model_opset(opset);
+    if let Some(on) = bf16_weights {
+        wrapped.set_bf16_weights(on);
+    }
     for op_type in reachable_op_types(nodes) {
         // `contains` and `get` agree by construction; the `let ... else` keeps
         // the snapshot below infallible without an unwrap.

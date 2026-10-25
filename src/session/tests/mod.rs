@@ -16,6 +16,8 @@ pub(super) fn equal_split(axis_len: usize, n: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod basic;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod bf16_weights;
 #[cfg(test)]
 mod dynamic_shape;
 #[cfg(all(test, feature = "gpu"))]
