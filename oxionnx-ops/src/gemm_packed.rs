@@ -1,10 +1,11 @@
 //! Prototype (onnx_spike): row-major SGEMM `C[m,n] = A[m,k] @ B[k,n]` with B packed once.
 //!
 //! B is stored as KC-row blocks of NR-column panels (zero-padded on the right),
-//! so the micro-kernel streams each panel contiguously. A is read in place
-//! (MR row streams, broadcast loads) for small M, as in MLAS's SGEMM, and packed
-//! into MR-row strips per tile for large M. Two micro-kernels, picked once per
-//! process from the CPU features (MLAS does the same):
+//! so the micro-kernel streams each panel contiguously. A is read in place (MR
+//! row streams, broadcast loads). The loop order is MLAS's: slices of
+//! `SLICE_PANELS` panels (a KC x 256 block of B that stays in L2), then k
+//! blocks, then every MR-row strip of the task's rows. Two micro-kernels, picked
+//! once per process from the CPU features (MLAS does the same):
 //! * AVX-512F: 12x32, 24 zmm accumulators;
 //! * AVX2+FMA: 6x16, 12 ymm accumulators.
 //!
@@ -17,8 +18,11 @@
 use rayon::prelude::*;
 use std::sync::OnceLock;
 
-const KC: usize = 256;
-const MC: usize = 96; // multiple of both MRs
+const KC: usize = 512;
+/// Panels per B slice: 256 columns with the AVX-512 kernel, 128 with AVX2.
+const SLICE_PANELS: usize = 8;
+/// Fewest rows a task tile is split down to along M.
+const MIN_ROWS_PER_TILE: usize = 96;
 const MIN_MACS_PER_TASK: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,32 +147,73 @@ pub fn gemm(m: usize, a: &[f32], b: &PackedB, c: &mut [f32], threads: usize) {
         c.fill(0.0);
         return;
     }
-    let mr = b.isa.tile().0;
     let tasks = (m * n * k / MIN_MACS_PER_TASK).clamp(1, threads.max(1));
-    // Tile grid: MC-row blocks x groups of panels, enough tiles for ~2 per task.
-    let mc = MC.min(m.div_ceil(mr) * mr);
-    let mtiles = m.div_ceil(mc);
-    let ntiles = if tasks == 1 { 1 } else { (2 * tasks).div_ceil(mtiles).clamp(1, b.panels) };
-    let panels_per_tile = b.panels.div_ceil(ntiles);
-    let ntiles = b.panels.div_ceil(panels_per_tile);
+    let slices = b.panels.div_ceil(SLICE_PANELS);
+    // Whole slices per tile when there are enough of them, else single panels.
+    let splits = Grid::col_splits(m, b.isa.tile().0, tasks);
+    let unit = if slices % splits == 0 || slices >= 4 * splits { SLICE_PANELS } else { 1 };
+    let grid = Grid::new(m, b.isa.tile().0, b.panels.div_ceil(unit), tasks);
     let cp = SendPtr(c.as_mut_ptr());
     let cp = &cp;
-    let run = |t: usize| {
-        let (ti, tj) = (t / ntiles, t % ntiles);
-        let i0 = ti * mc;
-        let mb = mc.min(m - i0);
-        let p0 = tj * panels_per_tile;
-        let p1 = (p0 + panels_per_tile).min(b.panels);
+    grid.run(tasks, |i0, mb, u0, u1| {
+        let (p0, p1) = (u0 * unit, (u1 * unit).min(b.panels));
         // SAFETY: tiles cover disjoint (row, column) ranges of C; all pointer
         // offsets stay within a/b/c bounds (checked by the asserts above), and
         // `b.isa` was detected on this CPU.
         unsafe { tile(a.as_ptr().add(i0 * k), k, mb, b, p0, p1, cp.0.add(i0 * n), n) };
-    };
-    let total = mtiles * ntiles;
-    if tasks == 1 || total == 1 {
-        (0..total).for_each(run);
-    } else {
-        (0..total).into_par_iter().for_each(run);
+    });
+}
+
+/// Task tiles: one per task (equal tiles balance better than more, smaller
+/// ones), split along M first (each tile then reuses its B columns over as
+/// many rows as possible), then along `units` column groups.
+struct Grid {
+    m: usize,
+    rows_per_tile: usize,
+    units: usize,
+    units_per_tile: usize,
+    ntiles: usize,
+    total: usize,
+}
+
+impl Grid {
+    /// `(rows per tile, row tiles, column splits)`.
+    fn rows(m: usize, mr: usize, tasks: usize) -> (usize, usize, usize) {
+        let target = tasks;
+        let strips = m.div_ceil(mr).max(1);
+        // Every row tile streams all of its B columns, so small M (where B is most
+        // of the traffic) is split along N only.
+        let max_mtiles = (m / MIN_ROWS_PER_TILE).clamp(1, strips);
+        // The largest divisor of `target` that fits, so the column splits come out whole.
+        let mt = (1..=max_mtiles.min(target)).rev().find(|d| target % d == 0).unwrap_or(1);
+        let rows_per_tile = strips.div_ceil(mt) * mr;
+        (rows_per_tile, m.div_ceil(rows_per_tile).max(1), target / mt)
+    }
+
+    fn col_splits(m: usize, mr: usize, tasks: usize) -> usize {
+        Self::rows(m, mr, tasks).2
+    }
+
+    fn new(m: usize, mr: usize, units: usize, tasks: usize) -> Self {
+        let (rows_per_tile, mtiles, splits) = Self::rows(m, mr, tasks);
+        let units_per_tile = units.div_ceil(splits.clamp(1, units.max(1))).max(1);
+        let ntiles = units.div_ceil(units_per_tile).max(1);
+        Grid { m, rows_per_tile, units, units_per_tile, ntiles, total: mtiles * ntiles }
+    }
+
+    /// Calls `f(first row, rows, first unit, end unit)` for every tile.
+    fn run(&self, tasks: usize, f: impl Fn(usize, usize, usize, usize) + Sync) {
+        let one = |t: usize| {
+            let (ti, tj) = (t / self.ntiles, t % self.ntiles);
+            let i0 = ti * self.rows_per_tile;
+            let u0 = tj * self.units_per_tile;
+            f(i0, self.rows_per_tile.min(self.m - i0), u0, (u0 + self.units_per_tile).min(self.units));
+        };
+        if tasks == 1 || self.total == 1 {
+            (0..self.total).for_each(one);
+        } else {
+            (0..self.total).into_par_iter().for_each(one);
+        }
     }
 }
 
@@ -187,63 +232,52 @@ pub unsafe fn gemm_strided_serial(m: usize, a: *const f32, lda: usize, b: &Packe
         }
         return;
     }
-    let mut i0 = 0;
-    while i0 < m {
-        let mb = MC.min(m - i0);
-        tile(a.add(i0 * lda), lda, mb, b, 0, b.panels, c.add(i0 * ldc), ldc);
-        i0 += mb;
-    }
+    tile(a, lda, m, b, 0, b.panels, c, ldc);
 }
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn tile(a: *const f32, lda: usize, mb: usize, b: &PackedB, p0: usize, p1: usize, c: *mut f32, ldc: usize) {
     let (k, n, nr) = (b.k, b.n, b.nr);
     let mr = b.isa.tile().0;
-    // Pack A into MR-row strips (p-major) when it is reused across enough panels;
-    // for small M the MR row streams of A stay in L1 anyway.
-    let pack_a = p1 - p0 >= 4 && mb > mr;
-    let strips = mb.div_ceil(mr);
-    let mut abuf = if pack_a { vec![0f32; strips * mr * KC.min(k)] } else { Vec::new() };
-    for k0 in (0..k).step_by(KC) {
-        let kc = KC.min(k - k0);
-        let acc = k0 > 0;
-        if pack_a {
-            for (s, strip) in abuf.chunks_mut(mr * kc).take(strips).enumerate() {
-                for r in 0..mr.min(mb - s * mr) {
-                    let src = a.add((s * mr + r) * lda + k0);
-                    for p in 0..kc {
-                        *strip.get_unchecked_mut(p * mr + r) = *src.add(p);
-                    }
-                }
-            }
-        }
-        for j in p0..p1 {
-            let bp = b.panel(k0, j);
-            let j0 = j * nr;
-            let nb = nr.min(n - j0);
+    let mut s0 = p0;
+    while s0 < p1 {
+        let s1 = (s0 + SLICE_PANELS).min(p1);
+        for k0 in (0..k).step_by(KC) {
+            let kc = KC.min(k - k0);
             let mut i = 0;
             while i < mb {
                 let r = mr.min(mb - i);
-                let (ap, rs, ps) = if pack_a { (abuf.as_ptr().add(i * kc), 1, mr) } else { (a.add(i * lda + k0), lda, 1) };
-                let k = Kernel { kc, a: ap, rs, ps, bp, c: c.add(i * ldc + j0), ldc, nb, accumulate: acc };
-                match b.isa {
-                    Isa::Avx512 => avx512::dispatch(r, &k),
-                    Isa::Avx2 => avx2::dispatch(r, &k),
+                for j in s0..s1 {
+                    let j0 = j * nr;
+                    let kernel = Kernel {
+                        kc,
+                        a: a.add(i * lda + k0),
+                        rs: lda,
+                        bp: b.panel(k0, j),
+                        c: c.add(i * ldc + j0),
+                        ldc,
+                        nb: nr.min(n - j0),
+                        accumulate: k0 > 0,
+                    };
+                    match b.isa {
+                        Isa::Avx512 => avx512::dispatch(r, &kernel),
+                        Isa::Avx2 => avx2::dispatch(r, &kernel),
+                    }
                 }
                 i += r;
             }
         }
+        s0 = s1;
     }
 }
 
 /// One micro-kernel call: `C[R, nb] (+)= A[R, kc] @ Bpanel[kc, NR]`, with
-/// `A[r, p] = a[r * rs + p * ps]`.
+/// `A[r, p] = a[r * rs + p]`.
 #[derive(Clone, Copy)]
 struct Kernel {
     kc: usize,
     a: *const f32,
     rs: usize,
-    ps: usize,
     bp: *const f32,
     c: *mut f32,
     ldc: usize,
@@ -268,14 +302,14 @@ mod avx2 {
 
     #[target_feature(enable = "avx2,fma")]
     unsafe fn kernel<const R: usize>(k: &Kernel) {
-        let Kernel { kc, a, rs, ps, bp, c, ldc, nb, accumulate } = *k;
+        let Kernel { kc, a, rs, bp, c, ldc, nb, accumulate } = *k;
         let mut lo = [_mm256_setzero_ps(); R];
         let mut hi = [_mm256_setzero_ps(); R];
         for p in 0..kc {
             let b0 = _mm256_load_ps(bp.add(p * 16));
             let b1 = _mm256_load_ps(bp.add(p * 16 + 8));
             for r in 0..R {
-                let av = _mm256_broadcast_ss(&*a.add(r * rs + p * ps));
+                let av = _mm256_broadcast_ss(&*a.add(r * rs + p));
                 lo[r] = _mm256_fmadd_ps(av, b0, lo[r]);
                 hi[r] = _mm256_fmadd_ps(av, b1, hi[r]);
             }
@@ -328,14 +362,14 @@ mod avx512 {
 
     #[target_feature(enable = "avx512f")]
     unsafe fn kernel<const R: usize>(k: &Kernel) {
-        let Kernel { kc, a, rs, ps, bp, c, ldc, nb, accumulate } = *k;
+        let Kernel { kc, a, rs, bp, c, ldc, nb, accumulate } = *k;
         let mut lo = [_mm512_setzero_ps(); R];
         let mut hi = [_mm512_setzero_ps(); R];
         for p in 0..kc {
             let b0 = _mm512_load_ps(bp.add(p * 32));
             let b1 = _mm512_load_ps(bp.add(p * 32 + 16));
             for r in 0..R {
-                let av = _mm512_set1_ps(*a.add(r * rs + p * ps));
+                let av = _mm512_set1_ps(*a.add(r * rs + p));
                 lo[r] = _mm512_fmadd_ps(av, b0, lo[r]);
                 hi[r] = _mm512_fmadd_ps(av, b1, hi[r]);
             }
