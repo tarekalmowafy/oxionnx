@@ -137,7 +137,7 @@ The MatMul, QKV and attention fusions were written against EmbeddingGemma-2's gr
 
 ## Phase 3: threading overhead on short inputs
 
-### [~] P3.1 Short queries at high thread counts ([#PR](https://github.com/tarekalmowafy/oxionnx/pulls?q=head%3Aperf-threads))
+### [~] P3.1 Short queries at high thread counts ([#22](https://github.com/tarekalmowafy/oxionnx/pull/22))
 - **Problem:** on EmbeddingGemma-2, 16-thread queries take 13.8 ms against llama.cpp Q4_0's 13.0. On the other models, llama-server wins most 8-thread query cells. oxionnx workers spin (`RAYON_SPIN_ROUNDS`), so a 16-thread query costs 220–273 ms of CPU, 1.3–1.6× ORT's 169 ms.
 - **Plan:**
   - Adaptive spin-then-park.
