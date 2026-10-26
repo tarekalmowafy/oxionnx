@@ -57,6 +57,14 @@ impl Session {
         ref_counts.extend(base.iter().map(|(name, count)| (name.as_str(), *count)));
 
         let mut state = SessionRunState::with_capacity(self.sorted_nodes.len());
+        if self.pool.is_some() {
+            state.set_graph_outputs(&self.output_names);
+        }
+        if super::memtrace::on() {
+            state.mem = Some(Box::new(super::memtrace::MemTrace::start(
+                self.pool.as_ref().map(|m| m as &Mutex<SizeClassPool>),
+            )));
+        }
         // Seed state with input tensors (one clone per input, not per op)
         for (name, tensor) in inputs {
             state.insert(
@@ -92,7 +100,14 @@ impl Session {
         }
 
         let pool_ref = self.pool.as_ref().map(|m| m as &Mutex<SizeClassPool>);
+        let mem = state.mem.take();
         let out = state.take_outputs(&self.output_names, &self.weights, pool_ref);
+        if let Some(mut pool) = pool_ref.and_then(|p| p.lock().ok()) {
+            pool.end_run();
+        }
+        if let Some(mem) = mem {
+            mem.report(pool_ref);
+        }
         if super::dispatch::phase_timers::on() {
             super::dispatch::phase_timers::add(&super::dispatch::phase_timers::RUN, t_run.elapsed());
             super::dispatch::phase_timers::report();

@@ -189,6 +189,11 @@ impl Session {
     /// to `ref_counts` in `run_internal`.  The two sites must apply the identical
     /// weight filter (an initializer is never reference-counted) or the counts
     /// desync and a live tensor is freed early.
+    ///
+    /// Outputs of `node` that nothing reads (no consumer, not a graph output, so
+    /// absent from `ref_counts`) are freed here too. Without this they stayed in
+    /// the run state until the run ended — e.g. the unused `present_k`/`present_v`
+    /// of every `GroupQueryAttention` layer, all alive at once at the last layer.
     pub(crate) fn decrement_refs_state(
         &self,
         node: &Node,
@@ -196,6 +201,13 @@ impl Session {
         ref_counts: &mut RefCounts<'_>,
         output_set: &OutputSet<'_>,
     ) {
+        for out in &node.outputs {
+            if !out.is_empty() && !ref_counts.contains_key(out.as_str()) && !output_set.contains(out.as_str()) {
+                if let Some(tensor) = state.take(out) {
+                    super::state::release_to_pool(tensor, self.pool.as_ref());
+                }
+            }
+        }
         for inp in &node.inputs {
             self.release_one_ref(inp, state, ref_counts, output_set);
         }
@@ -490,5 +502,36 @@ mod tests {
         let mut weights = HashMap::new();
         weights.insert("w".to_string(), Tensor::new(vec![1.0], vec![1]));
         assert_eq!(Session::compute_node_depths(&nodes, &weights), vec![0]);
+    }
+
+    /// An output nothing reads is freed right after its node, not at the end of
+    /// the run; an output something reads, and a graph output, stay.
+    #[test]
+    fn an_unconsumed_output_is_released_after_its_node() {
+        use crate::{OptLevel, SessionBuilder};
+        let nodes = vec![
+            node(OpKind::Split, "split", &["x"], &["a", "dead"]),
+            node(OpKind::Relu, "relu", &["a"], &["y"]),
+        ];
+        let session = SessionBuilder::new()
+            .with_optimization_level(OptLevel::None)
+            .build_from_graph(graph(nodes.clone(), &["x"], &["y"]), HashMap::new())
+            .expect("build");
+        let mut state = SessionRunState::with_capacity(4);
+        for name in ["x", "a", "dead"] {
+            state.insert(name.to_string(), Tensor::new(vec![1.0; 4], vec![4]), None);
+        }
+        let mut ref_counts: RefCounts<'_> = [("x", 1), ("a", 1), ("y", 1)].into_iter().collect();
+        let output_set: OutputSet<'_> = ["y"].into_iter().collect();
+        session.decrement_refs_state(&nodes[0], &mut state, &mut ref_counts, &output_set);
+        assert!(state.get("dead").is_none(), "no consumer: freed after the Split");
+        assert!(state.get("a").is_some(), "still read by the Relu");
+        assert!(state.get("x").is_none(), "its last consumer ran");
+
+        // End to end, with an unused Split output.
+        let mut inputs = HashMap::new();
+        inputs.insert("x", Tensor::new(vec![-1.0, 2.0, -3.0, 4.0], vec![4]));
+        let out = session.run(&inputs).expect("run");
+        assert_eq!(out["y"].data, vec![0.0, 2.0]);
     }
 }
