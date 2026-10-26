@@ -460,7 +460,8 @@ impl WeightCache {
                 return Some(p);
             }
         }
-        let p = std::sync::Arc::new(pack(crate::gemm_packed::weight_isa(crate::gemm_bf16::weights_enabled(ctx.registry))?));
+        let isa = crate::gemm_packed::weight_isa(crate::gemm_bf16::weights_enabled(ctx.registry))?;
+        let p = std::sync::Arc::new(pack(isa).with_split_activations(crate::gemm_bf16::split_activations(ctx.registry)));
         if let Ok(mut c) = self.packed.write() {
             let entries = c.entry(name.clone()).or_default();
             entries.retain(|e| e.tag != tag);

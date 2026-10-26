@@ -17,6 +17,10 @@ fn session(bf16: Option<bool>) -> Session {
 }
 
 fn session_with(bf16: Option<bool>, keep: bool) -> Session {
+    session_full(bf16, None, keep)
+}
+
+fn session_full(bf16: Option<bool>, split: Option<bool>, keep: bool) -> Session {
     let graph = Graph {
         nodes: vec![Node {
             op: OpKind::MatMul,
@@ -33,6 +37,10 @@ fn session_with(bf16: Option<bool>, keep: bool) -> Session {
     let builder = Session::builder().with_optimization_level(OptLevel::None).with_keep_weights(keep);
     let builder = match bf16 {
         Some(on) => builder.with_bf16_weights(on),
+        None => builder,
+    };
+    let builder = match split {
+        Some(on) => builder.with_bf16_split_activations(on),
         None => builder,
     };
     builder.build_from_graph(graph, weights).expect("build")
@@ -87,6 +95,55 @@ fn bf16_weights_option() {
     // The session cache cannot hold freed weights.
     assert!(bf16.to_optimized_bytes().is_err());
     assert!(fp32.to_optimized_bytes().is_ok());
+}
+
+#[test]
+fn bf16_split_activations_option() {
+    let shape = [2, 5, K];
+    let want = run(&session(Some(false)), &shape);
+    // No effect without BF16 weights.
+    assert_eq!(run(&session_full(Some(false), Some(true), false), &shape), want);
+    let one = run(&session_full(Some(true), Some(false), false), &shape);
+    let split = run(&session_full(Some(true), Some(true), false), &shape);
+    let hw = is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bf16");
+    if !hw {
+        assert_eq!(split, want, "without AVX-512 BF16 the weights stay FP32");
+        return;
+    }
+    if std::env::var("OXIONNX_BF16_WEIGHTS").is_err() {
+        assert_eq!(run(&session(Some(true)), &shape), one, "one-term activations are the default");
+    }
+    close(&split, &want);
+    // Only the weight rounding is left (these weights are not BF16 values, so it dominates).
+    let err = |v: &[f32]| v.iter().zip(&want).map(|(x, y)| ((x - y) as f64).powi(2)).sum::<f64>().sqrt();
+    assert!(err(&split) < err(&one), "split {} vs one-term {}", err(&split), err(&one));
+    // The weights round exactly to BF16: then the split result is close to FP32.
+    let w: Vec<f32> = weight().iter().map(|&x| f32::from_bits(x.to_bits() & 0xffff_0000)).collect();
+    let mk = |bf16: bool, split: bool| {
+        let graph = Graph {
+            nodes: vec![Node {
+                op: OpKind::MatMul,
+                name: "mm".into(),
+                inputs: vec!["x".into(), "w".into()],
+                outputs: vec!["y".into()],
+                attrs: Attributes::default(),
+            }],
+            input_names: vec!["x".into()],
+            output_names: vec!["y".into()],
+            ..Default::default()
+        };
+        let weights = HashMap::from([("w".to_string(), Tensor::new(w.clone(), vec![K, N]))]);
+        Session::builder()
+            .with_optimization_level(OptLevel::None)
+            .with_bf16_weights(bf16)
+            .with_bf16_split_activations(split)
+            .build_from_graph(graph, weights)
+            .expect("build")
+    };
+    let exact = run(&mk(false, false), &shape);
+    for (x, y) in run(&mk(true, true), &shape).iter().zip(&exact) {
+        assert!((x - y).abs() <= 1e-4 * (1.0 + y.abs()), "{x} vs {y}");
+    }
 }
 
 /// The packed GEMM is in use, so constant MatMul weights are packed at load.

@@ -32,7 +32,7 @@ const MIN_MACS_PER_TASK: usize = 64 * 1024;
 pub enum Isa {
     Avx2,
     Avx512,
-    /// BF16 weights and activations, FP32 accumulation (`vdpbf16ps`); see [`crate::gemm_bf16`].
+    /// BF16 weights and activations (one or two BF16 terms each), FP32 accumulation (`vdpbf16ps`); see [`crate::gemm_bf16`].
     Avx512Bf16,
 }
 
@@ -91,6 +91,8 @@ pub struct PackedB {
     panels: usize,
     buf: Vec<f32>,
     off: usize, // offset of the 64-byte aligned start in `buf`
+    /// BF16 only: split each activation into two BF16 terms (see [`PackedB::with_split_activations`]).
+    split: bool,
 }
 
 impl PackedB {
@@ -116,7 +118,7 @@ impl PackedB {
         let panels = n.div_ceil(nr);
         if isa == Isa::Avx512Bf16 {
             let (buf, off) = crate::gemm_bf16::pack(k, n, nr, |p, j| b[p * rs + j * cs]);
-            return PackedB { k, n, isa, nr, panels, buf, off };
+            return PackedB { k, n, isa, nr, panels, buf, off, split: false };
         }
         let len = k * panels * nr;
         let mut buf = vec![0f32; len + 16];
@@ -146,7 +148,7 @@ impl PackedB {
             }
             base += kc * panels * nr;
         }
-        PackedB { k, n, isa, nr, panels, buf, off }
+        PackedB { k, n, isa, nr, panels, buf, off, split: false }
     }
 
     /// Pack a column selection of the row-major `k x ld` matrix `b`: packed
@@ -163,7 +165,7 @@ impl PackedB {
         let panels = n.div_ceil(nr);
         if isa == Isa::Avx512Bf16 {
             let (buf, off) = crate::gemm_bf16::pack(k, n, nr, |p, j| b[p * ld + cols[j]]);
-            return PackedB { k, n, isa, nr, panels, buf, off };
+            return PackedB { k, n, isa, nr, panels, buf, off, split: false };
         }
         let len = k * panels * nr;
         let mut buf = vec![0f32; len + 16];
@@ -183,7 +185,32 @@ impl PackedB {
             }
             base += kc * panels * nr;
         }
-        PackedB { k, n, isa, nr, panels, buf, off }
+        PackedB { k, n, isa, nr, panels, buf, off, split: false }
+    }
+
+    /// For a BF16 packing: multiply by activations split into two BF16 terms,
+    /// `a = hi + lo` with `hi = bf16(a)`, `lo = bf16(a - hi)` (16 significant
+    /// bits instead of 8), at twice the dot-product count. See
+    /// [`crate::gemm_bf16`]. No effect on FP32 packings.
+    pub fn with_split_activations(mut self, on: bool) -> Self {
+        self.split = on && self.isa == Isa::Avx512Bf16;
+        self
+    }
+
+    /// Whether the activations are split into two BF16 terms.
+    #[allow(dead_code)]
+    pub fn split_activations(&self) -> bool {
+        self.split
+    }
+
+    /// Pair offset of the `lo` activation terms from the start of each
+    /// converted A row (0 = no split), as [`crate::gemm_bf16::with_a`] lays them out.
+    fn lo_offset(&self) -> usize {
+        if self.split {
+            self.k.div_ceil(2)
+        } else {
+            0
+        }
     }
 
     pub fn isa(&self) -> Isa {
@@ -265,7 +292,7 @@ pub fn gemm(m: usize, a: &[f32], b: &PackedB, c: &mut [f32], threads: usize) {
     };
     if b.isa == Isa::Avx512Bf16 {
         // SAFETY: `a` is m x k (asserted above).
-        unsafe { crate::gemm_bf16::with_a(m, a.as_ptr(), k, k, threads, run) };
+        unsafe { crate::gemm_bf16::with_a(m, a.as_ptr(), k, k, threads, b.split, run) };
     } else {
         run(a.as_ptr(), k);
     }
@@ -320,6 +347,7 @@ pub fn gemm_epilogue<E: Epilogue>(m: usize, a: &[f32], b: &PackedB, epi: &E, thr
                                 ldc: w,
                                 nb: nr,
                                 accumulate: k0 > 0,
+                                lo: b.lo_offset(),
                             };
                             // SAFETY: rows i0+i..i0+i+r of `a` and panel u*w/nr+jj of `b` exist
                             // (n % w == 0), `block` holds mr x w, and `b.isa` was detected here.
@@ -341,7 +369,7 @@ pub fn gemm_epilogue<E: Epilogue>(m: usize, a: &[f32], b: &PackedB, epi: &E, thr
     };
     if b.isa == Isa::Avx512Bf16 {
         // SAFETY: `a` is m x k (asserted above).
-        unsafe { crate::gemm_bf16::with_a(m, a.as_ptr(), k, k, threads, run) };
+        unsafe { crate::gemm_bf16::with_a(m, a.as_ptr(), k, k, threads, b.split, run) };
     } else {
         run(a.as_ptr(), k);
     }
@@ -416,14 +444,15 @@ pub unsafe fn gemm_strided_serial(m: usize, a: *const f32, lda: usize, b: &Packe
         return;
     }
     if b.isa == Isa::Avx512Bf16 {
-        crate::gemm_bf16::with_a(m, a, lda, b.k, 1, |ap, lda| tile(ap, lda, m, b, 0, b.panels, c, ldc));
+        crate::gemm_bf16::with_a(m, a, lda, b.k, 1, b.split, |ap, lda| tile(ap, lda, m, b, 0, b.panels, c, ldc));
     } else {
         tile(a, lda, m, b, 0, b.panels, c, ldc);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-/// `a` is FP32, or BF16 pairs (row stride `lda` pairs) for [`Isa::Avx512Bf16`].
+/// `a` is FP32, or BF16 pairs (row stride `lda` pairs, `lo` terms after the
+/// `hi` ones when split) for [`Isa::Avx512Bf16`].
 unsafe fn tile(a: *const f32, lda: usize, mb: usize, b: &PackedB, p0: usize, p1: usize, c: *mut f32, ldc: usize) {
     let (k, n, nr) = (b.k, b.n, b.nr);
     let mr = b.isa.tile().0;
@@ -447,6 +476,7 @@ unsafe fn tile(a: *const f32, lda: usize, mb: usize, b: &PackedB, p0: usize, p1:
                         ldc,
                         nb: nr.min(n - j0),
                         accumulate: k0 > 0,
+                        lo: b.lo_offset(),
                     };
                     match b.isa {
                         Isa::Avx512 => avx512::dispatch(r, &kernel),
@@ -473,6 +503,9 @@ pub(crate) struct Kernel {
     pub(crate) ldc: usize,
     pub(crate) nb: usize,
     pub(crate) accumulate: bool,
+    /// BF16 split activations: the `lo` terms of row `r` start at
+    /// `a + r * rs + lo` pairs (0 = not split). Unused by the FP32 kernels.
+    pub(crate) lo: usize,
 }
 
 mod avx2 {
@@ -492,7 +525,7 @@ mod avx2 {
 
     #[target_feature(enable = "avx2,fma")]
     unsafe fn kernel<const R: usize>(k: &Kernel) {
-        let Kernel { kc, a, rs, bp, c, ldc, nb, accumulate } = *k;
+        let Kernel { kc, a, rs, bp, c, ldc, nb, accumulate, .. } = *k;
         let mut lo = [_mm256_setzero_ps(); R];
         let mut hi = [_mm256_setzero_ps(); R];
         for p in 0..kc {
@@ -552,7 +585,7 @@ mod avx512 {
 
     #[target_feature(enable = "avx512f")]
     unsafe fn kernel<const R: usize>(k: &Kernel) {
-        let Kernel { kc, a, rs, bp, c, ldc, nb, accumulate } = *k;
+        let Kernel { kc, a, rs, bp, c, ldc, nb, accumulate, .. } = *k;
         let mut lo = [_mm512_setzero_ps(); R];
         let mut hi = [_mm512_setzero_ps(); R];
         for p in 0..kc {

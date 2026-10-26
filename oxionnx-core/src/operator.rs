@@ -314,6 +314,10 @@ pub struct OperatorRegistry {
     /// kernels consult `OXIONNX_BF16_WEIGHTS`; 1 = off; 2 = on). See
     /// [`OperatorRegistry::set_bf16_weights`].
     bf16_weights: AtomicU8,
+    /// Session option: with BF16 weights, split the GEMM activations into two
+    /// BF16 terms (0 = unset, so the kernels consult `OXIONNX_BF16_WEIGHTS=split`;
+    /// 1 = off; 2 = on). See [`OperatorRegistry::set_bf16_split_activations`].
+    bf16_split: AtomicU8,
     /// Session option: keep the FP32 data of weights that operators packed at
     /// load time instead of freeing it. See [`OperatorRegistry::set_keep_weights`].
     keep_weights: AtomicBool,
@@ -325,6 +329,7 @@ impl OperatorRegistry {
             ops: hashbrown::HashMap::new(),
             model_opset: AtomicI64::new(DEFAULT_OPSET),
             bf16_weights: AtomicU8::new(0),
+            bf16_split: AtomicU8::new(0),
             keep_weights: AtomicBool::new(false),
         }
     }
@@ -353,6 +358,23 @@ impl OperatorRegistry {
     /// then follow the `OXIONNX_BF16_WEIGHTS` environment variable).
     pub fn bf16_weights(&self) -> Option<bool> {
         match self.bf16_weights.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v == 2),
+        }
+    }
+
+    /// With BF16 weights, multiply by activations split into two BF16 terms
+    /// (16 significant bits, twice the dot products) instead of rounded to
+    /// one (8 bits, the default). Set by
+    /// `SessionBuilder::with_bf16_split_activations`.
+    pub fn set_bf16_split_activations(&self, enabled: bool) {
+        self.bf16_split.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+    }
+
+    /// The split-activations option, or `None` when it was never set (the
+    /// kernels then follow `OXIONNX_BF16_WEIGHTS=split`).
+    pub fn bf16_split_activations(&self) -> Option<bool> {
+        match self.bf16_split.load(Ordering::Relaxed) {
             0 => None,
             v => Some(v == 2),
         }
