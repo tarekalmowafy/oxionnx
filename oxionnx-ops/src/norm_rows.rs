@@ -56,9 +56,6 @@ struct OutPtrs {
     inv_std: Option<Ptr>,
 }
 
-/// Minimum number of elements one parallel task normalises.
-const MIN_ELEMS_PER_TASK: usize = 32 * 1024;
-
 /// Normalise every row of `a.x` into `o`.
 pub fn norm_rows_into(a: &NormRows<'_>, o: NormRowsOut<'_>) -> Result<(), String> {
     let h = a.hidden;
@@ -97,7 +94,7 @@ pub fn norm_rows_into(a: &NormRows<'_>, o: NormRowsOut<'_>) -> Result<(), String
     let kind = isa();
     // SAFETY (all calls below): every row index in `lo..hi` is in bounds of the
     // checked buffers, and parallel tasks get disjoint row ranges.
-    par_ranges(rows, (MIN_ELEMS_PER_TASK / h).max(1), |lo, hi| unsafe { run_rows(kind, a, ptrs, lo, hi) });
+    par_ranges(rows, (crate::par::min_elems() / h).max(1), |lo, hi| unsafe { run_rows(kind, a, ptrs, lo, hi) });
     Ok(())
 }
 

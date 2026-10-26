@@ -28,7 +28,9 @@ impl Session {
         // through the execution paths as an argument: two concurrent `run()` calls
         // with different batch sizes must not be able to observe each other's
         // shapes.  See `Session::resolve_run_shapes`.
+        let t_shapes = super::dispatch::phase_timers::start();
         let resolved_shapes = self.resolve_run_shapes(inputs)?;
+        super::dispatch::phase_timers::stop(&super::dispatch::phase_timers::SHAPES, t_shapes);
 
         let output_set: OutputSet<'_> = self.output_names.iter().map(|s| s.as_str()).collect();
         // Reference counts drive when an intermediate's buffer may be recycled.
@@ -90,14 +92,16 @@ impl Session {
         // in this run, are added to this input signature's plan, so the next run with
         // the same input shapes writes those nodes into pooled slots instead of fresh
         // allocations (the analogue of ORT's per-shape memory pattern cache).
+        let t_learn = super::dispatch::phase_timers::start();
         let learned = state.take_learned_shapes();
         if !learned.is_empty() {
             let input_shapes: HashMap<String, Vec<usize>> =
                 inputs.iter().map(|(name, t)| ((*name).to_string(), t.shape.clone())).collect();
             let mut plan = (*resolved_shapes).clone();
             plan.extend(learned);
-            self.shape_plans.store(&input_shapes, &plan);
+            self.shape_plans.store_arc(&input_shapes, &std::sync::Arc::new(plan));
         }
+        super::dispatch::phase_timers::stop(&super::dispatch::phase_timers::LEARN, t_learn);
 
         let pool_ref = self.pool.as_ref().map(|m| m as &Mutex<SizeClassPool>);
         let mem = state.mem.take();

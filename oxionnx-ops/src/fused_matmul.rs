@@ -153,7 +153,11 @@ pub struct SplitSpec<'a> {
 impl SplitSpec<'_> {
     /// Column block that never straddles an output or a head: the head width
     /// when there is a norm or rotary, else the largest of 256/128/64/32 that
-    /// divides every split (the splits' common divisor if none does). `head` is the rotary head size, if any.
+    /// divides every split (the splits' common divisor when none does). `head`
+    /// is the rotary head size, if any.
+    ///
+    /// Blocks are the GEMM's column work units, so a whole-split block (768 for
+    /// a `[768, 768, 768]` QKV) left a short query's projection on 3 threads.
     pub fn block(&self, head: Option<usize>) -> Option<usize> {
         let mut widths = self.norms.iter().flatten().map(|n| n.gamma.len());
         let norm_d = widths.next();

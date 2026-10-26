@@ -247,9 +247,10 @@ pub fn gemm(m: usize, a: &[f32], b: &PackedB, c: &mut [f32], threads: usize) {
     }
     let tasks = (m * n * k / MIN_MACS_PER_TASK).clamp(1, threads.max(1));
     let slices = b.panels.div_ceil(SLICE_PANELS);
-    // Whole slices per tile when there are enough of them, else single panels.
+    // Whole slices per tile when there are enough of them, else single panels
+    // (always for small M, whose grid is searched panel by panel).
     let splits = Grid::col_splits(m, b.isa.tile().0, tasks);
-    let unit = if slices % splits == 0 || slices >= 4 * splits { SLICE_PANELS } else { 1 };
+    let unit = if !Grid::small_m(m) && (slices % splits == 0 || slices >= 4 * splits) { SLICE_PANELS } else { 1 };
     let grid = Grid::new(m, b.isa.tile().0, b.panels.div_ceil(unit), tasks);
     let cp = SendPtr(c.as_mut_ptr());
     let cp = &cp;
@@ -378,10 +379,54 @@ impl Grid {
     }
 
     fn new(m: usize, mr: usize, units: usize, tasks: usize) -> Self {
+        if tasks > 1 && units > 0 && Self::small_m(m) {
+            return Self::small(m, mr, units, tasks);
+        }
         let (rows_per_tile, mtiles, splits) = Self::rows(m, mr, tasks);
         let units_per_tile = units.div_ceil(splits.clamp(1, units.max(1))).max(1);
         let ntiles = units.div_ceil(units_per_tile).max(1);
         Grid { m, rows_per_tile, units, units_per_tile, ntiles, total: mtiles * ntiles }
+    }
+
+    /// M too small for [`Grid::rows`] to split it (fewer than two
+    /// [`MIN_ROWS_PER_TILE`] tiles): short queries, M = tokens.
+    fn small_m(m: usize) -> bool {
+        m < 2 * MIN_ROWS_PER_TILE
+    }
+
+    /// Small-M grid: the (row tiles, column tiles) split with the shortest
+    /// critical path, counting a column unit as `rows / mr + SMALL_M_B_COST`
+    /// micro-tile strips (its compute, plus streaming its B panels, which every
+    /// row tile repeats). Splitting along N only, as [`Grid::rows`] does, leaves
+    /// threads idle whenever `units` is not a multiple of `tasks` (N = 768 has 24
+    /// panels: 12 tiles of 2 for 16 tasks) or is smaller than it (an epilogue
+    /// GEMM with 256-column blocks); a few row tiles fill them.
+    fn small(m: usize, mr: usize, units: usize, tasks: usize) -> Self {
+        const SMALL_M_B_COST: usize = 2;
+        let strips = m.div_ceil(mr).max(1);
+        // (cost, total, rows per tile, units per tile, column tiles)
+        let mut best = (usize::MAX, usize::MAX, 0, 0, 0);
+        for mt in 1..=strips.min(tasks) {
+            let spt = strips.div_ceil(mt);
+            let mtiles = strips.div_ceil(spt);
+            if mtiles < mt {
+                continue; // same tiles as a smaller mt
+            }
+            for nt in 1..=units.min(2 * tasks / mtiles).max(1) {
+                let upt = units.div_ceil(nt);
+                let ntiles = units.div_ceil(upt);
+                if ntiles < nt {
+                    continue;
+                }
+                let total = mtiles * ntiles;
+                let cost = total.div_ceil(tasks) * upt * (spt + SMALL_M_B_COST);
+                if (cost, total) < (best.0, best.1) {
+                    best = (cost, total, spt * mr, upt, ntiles);
+                }
+            }
+        }
+        let (_, total, rows_per_tile, units_per_tile, ntiles) = best;
+        Grid { m, rows_per_tile, units, units_per_tile, ntiles, total }
     }
 
     /// Calls `f(first row, rows, first unit, end unit)` for every tile.
@@ -606,18 +651,80 @@ mod tests {
         }
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         for isa in isas {
-            for &(m, k, n) in &[(1, 1, 1), (5, 7, 3), (6, 16, 16), (13, 300, 33), (97, 513, 70), (200, 64, 260), (12, 1024, 512)] {
+            for &(m, k, n) in &[(1, 1, 1), (5, 7, 3), (6, 16, 16), (13, 300, 33), (97, 513, 70), (200, 64, 260), (12, 1024, 512), (29, 600, 768), (48, 96, 1000)] {
                 let a: Vec<f32> = (0..m * k).map(|i| ((i * 37) % 101) as f32 / 101.0 - 0.5).collect();
                 let b: Vec<f32> = (0..k * n).map(|i| ((i * 53) % 89) as f32 / 89.0 - 0.5).collect();
                 let want = naive(m, k, n, &a, &b);
                 let pb = PackedB::pack_for(isa, &b, k, n);
-                for threads in [1, 4] {
+                for threads in [1, 4, 16] {
                     let mut c = vec![f32::NAN; m * n];
                     pool.install(|| gemm(m, &a, &pb, &mut c, threads));
                     for (x, y) in c.iter().zip(&want) {
                         assert!((x - y).abs() <= 1e-4 * (1.0 + y.abs()), "{isa:?} m={m} k={k} n={n} t={threads}: {x} vs {y}");
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn grid_tiles_cover_every_cell_once() {
+        for m in [1, 5, 12, 13, 29, 48, 95, 96, 191, 192, 400] {
+            for units in [1, 3, 5, 9, 24, 96, 192] {
+                for tasks in [1, 2, 3, 8, 12, 16, 32] {
+                    let g = Grid::new(m, 12, units, tasks);
+                    assert!(g.total <= 4 * tasks.max(units), "m={m} units={units} tasks={tasks}: {} tiles", g.total);
+                    let seen: Vec<std::sync::atomic::AtomicU32> = (0..m * units).map(|_| 0.into()).collect();
+                    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+                    pool.install(|| {
+                        g.run(tasks, |i0, rows, u0, u1| {
+                            for i in i0..i0 + rows {
+                                for u in u0..u1 {
+                                    seen[i * units + u].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        })
+                    });
+                    assert!(seen.iter().all(|c| c.load(std::sync::atomic::Ordering::Relaxed) == 1), "m={m} units={units} tasks={tasks}");
+                }
+            }
+        }
+    }
+
+    /// Small-M timing (not a test): `cargo test --release -p oxionnx-ops gemm_packed::tests::bench_small_m -- --ignored --nocapture`
+    /// with `GEMM_BENCH=M,K,N[;M,K,N...]` and `GEMM_BENCH_THREADS=1,8,16`. Cycles through
+    /// enough distinct weights to stream them from DRAM, as a model run does.
+    #[test]
+    #[ignore]
+    fn bench_small_m() {
+        let shapes = std::env::var("GEMM_BENCH").unwrap_or_else(|_| "48,3072,768;48,768,2304;48,768,768".into());
+        let threads = std::env::var("GEMM_BENCH_THREADS").unwrap_or_else(|_| "1,8,16".into());
+        for sh in shapes.split(';') {
+            let d: Vec<usize> = sh.split(',').map(|v| v.parse().unwrap()).collect();
+            let (m, k, n) = (d[0], d[1], d[2]);
+            let copies = (96 << 20) / (k * n * 4) + 1;
+            let a: Vec<f32> = (0..m * k).map(|i| ((i * 37) % 101) as f32 / 101.0 - 0.5).collect();
+            let bs: Vec<PackedB> = (0..copies)
+                .map(|c| PackedB::pack(&(0..k * n).map(|i| (((i + c) * 53) % 89) as f32 / 89.0 - 0.5).collect::<Vec<_>>(), k, n))
+                .collect();
+            let mut c = vec![0f32; m * n];
+            for t in threads.split(',').map(|v| v.parse::<usize>().unwrap()) {
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap();
+                let us = pool.install(|| {
+                    let mut best = f64::MAX;
+                    for rep in 0..7 {
+                        let t0 = std::time::Instant::now();
+                        for b in &bs {
+                            gemm(m, &a, b, &mut c, t);
+                        }
+                        if rep > 0 {
+                            best = best.min(t0.elapsed().as_secs_f64() * 1e6 / bs.len() as f64);
+                        }
+                    }
+                    best
+                });
+                let gbs = (k * n * 4) as f64 / us / 1e3;
+                println!("gemm m={m} k={k} n={n} t={t:2}: {us:8.1} us  {gbs:6.1} GB/s of B  {:6.1} GFLOP/s", 2.0 * (m * k * n) as f64 / us / 1e3);
             }
         }
     }

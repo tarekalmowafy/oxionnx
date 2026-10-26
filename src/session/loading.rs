@@ -545,7 +545,7 @@ impl Session {
             op_placement,
             providers,
             dynamic_dims: Mutex::new(HashMap::new()),
-            resolved_shapes: Mutex::new(HashMap::new()),
+            resolved_shapes: Mutex::new(Default::default()),
             shape_plans,
             cancellation: None,
             #[cfg(not(target_arch = "wasm32"))]

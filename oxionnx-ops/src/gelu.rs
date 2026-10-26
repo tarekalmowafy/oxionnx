@@ -178,11 +178,12 @@ pub fn apply(kind: Kind, x: &[f32], mul: Option<&[f32]>, out: &mut [f32]) {
 /// on the calling thread.
 fn par_chunk(len: usize) -> Option<usize> {
     let t = crate::par::threads();
-    if t <= 1 || len < 2 * crate::par::MIN_ELEMS_PER_TASK || cfg!(all(target_arch = "wasm32", not(feature = "wasm-threads"))) {
+    let min = crate::par::min_elems();
+    if t <= 1 || len < 2 * min || cfg!(all(target_arch = "wasm32", not(feature = "wasm-threads"))) {
         return None;
     }
     // Multiple of 16 so only the last chunk takes the masked tail.
-    Some(crate::par::MIN_ELEMS_PER_TASK.max(len.div_ceil(4 * t)).next_multiple_of(16))
+    Some(min.max(len.div_ceil(4 * t)).next_multiple_of(16))
 }
 
 /// [`apply`] split across the current rayon pool when large enough.

@@ -98,7 +98,7 @@ pub struct Session {
     ///
     /// Also the memo consulted by `resolve_run_shapes`: it contains the input
     /// shapes it was seeded with, so it is its own cache key.
-    pub(crate) resolved_shapes: Mutex<HashMap<String, Vec<usize>>>,
+    pub(crate) resolved_shapes: Mutex<Arc<HashMap<String, Vec<usize>>>>,
     /// Recently computed shape plans, keyed by the input shapes that produced
     /// them.  See [`ShapePlanCache`].
     pub(crate) shape_plans: ShapePlanCache,
@@ -192,13 +192,22 @@ impl ShapePlanCache {
         input_shapes: &HashMap<String, Vec<usize>>,
         plan: &HashMap<String, Vec<usize>>,
     ) {
+        self.store_arc(input_shapes, &Arc::new(plan.clone()));
+    }
+
+    /// [`ShapePlanCache::store`] for a plan already behind an `Arc` (no copy).
+    pub(crate) fn store_arc(
+        &self,
+        input_shapes: &HashMap<String, Vec<usize>>,
+        plan: &Arc<HashMap<String, Vec<usize>>>,
+    ) {
         let Ok(mut entries) = self.entries.lock() else {
             return;
         };
         if let Some(existing) = entries.iter().position(|(key, _)| key == input_shapes) {
             entries.remove(existing);
         }
-        entries.insert(0, (input_shapes.clone(), Arc::new(plan.clone())));
+        entries.insert(0, (input_shapes.clone(), Arc::clone(plan)));
         entries.truncate(MAX_CACHED_SHAPE_PLANS);
     }
 
