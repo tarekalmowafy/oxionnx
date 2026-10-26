@@ -171,10 +171,11 @@ fn infer_node_symbolic(
             Some(vec![out])
         }
 
-        // --- Shape op: output is always [rank] ---
+        // --- Shape op: output is [end - start] (opset-15 slice attrs; [rank] by default) ---
         OpKind::Shape => {
             let s = inputs.first().and_then(|o| *o)?;
-            Some(vec![vec![SymDim::Known(s.len())]])
+            let (start, end) = oxionnx_ops::registry::misc_ops::shape_slice_bounds(s.len(), attrs);
+            Some(vec![vec![SymDim::Known(end - start)]])
         }
 
         // Unsupported ops return None so the caller can skip gracefully.

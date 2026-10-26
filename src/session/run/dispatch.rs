@@ -1303,7 +1303,7 @@ mod tests {
 fn fully_writes_slot(node: &Node, idx: usize) -> bool {
     match node.op.as_str() {
         "Split" | "SkipSimplifiedLayerNormalization" | "OxiMatMulSplit" | "MatMulNBits" | "OxiMatMulNBits"
-        | "GatherBlockQuantized" => true,
+        | "GatherBlockQuantized" | "com.microsoft.MultiHeadAttention" | "GroupQueryAttention" => true,
         "com.microsoft.RotaryEmbedding" | "OxiAttention" | "OxiMatMulAct" => idx == 0,
         "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "Concat" | "Transpose"
         | "SimplifiedLayerNormalization" => idx == 0,
@@ -1330,6 +1330,10 @@ fn shape_depends_only_on_input_shapes(node: &Node, weights: &HashMap<String, Ten
         | "SimplifiedLayerNormalization" => true,
         "SkipSimplifiedLayerNormalization" | "com.microsoft.RotaryEmbedding" | "OxiAttention" | "OxiMatMulAct"
         | "OxiMatMulSplit" | "MatMulNBits" | "OxiMatMulNBits" | "GatherBlockQuantized" => true,
+        // Outputs depend on input shapes only (GQA's present length also on
+        // `total_sequence_length`, fixed by the input shapes in practice; the
+        // kernels size their outputs themselves either way).
+        "com.microsoft.MultiHeadAttention" | "GroupQueryAttention" => true,
         // `split` sizes may come from a runtime tensor.
         "Split" => node.inputs.get(1).is_none_or(|n| n.is_empty() || weights.contains_key(n)),
         _ => false,

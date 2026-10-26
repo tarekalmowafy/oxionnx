@@ -386,6 +386,11 @@ impl Operator for AttentionOp {
 
 // ── MultiHeadAttention ──────────────────────────────────────────────────────
 
+/// The `scale` attribute (com.microsoft::MultiHeadAttention); absent or 0 means `1/sqrt(head_dim)`.
+fn mha_scale(attrs: &oxionnx_core::Attributes) -> Option<f32> {
+    Some(attrs.f("scale", 0.0)).filter(|&s| s != 0.0)
+}
+
 pub struct MultiHeadAttentionOp;
 impl Operator for MultiHeadAttentionOp {
     fn op_type(&self) -> &str {
@@ -404,7 +409,8 @@ impl Operator for MultiHeadAttentionOp {
         let attrs = ctx.attrs();
         let num_heads = attrs.i("num_heads", 1) as usize;
 
-        let out = attention::multi_head_attention(
+        let mut out = vec![0.0f32; query.shape[0] * query.shape[1] * query.shape[2]];
+        let shape = attention::multi_head_attention_into(
             query,
             key,
             value,
@@ -414,8 +420,10 @@ impl Operator for MultiHeadAttentionOp {
             out_proj_bias,
             mask,
             num_heads,
+            mha_scale(attrs),
+            &mut out,
         )?;
-        Ok(vec![out])
+        Ok(vec![Tensor::new(out, shape)])
     }
 
     fn native_dtypes(&self) -> &'static [oxionnx_core::DType] {
@@ -517,7 +525,7 @@ impl Operator for MultiHeadAttentionOp {
                     return oxionnx_core::default_typed_via_f32(self, ctx);
                 }
 
-                let effective_scale = 1.0 / (head_dim as f32).sqrt();
+                let effective_scale = mha_scale(ctx.attrs()).unwrap_or(1.0 / (head_dim as f32).sqrt());
                 if !typed_mask_is_supported(mask_tt, batch * num_heads, seq_q, seq_kv) {
                     return oxionnx_core::default_typed_via_f32(self, ctx);
                 }
@@ -600,7 +608,7 @@ impl Operator for MultiHeadAttentionOp {
                     return oxionnx_core::default_typed_via_f32(self, ctx);
                 }
 
-                let effective_scale = 1.0 / (head_dim as f32).sqrt();
+                let effective_scale = mha_scale(ctx.attrs()).unwrap_or(1.0 / (head_dim as f32).sqrt());
                 if !typed_mask_is_supported(mask_tt, batch * num_heads, seq_q, seq_kv) {
                     return oxionnx_core::default_typed_via_f32(self, ctx);
                 }
@@ -697,6 +705,7 @@ impl Operator for MultiHeadAttentionOp {
             out_proj_bias,
             mask,
             num_heads,
+            mha_scale(ctx.attrs()),
             &mut slots[0].data,
         )?;
         Ok(())
@@ -1330,5 +1339,43 @@ mod tests {
             matches!(out[0].storage, TensorStorage::F32(_)),
             "an incompatible Q/K/V batch combination must decline to the f32 fallback"
         );
+    }
+
+    #[test]
+    fn mha_honors_scale_attribute() {
+        // One head, seq 2, head_dim 4: out[i] = softmax_j(scale * q_i.k_j) v_j.
+        let q = Tensor::new(seq_f32(0.1, 0.3, 8), vec![1, 2, 4]);
+        let k = Tensor::new(seq_f32(-0.5, 0.2, 8), vec![1, 2, 4]);
+        let v = Tensor::new(seq_f32(1.0, -0.4, 8), vec![1, 2, 4]);
+        let reference = |scale: f32| -> Vec<f32> {
+            let mut out = vec![0.0f32; 8];
+            for i in 0..2 {
+                let s: Vec<f32> = (0..2)
+                    .map(|j| scale * (0..4).map(|d| q.data[i * 4 + d] * k.data[j * 4 + d]).sum::<f32>())
+                    .collect();
+                let m = s[0].max(s[1]);
+                let e: Vec<f32> = s.iter().map(|x| (x - m).exp()).collect();
+                for d in 0..4 {
+                    out[i * 4 + d] = (e[0] * v.data[d] + e[1] * v.data[4 + d]) / (e[0] + e[1]);
+                }
+            }
+            out
+        };
+        for (attr, scale) in [(Some(1.0f32), 1.0f32), (Some(2.5), 2.5), (None, 0.5)] {
+            let mut attrs = Attributes::default();
+            attrs.ints.insert("num_heads".into(), 1);
+            if let Some(a) = attr {
+                attrs.floats.insert("scale".into(), a);
+            }
+            let node = Node { name: "mha".into(), op: OpKind::MultiHeadAttention, inputs: vec![], outputs: vec![], attrs };
+            let ctx = OpContext { node: &node, inputs: vec![Some(&q), Some(&k), Some(&v)], outer_scope: None, weights: None, registry: None };
+            let want = reference(scale);
+            let got = MultiHeadAttentionOp.execute(&ctx).unwrap();
+            let mut slots = vec![Tensor::new(vec![], vec![0])];
+            MultiHeadAttentionOp.execute_into_slots(&ctx, &mut slots).unwrap();
+            for (g, w) in got[0].data.iter().zip(&want).chain(slots[0].data.iter().zip(&want)) {
+                assert!((g - w).abs() < 1e-5, "scale {scale}: {g} vs {w}");
+            }
+        }
     }
 }

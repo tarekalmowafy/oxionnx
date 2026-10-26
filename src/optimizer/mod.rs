@@ -232,7 +232,8 @@ fn materialize_shape_ops(
         }
         // Store as a 1-D tensor.  Shape output is int64 per ONNX spec;
         // we use f32 since our Tensor stores f32 data.
-        let shape_data: Vec<f32> = shape.iter().map(|&d| d as f32).collect();
+        let (start, end) = oxionnx_ops::registry::misc_ops::shape_slice_bounds(shape.len(), &node.attrs);
+        let shape_data: Vec<f32> = shape[start..end].iter().map(|&d| d as f32).collect();
         let len = shape_data.len();
         weights.insert(output_name.clone(), Tensor::new(shape_data, vec![len]));
     }

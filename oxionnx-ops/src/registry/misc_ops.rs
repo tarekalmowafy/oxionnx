@@ -508,7 +508,7 @@ impl Operator for CastOp {
 /// negative values count from the back (clamped at 0), positive values clamp
 /// at `rank`, and `end < start` collapses to an empty range rather than
 /// panicking on the subsequent `shape[start..end]` slice.
-fn shape_slice_bounds(rank: usize, attrs: &oxionnx_core::Attributes) -> (usize, usize) {
+pub fn shape_slice_bounds(rank: usize, attrs: &oxionnx_core::Attributes) -> (usize, usize) {
     let rank_i = rank as i64;
     let resolve = |v: i64| -> i64 {
         if v < 0 {

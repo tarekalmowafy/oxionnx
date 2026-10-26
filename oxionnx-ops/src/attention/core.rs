@@ -825,6 +825,7 @@ pub(crate) fn reshape_from_heads(
 /// * `out_proj_bias` - `[embed_dim]` (optional)
 /// * `mask` - Additive mask (optional)
 /// * `num_heads` - Number of attention heads
+/// * `scale` - Softmax scale; `None` = `1/sqrt(head_dim)`
 /// * `out` - Pre-allocated output buffer, must be sized `batch * seq_q * embed_dim`.
 ///
 /// Returns `[batch, seq_q, embed_dim]`.
@@ -839,6 +840,7 @@ pub(crate) fn multi_head_attention_into(
     out_proj_bias: Option<&Tensor>,
     mask: Option<&Tensor>,
     num_heads: usize,
+    scale: Option<f32>,
     out: &mut [f32],
 ) -> Result<Vec<usize>, OnnxError> {
     let batch = query.shape[0];
@@ -933,7 +935,7 @@ pub(crate) fn multi_head_attention_into(
     let q_heads = reshape_to_heads(&q_proj, batch, seq_q, num_heads, head_dim);
     let k_heads = reshape_to_heads(&k_proj, batch, seq_k, num_heads, head_dim);
     let v_heads = reshape_to_heads(&v_proj, batch, seq_k, num_heads, head_dim);
-    let attn_out = scaled_dot_product_attention(&q_heads, &k_heads, &v_heads, mask, None)?;
+    let attn_out = scaled_dot_product_attention(&q_heads, &k_heads, &v_heads, mask, scale)?;
     // --- Final write into out ---
     if let Some(w_out) = out_proj_weight {
         // Build concat (one allocation); project directly into out.
@@ -1000,6 +1002,7 @@ pub fn multi_head_attention(
         out_proj_bias,
         mask,
         num_heads,
+        None,
         &mut out,
     )?;
     Ok(Tensor::new(out, shape))
