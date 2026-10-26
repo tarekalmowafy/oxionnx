@@ -23,5 +23,5 @@ pub use unique::unique;
 pub use where_expand::{expand, where_op};
 
 pub(crate) use gather::gather_into;
-pub(crate) use index_util::normalize_axis;
+pub(crate) use index_util::{normalize_axis, normalize_index};
 pub(crate) use scatter::{scatter_elements_into, scatter_nd_into};
