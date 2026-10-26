@@ -379,6 +379,8 @@ pub struct AttnExt<'a> {
     pub local_window: Option<usize>,
     pub softcap: f32,
     pub sink: AttnSink<'a>,
+    /// K/V are `[B, Hkv, T, D]` (head-major) instead of `[B, T, Hkv*D]`.
+    pub kv_bnsh: bool,
 }
 
 impl AttnExt<'_> {
@@ -446,6 +448,12 @@ pub fn attention_ext_into(
         return Ok(());
     }
     let group = q_heads / kv_heads;
+    // K/V element strides per batch, per KV head and per key row.
+    let (kbs, khs, krow) = if ext.kv_bnsh {
+        (kv_heads * seq_kv * head_dim, seq_kv * head_dim, head_dim)
+    } else {
+        (seq_kv * krs, head_dim, krs)
+    };
     // Query rows per task: enough tasks for every thread, at most 64 rows so the
     // score block (rows x T) stays in L2.
     let n_bh = batch * q_heads;
@@ -459,10 +467,10 @@ pub fn attention_ext_into(
     let packs: Option<Vec<(PackedB, PackedB)>> = crate::gemm_packed::available().then(|| {
         let pack = |bg: usize| {
             let (b, g) = (bg / kv_heads, bg % kv_heads);
-            let base = b * seq_kv * krs + g * head_dim;
+            let base = b * kbs + g * khs;
             (
-                PackedB::pack_strided(&k[base..], head_dim, seq_kv, 1, krs),
-                PackedB::pack_strided(&v[base..], seq_kv, head_dim, krs, 1),
+                PackedB::pack_strided(&k[base..], head_dim, seq_kv, 1, krow),
+                PackedB::pack_strided(&v[base..], seq_kv, head_dim, krow, 1),
             )
         };
         #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
@@ -484,8 +492,8 @@ pub fn attention_ext_into(
         let m = rows_per.min(seq_q - s0);
         scores.resize(m * seq_kv, 0.0);
         let qp = q[(b * seq_q + s0) * qrs + h * head_dim..].as_ptr();
-        let kp = k[b * seq_kv * krs + g * head_dim..].as_ptr();
-        let vp = v[b * seq_kv * krs + g * head_dim..].as_ptr();
+        let kp = k[b * kbs + g * khs..].as_ptr();
+        let vp = v[b * kbs + g * khs..].as_ptr();
         let pk = packs.as_ref().map(|p| &p[b * kv_heads + g]);
         // SAFETY: strides stay inside q/k/v (checked sizes above); every task
         // writes rows s0..s0+m of head h only.
@@ -502,7 +510,7 @@ pub fn attention_ext_into(
                 matrixmultiply::sgemm(
                     m, head_dim, seq_kv, scale,
                     qp, qrs as isize, 1,
-                    kp, 1, krs as isize,
+                    kp, 1, krow as isize,
                     0.0, scores.as_mut_ptr(), seq_kv as isize, 1,
                 );
             },
@@ -550,7 +558,7 @@ pub fn attention_ext_into(
                 matrixmultiply::sgemm(
                     m, seq_kv, head_dim, 1.0,
                     scores.as_ptr(), seq_kv as isize, 1,
-                    vp, krs as isize, 1,
+                    vp, krow as isize, 1,
                     0.0, dst, qrs as isize, 1,
                 );
             },

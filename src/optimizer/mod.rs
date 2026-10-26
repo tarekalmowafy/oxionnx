@@ -136,6 +136,13 @@ pub fn optimize_with_input_shapes(
         nodes
     };
 
+    // `repeat_kv` / attention-mask broadcasts in front of the contrib attention op.
+    let nodes = if registry.get("com.microsoft.MultiHeadAttention").is_some() {
+        fusion::fuse_repeat_kv(nodes, weights, output_names)
+    } else {
+        nodes
+    };
+
     // Inference-mode Dropout is the identity; removing it first lets the
     // downstream patterns (e.g. Softmax → Dropout → MatMul) match.
     let nodes = fusion::eliminate_dropout_inference(nodes, weights, output_names);
