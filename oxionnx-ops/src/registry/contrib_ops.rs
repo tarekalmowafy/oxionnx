@@ -330,8 +330,8 @@ fn nbits_product(m: usize, x: &Tensor, p: &crate::matmul_nbits::Packed<'_>) -> V
 /// (weight name, layout tag) and checked against the source data pointer. Per
 /// session, like the registry; shared with `MatMulOp`.
 ///
-/// With BF16 weights the session packs them at load time
-/// ([`Operator::prepack`]) and may then free the FP32 data: such a *released*
+/// The session packs them at load time ([`Operator::prepack`]; BF16 with the
+/// BF16-weights option) and then frees the original data: such a *released*
 /// weight (shape kept, data empty, see [`released`]) is served from here by
 /// name, or rebuilt with [`WeightCache::dense`] for the rare unpacked path.
 #[derive(Default)]
@@ -394,25 +394,31 @@ impl WeightCache {
         Some(p)
     }
 
-    /// [`Operator::prepack`] for input 1: when the session uses BF16 weights,
-    /// pack it now and report it as no longer needed in FP32.
+    /// [`Operator::prepack`] for input 1: pack it now (BF16 when the session
+    /// uses BF16 weights) and report it as no longer needed in its original
+    /// form.
     pub(crate) fn prepack(
         &self,
         ctx: &OpContext<'_>,
         tag: i64,
         pack: impl FnOnce(crate::gemm_packed::Isa) -> crate::gemm_packed::PackedB,
     ) -> Vec<usize> {
-        if !crate::gemm_bf16::weights_enabled(ctx.registry) {
-            return vec![];
-        }
         match ctx.optional_input(1).and_then(|w| self.get(ctx, w, tag, pack)) {
-            Some(p) if p.isa() == crate::gemm_packed::Isa::Avx512Bf16 => vec![1],
-            _ => vec![],
+            Some(_) => vec![1],
+            None => vec![],
         }
     }
 
-    /// The FP32 matrix of a released input 1 rebuilt from its packed copy (BF16
-    /// values), with packed column `j` stored at column `cols[j]` (identity if
+    /// [`Operator::released_weight`] for input 1: its FP32 data rebuilt from
+    /// an FP32 packed copy (exact); `None` for a BF16 one.
+    pub(crate) fn exact_dense(&self, ctx: &OpContext<'_>, tag: i64, cols: Option<&[usize]>) -> Option<Tensor> {
+        let name = ctx.node.inputs.get(1)?;
+        let p = self.lookup(name, tag, None)?;
+        (p.isa() != crate::gemm_packed::Isa::Avx512Bf16).then(|| self.dense(ctx, tag, cols).ok()).flatten()
+    }
+
+    /// The FP32 matrix of a released input 1 rebuilt from its packed copy
+    /// (exact for FP32, BF16 values otherwise), with packed column `j` stored at column `cols[j]` (identity if
     /// `None`).
     pub(crate) fn dense(&self, ctx: &OpContext<'_>, tag: i64, cols: Option<&[usize]>) -> Result<Tensor, OnnxError> {
         let p = ctx.node.inputs.get(1).and_then(|name| self.lookup(name, tag, None)).ok_or_else(|| {
@@ -579,6 +585,12 @@ impl Operator for OxiMatMulActOp {
     fn prepack(&self, ctx: &OpContext<'_>) -> Vec<usize> {
         self.prepack_weight(ctx)
     }
+    #[cfg(target_arch = "x86_64")]
+    fn released_weight(&self, ctx: &OpContext<'_>, input: usize) -> Option<Tensor> {
+        let (n, gate) = (*ctx.optional_input(1)?.shape.get(1)?, ctx.attrs().i("gate", -1));
+        let cols = (gate >= 0).then(|| crate::fused_matmul::block_cols(n, true).map(|c| crate::fused_matmul::gate_columns(n, gate as usize, c)));
+        (input == 1).then(|| self.cache.exact_dense(ctx, gate, cols.flatten().as_deref())).flatten()
+    }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let mut slots = empty_slots(ctx);
         self.run(ctx, &mut slots)?;
@@ -717,6 +729,10 @@ impl Operator for OxiMatMulSplitOp {
         let Some(w) = ctx.optional_input(1).filter(|w| w.ndim() == 2) else { return vec![] };
         let (k, n) = (w.shape[0], w.shape[1]);
         self.cache.prepack(ctx, -1, |isa| crate::gemm_packed::PackedB::pack_for(isa, &w.data, k, n))
+    }
+    #[cfg(target_arch = "x86_64")]
+    fn released_weight(&self, ctx: &OpContext<'_>, input: usize) -> Option<Tensor> {
+        (input == 1).then(|| self.cache.exact_dense(ctx, -1, None)).flatten()
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let mut slots = empty_slots(ctx);

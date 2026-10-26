@@ -764,3 +764,47 @@ fn unrecognized_elem_type_is_reported_through_the_fallible_api() {
     assert_eq!(info.dtype, oxionnx_core::dtype::DType::Bool);
     assert_eq!(info.shape, vec![Some(2)]);
 }
+
+// ─────────────────────────────────────────────────────────────────
+// deferred (zero-copy) inline payloads
+// ─────────────────────────────────────────────────────────────────
+
+fn f32_initializer(name: &str, values: &[f32]) -> Vec<u8> {
+    let mut t = encode_varint_field(1, values.len() as u64); // dims
+    t.extend(encode_varint_field(2, 1)); // data_type = FLOAT
+    t.extend(encode_bytes_field(8, name.as_bytes())); // name
+    let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    t.extend(encode_bytes_field(9, &raw)); // raw_data
+    t
+}
+
+#[test]
+fn large_inline_payloads_are_decoded_in_place_and_released() {
+    use oxionnx_proto::model::{load_with_metadata, load_with_metadata_releasing};
+    use oxionnx_proto::parser::{parse_model_deferred, DEFER_RAW_BYTES};
+
+    let big: Vec<f32> = (0..DEFER_RAW_BYTES).map(|i| i as f32 * 0.5).collect(); // 4x the threshold in bytes
+    let small = [1.0f32, -2.0, 3.5];
+    let mut graph = encode_bytes_field(5, &f32_initializer("big", &big));
+    graph.extend(encode_bytes_field(5, &f32_initializer("small", &small)));
+    let model = model_with_graph(&graph);
+
+    // Only the large payload is deferred, and its range covers exactly its bytes.
+    let (proto, deferred) = parse_model_deferred(&model).unwrap();
+    assert_eq!(deferred.len(), 1);
+    assert_eq!(deferred[0].initializer, 0);
+    assert!(proto.graph.initializers[0].raw_data.is_empty());
+    assert_eq!(proto.graph.initializers[1].raw_data.len(), small.len() * 4);
+    let r = deferred[0].range.clone();
+    let want: Vec<u8> = big.iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(&model[r.clone()], &want[..]);
+
+    // The releasing loader reports that range once and decodes the same weights.
+    let mut released = Vec::new();
+    let (_, _, w) = load_with_metadata_releasing(&model, None, &mut |r| released.push(r)).unwrap();
+    assert_eq!(released, vec![r]);
+    let (_, _, reference) = load_with_metadata(&model).unwrap();
+    assert_eq!(w["big"].data, big);
+    assert_eq!(w["small"].data, small);
+    assert_eq!(reference["big"].data, w["big"].data);
+}

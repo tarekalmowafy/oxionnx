@@ -21,7 +21,7 @@ use hashbrown::HashMap;
 #[cfg(feature = "std")]
 use std::collections::HashMap;
 
-use core::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 
 use crate::dtype::{DType, TypedTensor};
 use crate::error::OnnxError;
@@ -187,6 +187,14 @@ pub trait Operator: Send + Sync {
         Vec::new()
     }
 
+    /// The data of constant input `input`, which the session released after
+    /// [`Self::prepack`], rebuilt **exactly** from this operator's packed copy
+    /// (used to save the session). `None` when the packed copy is not exact
+    /// (BF16) or the operator keeps none. `ctx` is set up as for `prepack`.
+    fn released_weight(&self, _ctx: &OpContext<'_>, _input: usize) -> Option<Tensor> {
+        None
+    }
+
     // ── Phase D: native typed dispatch ─────────────────────────────────────────
 
     /// Dtypes this operator can execute without an f32 round-trip.
@@ -306,6 +314,9 @@ pub struct OperatorRegistry {
     /// kernels consult `OXIONNX_BF16_WEIGHTS`; 1 = off; 2 = on). See
     /// [`OperatorRegistry::set_bf16_weights`].
     bf16_weights: AtomicU8,
+    /// Session option: keep the FP32 data of weights that operators packed at
+    /// load time instead of freeing it. See [`OperatorRegistry::set_keep_weights`].
+    keep_weights: AtomicBool,
 }
 
 impl OperatorRegistry {
@@ -314,7 +325,20 @@ impl OperatorRegistry {
             ops: hashbrown::HashMap::new(),
             model_opset: AtomicI64::new(DEFAULT_OPSET),
             bf16_weights: AtomicU8::new(0),
+            keep_weights: AtomicBool::new(false),
         }
+    }
+
+    /// Keep (`true`) or free (`false`, the default) the original data of the
+    /// weights that operators packed when the session was built. Set by
+    /// `SessionBuilder::with_keep_weights`.
+    pub fn set_keep_weights(&self, keep: bool) {
+        self.keep_weights.store(keep, Ordering::Relaxed);
+    }
+
+    /// See [`OperatorRegistry::set_keep_weights`].
+    pub fn keep_weights(&self) -> bool {
+        self.keep_weights.load(Ordering::Relaxed)
     }
 
     /// Opt in to (or out of) BF16 weights for the session bound to this

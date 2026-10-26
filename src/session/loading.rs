@@ -56,19 +56,68 @@ pub(crate) fn parse_stage<T, E>(
     result
 }
 
+/// Parse the model file at `path`, resolving external data next to it.
+///
+/// On native targets the file is memory-mapped rather than read into a buffer,
+/// and each large inline initializer's pages are dropped from the mapping as
+/// soon as the tensor has been decoded (see
+/// [`crate::model::load_with_metadata_releasing`]). Loading a model with inline
+/// weights then needs about one copy of the weights in memory, not three.
+pub(crate) fn parse_file(
+    path: &Path,
+) -> Result<(oxionnx_proto::model::RawModelMeta, Graph, HashMap<String, Tensor>), OnnxError> {
+    let base_path = path.parent().unwrap_or_else(|| Path::new("."));
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let file = std::fs::File::open(path)
+            .map_err(|e| OnnxError::Parse(format!("Cannot read ONNX file {}: {e}", path.display())))?;
+        // SAFETY: the mapping is read-only and private, and lives only for this
+        // parse: every tensor is copied out into owned storage before the map is
+        // dropped at the end of this block. As with any file mapping, the file
+        // must not be truncated or rewritten while the model loads.
+        #[allow(unsafe_code)]
+        let map = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| OnnxError::Parse(format!("Cannot map ONNX file {}: {e}", path.display())))?;
+        let release = |range: std::ops::Range<usize>| release_pages(&map, range);
+        parse_stage("file", map.len(), || {
+            crate::model::load_with_metadata_releasing(&map, Some(base_path), &mut { release })
+        })
+        .map_err(OnnxError::Parse)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let bytes = std::fs::read(path)
+            .map_err(|e| OnnxError::Parse(format!("Cannot read ONNX file {}: {e}", path.display())))?;
+        parse_stage("file", bytes.len(), || crate::model::load_with_metadata_and_path(&bytes, base_path))
+            .map_err(OnnxError::Parse)
+    }
+}
+
+/// Drop the whole pages of `range` from a read-only file mapping. They are not
+/// read again; if they were, they would be faulted back in from the file.
+#[cfg(not(target_arch = "wasm32"))]
+fn release_pages(map: &memmap2::Mmap, range: std::ops::Range<usize>) {
+    // 64 KiB covers every common page size; only whole aligned chunks go.
+    const ALIGN: usize = 64 << 10;
+    let (start, end) = (range.start.next_multiple_of(ALIGN), range.end / ALIGN * ALIGN);
+    #[cfg(unix)]
+    if end > start {
+        // SAFETY: `MADV_DONTNEED` on a private read-only file mapping discards
+        // the resident copies of these pages; a later access re-reads them from
+        // the file, so no data visible through `map` changes.
+        #[allow(unsafe_code)]
+        let _ = unsafe { map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, start, end - start) };
+    }
+    #[cfg(not(unix))]
+    let _ = (map, start, end);
+}
+
 impl Session {
     /// Load an ONNX model from a `.onnx` file.
     /// Supports models with external data by resolving paths relative to the file's directory.
     pub fn from_file(path: &Path) -> Result<Self, OnnxError> {
-        let bytes = std::fs::read(path).map_err(|e| {
-            OnnxError::Parse(format!("Cannot read ONNX file {}: {e}", path.display()))
-        })?;
-        let base_path = path.parent().unwrap_or_else(|| Path::new("."));
         let registry = oxionnx_ops::default_registry();
-        let (raw_meta, graph, weights) = parse_stage("file", bytes.len(), || {
-            crate::model::load_with_metadata_and_path(&bytes, base_path)
-        })
-        .map_err(OnnxError::Parse)?;
+        let (raw_meta, graph, weights) = parse_file(path)?;
         let metadata = raw_meta_to_model_metadata(raw_meta);
         Self::build_from_graph(
             graph,
@@ -97,14 +146,7 @@ impl Session {
         path: &Path,
         registry: OperatorRegistry,
     ) -> Result<Self, OnnxError> {
-        let bytes = std::fs::read(path).map_err(|e| {
-            OnnxError::Parse(format!("Cannot read ONNX file {}: {e}", path.display()))
-        })?;
-        let base_path = path.parent().unwrap_or_else(|| Path::new("."));
-        let (raw_meta, graph, weights) = parse_stage("file", bytes.len(), || {
-            crate::model::load_with_metadata_and_path(&bytes, base_path)
-        })
-        .map_err(OnnxError::Parse)?;
+        let (raw_meta, graph, weights) = parse_file(path)?;
         let metadata = raw_meta_to_model_metadata(raw_meta);
         Self::build_from_graph(
             graph,
