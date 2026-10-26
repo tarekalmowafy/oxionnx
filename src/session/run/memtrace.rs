@@ -38,6 +38,7 @@ pub(crate) struct MemTrace {
     peak_rss: f64,
     allocs_start: u64,
     alloc_bytes_start: u64,
+    zeroed_start: u64,
     pool_start: usize,
     /// Bytes of outputs freshly allocated by kernels (non-slot, non-inplace path), per op.
     fresh: std::collections::BTreeMap<String, usize>,
@@ -49,6 +50,7 @@ impl MemTrace {
         if let Some(p) = pool.and_then(|p| p.lock().ok()) {
             t.allocs_start = p.stats().alloc_count;
             t.alloc_bytes_start = p.stats().alloc_bytes;
+            t.zeroed_start = p.stats().zeroed_bytes;
             t.pool_start = p.stats().current_bytes;
         }
         t
@@ -87,19 +89,20 @@ impl MemTrace {
 
     pub(crate) fn report(&self, pool: Option<&Mutex<SizeClassPool>>) {
         let (rss, hwm) = rss_mib();
-        let (allocs, alloc_mib, pool_end, nbuf, budget) = pool.and_then(|p| p.lock().ok()).map_or((0, 0.0, 0, 0, 0), |p| {
+        let (allocs, alloc_mib, pool_end, nbuf, budget, zeroed) = pool.and_then(|p| p.lock().ok()).map_or((0, 0.0, 0, 0, 0, 0.0), |p| {
             (
                 p.stats().alloc_count - self.allocs_start,
                 (p.stats().alloc_bytes - self.alloc_bytes_start) as f64 / MIB,
                 p.stats().current_bytes,
                 p.buffer_count(),
                 p.budget().unwrap_or(0),
+                (p.stats().zeroed_bytes - self.zeroed_start) as f64 / MIB,
             )
         });
         eprintln!(
-            "oxionnx-mem run: peak live+pool {:.1} MiB (live {:.1}, pool {:.1}) at {}; rss there {:.0}, now {:.0}, hwm {:.0}; pool start {:.1} end {:.1} MiB ({} bufs, budget {:.1}), {} new pool allocs ({:.1} MiB)",
+            "oxionnx-mem run: peak live+pool {:.1} MiB (live {:.1}, pool {:.1}) at {}; rss there {:.0}, now {:.0}, hwm {:.0}; pool start {:.1} end {:.1} MiB ({} bufs, budget {:.1}), {} new pool allocs ({:.1} MiB), {:.1} MiB zero-filled",
             self.peak_total as f64 / MIB, self.peak_live as f64 / MIB, self.peak_pool as f64 / MIB, self.peak_node,
-            self.peak_rss, rss, hwm, self.pool_start as f64 / MIB, pool_end as f64 / MIB, nbuf, budget as f64 / MIB, allocs, alloc_mib
+            self.peak_rss, rss, hwm, self.pool_start as f64 / MIB, pool_end as f64 / MIB, nbuf, budget as f64 / MIB, allocs, alloc_mib, zeroed
         );
         for (n, b, s) in &self.peak_top {
             eprintln!("oxionnx-mem   live {:8.1} MiB {:?} {}", *b as f64 / MIB, s, n);

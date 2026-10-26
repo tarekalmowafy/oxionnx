@@ -23,12 +23,13 @@ use super::functions::{bucket_for, compute_peak_memory, MAX_BUCKETS_PER_CLASS, M
 ///   and forces the next large request to allocate afresh.
 /// * An optional **byte budget** ([`SizeClassPool::raise_budget`]) caps the bytes
 ///   held in the free lists. A release that would exceed it evicts the
-///   least-recently released buffers first. The session sets the budget to the
+///   least-recently released buffers first. The session sets the base budget to the
 ///   peak bytes of live intermediates it has seen in one run. With perfect size
 ///   matching the free lists would never need more than that; when they do (a
 ///   request misses that a buffer evicted for the budget would have served), the
-///   budget grows by that buffer's size, so it settles at the smallest value the
-///   run's reuse pattern needs. Without a budget (the default for a pool built
+///   budget grows by that buffer's size, up to
+///   [`MAX_EXTRA_BUDGET_FACTOR`] times the base, so it settles at the smallest
+///   value the run's reuse pattern needs. Without a budget (the default for a pool built
 ///   with [`SizeClassPool::new`]) the cache is bounded only by the per-class
 ///   buffer count.
 pub struct SizeClassPool {
@@ -43,6 +44,8 @@ pub struct SizeClassPool {
     clock: u64,
     /// Upper bound on the bytes held in the free lists, if any.
     budget: Option<usize>,
+    /// Adaptive growth on top of `budget` (see the type-level docs).
+    extra: usize,
     /// Capacities (elements) of the buffers most recently evicted for the budget,
     /// with the run epoch of the eviction, newest last; a fresh allocation one of
     /// them would have served raises the budget.
@@ -52,6 +55,9 @@ pub struct SizeClassPool {
     /// buffer is missing now, since the pool has had a whole run to refill.
     epoch: u64,
 }
+
+/// Cap of the adaptive budget growth, as a multiple of the base budget.
+pub const MAX_EXTRA_BUDGET_FACTOR: usize = 2;
 
 /// How many budget evictions [`SizeClassPool`] remembers for its miss check.
 const EVICTED_HISTORY: usize = 64;
@@ -83,6 +89,7 @@ impl SizeClassPool {
             stats: PoolStats::default(),
             clock: 0,
             budget: None,
+            extra: 0,
             evicted: std::collections::VecDeque::new(),
             epoch: 0,
         }
@@ -99,9 +106,16 @@ impl SizeClassPool {
         let oldest = self.epoch.saturating_sub(1);
         self.evicted.retain(|&(_, e)| e >= oldest);
     }
-    /// The current byte budget for cached buffers, if any.
+    /// The current byte budget for cached buffers (base plus adaptive growth),
+    /// if any.
     pub fn budget(&self) -> Option<usize> {
-        self.budget
+        self.budget.map(|b| b + self.extra)
+    }
+    /// Grow the adaptive part of the budget by `bytes`, within its cap.
+    fn grow_budget(&mut self, bytes: usize) {
+        if let Some(base) = self.budget {
+            self.extra = (self.extra + bytes).min(base.saturating_mul(MAX_EXTRA_BUDGET_FACTOR));
+        }
     }
     /// Take buffer `idx` out of `class`'s free list, updating the accounting.
     fn take_at(&mut self, class: SizeClass, idx: usize) -> Vec<f32> {
@@ -116,10 +130,10 @@ impl SizeClassPool {
         // A miss that a buffer evicted for the budget would have served: the
         // budget is too tight for this run's reuse pattern, so grow it by that
         // buffer.
-        if let Some(budget) = self.budget.as_mut().filter(|_| count_miss) {
+        if self.budget.is_some() && count_miss {
             if let Some(pos) = self.evicted.iter().rposition(|&(cap, _)| fits_tightly(cap, size)) {
                 let cap = self.evicted.remove(pos).map_or(0, |(cap, _)| cap);
-                *budget += cap * std::mem::size_of::<f32>();
+                self.grow_budget(cap * std::mem::size_of::<f32>());
             }
         }
         self.stats.alloc_count += 1;
@@ -161,6 +175,7 @@ impl SizeClassPool {
         match found {
             Some((found_class, idx)) => {
                 let mut buf = self.take_at(found_class, idx);
+                self.stats.zeroed_bytes += (size * std::mem::size_of::<f32>()) as u64;
                 buf.clear();
                 buf.resize(size, 0.0);
                 buf
@@ -231,6 +246,19 @@ impl SizeClassPool {
         let found = exact
             .or_else(|| Self::no_zeroing_fit_index(self.bucket_ref(class), size).map(|i| (class, i)))
             .or_else(|| self.find_in_larger_buckets(class, size));
+        // With a budget, a large request the cache can only serve by growing a
+        // shorter buffer gets a fresh one instead. Growing zero-fills the tail
+        // (`Vec` cannot expose the bytes past a `truncate`), and it repeats on
+        // every run: the shorter buffer was cut from one of this length by a
+        // smaller request earlier in the run. A fresh buffer is paid once; from
+        // the next run on both lengths find an exact match.
+        if self.budget.is_some()
+            && exact.is_none()
+            && size >= MAX_SLACK_ELEMENTS
+            && found.is_some_and(|(c, i)| self.bucket_ref(c)[i].buf.len() < size)
+        {
+            return self.fresh(size, count_miss);
+        }
         match found {
             Some((found_class, idx)) => {
                 let mut buf = self.take_at(found_class, idx);
@@ -240,6 +268,7 @@ impl SizeClassPool {
                 if buf.len() >= size {
                     buf.truncate(size);
                 } else {
+                    self.stats.zeroed_bytes += ((size - buf.len()) * std::mem::size_of::<f32>()) as u64;
                     buf.resize(size, 0.0);
                 }
                 buf
@@ -260,7 +289,7 @@ impl SizeClassPool {
         }
         let class = bucket_for(buf.len());
         let added_bytes = buf.capacity() * std::mem::size_of::<f32>();
-        if let Some(budget) = self.budget {
+        if let Some(budget) = self.budget() {
             if added_bytes > budget {
                 self.remember_eviction(buf.capacity());
                 return;
@@ -620,6 +649,8 @@ pub struct PoolStats {
     pub reuse_count: u64,
     /// Total bytes of the buffers counted in `alloc_count`.
     pub alloc_bytes: u64,
+    /// Bytes zero-filled when handing out a recycled buffer.
+    pub zeroed_bytes: u64,
     /// Peak total bytes held by the pool (cached + in-flight).
     pub peak_bytes: usize,
     /// Current bytes held in the pool's free lists.
