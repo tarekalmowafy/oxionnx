@@ -1306,8 +1306,9 @@ fn fully_writes_slot(node: &Node, idx: usize) -> bool {
         | "GatherBlockQuantized" | "com.microsoft.MultiHeadAttention" | "GroupQueryAttention" => true,
         "LayerNormalization" | "SkipLayerNormalization" => true,
         "com.microsoft.RotaryEmbedding" | "OxiAttention" | "OxiMatMulAct" => idx == 0,
-        "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "Concat" | "Transpose"
+        "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "SiLU" | "Erf" | "Concat" | "Transpose"
         | "SimplifiedLayerNormalization" => idx == 0,
+        "Slice" | "Expand" | "Tile" => idx == 0,
         _ => false,
     }
 }
@@ -1327,7 +1328,7 @@ fn trace_path(node: &Node, path: &str) {
 /// slots; each of these kernels still sets its output shape itself.
 fn shape_depends_only_on_input_shapes(node: &Node, weights: &HashMap<String, Tensor>) -> bool {
     match node.op.as_str() {
-        "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "Concat" | "Transpose"
+        "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "SiLU" | "Erf" | "Concat" | "Transpose"
         | "SimplifiedLayerNormalization" => true,
         "SkipSimplifiedLayerNormalization" | "com.microsoft.RotaryEmbedding" | "OxiAttention" | "OxiMatMulAct"
         | "OxiMatMulSplit" | "MatMulNBits" | "OxiMatMulNBits" | "GatherBlockQuantized" => true,
@@ -1338,6 +1339,11 @@ fn shape_depends_only_on_input_shapes(node: &Node, weights: &HashMap<String, Ten
         "com.microsoft.MultiHeadAttention" | "GroupQueryAttention" => true,
         // `split` sizes may come from a runtime tensor.
         "Split" => node.inputs.get(1).is_none_or(|n| n.is_empty() || weights.contains_key(n)),
+        // The output shape also depends on the starts/ends/shape/repeats *values*,
+        // which exporters derive from input shapes (`Shape -> Gather -> ..`). A
+        // stale learned shape only mis-sizes the pooled slot: these kernels resize
+        // it and set the output shape themselves.
+        "Slice" | "Expand" | "Tile" => true,
         _ => false,
     }
 }

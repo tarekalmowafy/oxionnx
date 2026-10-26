@@ -53,7 +53,29 @@ pub fn slice(
     axes: Option<&[i64]>,
     steps: Option<&[i64]>,
 ) -> Result<Tensor, String> {
-    let ndim = x.ndim();
+    let plan = slice_plan(&x.shape, starts, ends, axes, steps)?;
+    let mut out = vec![0.0f32; plan.out_shape.iter().product()];
+    crate::datamove::slice_into(x, &plan.start, &plan.step, &plan.out_shape, &mut out);
+    Ok(Tensor::new(out, plan.out_shape))
+}
+
+/// Resolved per-axis view of a `Slice`: output axis `d` reads input positions
+/// `start[d] + k * step[d]` for `k < out_shape[d]`, all inside the input.
+pub(crate) struct SlicePlan {
+    pub start: Vec<i64>,
+    pub step: Vec<i64>,
+    pub out_shape: Vec<usize>,
+}
+
+/// [`slice`]'s argument normalisation and output shape, for an input of shape `shape`.
+pub(crate) fn slice_plan(
+    shape: &[usize],
+    starts: &[i64],
+    ends: &[i64],
+    axes: Option<&[i64]>,
+    steps: Option<&[i64]>,
+) -> Result<SlicePlan, String> {
+    let ndim = shape.len();
     let default_axes: Vec<i64> = (0..starts.len() as i64).collect();
     let axes = axes.unwrap_or(&default_axes);
     let default_steps: Vec<i64> = vec![1; starts.len()];
@@ -72,12 +94,12 @@ pub fn slice(
     // Per-axis (start, end, step) as signed values; axes not mentioned default to a full
     // forward pass (0..dim, step 1).
     let mut dim_start: Vec<i64> = vec![0; ndim];
-    let mut dim_end: Vec<i64> = x.shape.iter().map(|&d| d as i64).collect();
+    let mut dim_end: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
     let mut dim_step: Vec<i64> = vec![1; ndim];
 
     for (i, &raw_ax) in axes.iter().enumerate() {
         let ax = normalize_axis(raw_ax, ndim)?;
-        let dim = x.shape[ax] as i64;
+        let dim = shape[ax] as i64;
         let step = steps[i];
         if step == 0 {
             return Err(format!("slice: steps[{i}] must not be 0"));
@@ -128,38 +150,9 @@ pub fn slice(
         })
         .collect();
 
-    let out_n: usize = out_shape.iter().product();
-    let mut out = Vec::with_capacity(out_n);
-    if out_n == 0 {
-        return Ok(Tensor::new(out, out_shape));
-    }
-
-    let mut strides = vec![0usize; ndim];
-    let mut s = 1usize;
-    for i in (0..ndim).rev() {
-        strides[i] = s;
-        s *= x.shape[i];
-    }
-    let mut out_strides = vec![0usize; ndim];
-    let mut s = 1usize;
-    for i in (0..ndim).rev() {
-        out_strides[i] = s;
-        s *= out_shape[i];
-    }
-    for out_idx in 0..out_n {
-        let mut rem = out_idx;
-        // Signed accumulator: a negative step walks `dim_start` downward, and by construction
-        // (the clamp + out_shape length above) every coordinate visited stays in `[0, dim)`.
-        let mut in_idx: i64 = 0;
-        for d in 0..ndim {
-            let coord = rem / out_strides[d];
-            rem %= out_strides[d];
-            let in_coord = dim_start[d] + coord as i64 * dim_step[d];
-            in_idx += in_coord * strides[d] as i64;
-        }
-        out.push(x.data[in_idx as usize]);
-    }
-    Ok(Tensor::new(out, out_shape))
+    // Every visited coordinate stays in `[0, dim)` by construction (the clamp and the
+    // `out_shape` length above), so the strided view is in bounds.
+    Ok(SlicePlan { start: dim_start, step: dim_step, out_shape })
 }
 
 /// Pad tensor with constant, reflect, edge, or wrap values, honoring the opset-18 `axes` input.
@@ -399,28 +392,7 @@ pub fn tile(x: &Tensor, repeats: &[usize]) -> Result<Tensor, String> {
     }
     let out_shape: Vec<usize> = x.shape.iter().zip(repeats).map(|(&d, &r)| d * r).collect();
     let out_n: usize = out_shape.iter().product();
-    let mut out_strides = vec![0usize; ndim];
-    let mut s = 1usize;
-    for i in (0..ndim).rev() {
-        out_strides[i] = s;
-        s *= out_shape[i];
-    }
-    let mut in_strides = vec![0usize; ndim];
-    let mut s = 1usize;
-    for i in (0..ndim).rev() {
-        in_strides[i] = s;
-        s *= x.shape[i];
-    }
     let mut out = vec![0.0f32; out_n];
-    for (out_idx, out_val) in out.iter_mut().enumerate() {
-        let mut rem = out_idx;
-        let mut in_idx = 0usize;
-        for d in 0..ndim {
-            let coord = rem / out_strides[d];
-            rem %= out_strides[d];
-            in_idx += (coord % x.shape[d]) * in_strides[d];
-        }
-        *out_val = x.data[in_idx];
-    }
+    crate::datamove::tile_into(x, repeats, &mut out);
     Ok(Tensor::new(out, out_shape))
 }

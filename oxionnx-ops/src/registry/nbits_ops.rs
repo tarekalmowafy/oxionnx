@@ -777,9 +777,11 @@ mod tests {
                 }
             };
             if n == 128 {
-                for gate in [0i64, 1] {
+                let silu = |x: f32| x / (1.0 + (-x).exp());
+                for (gate, activation) in [(0i64, "gelu"), (1, "gelu"), (0, "silu"), (1, "silu")] {
+                    let gelu = |x: f32| if activation == "silu" { silu(x) } else { gelu(x) };
                     let mut nd = node("OxiMatMulAct", &["a", "p"], &[("gate", gate), ("nbits", 1)], &[]);
-                    nd.attrs.strings.insert("activation".into(), "gelu".into());
+                    nd.attrs.strings.insert("activation".into(), activation.into());
                     nd.attrs.strings.insert("approximate".into(), "tanh".into());
                     let got = run(&OxiMatMulActOp::default(), &nd, &pw, &[Some(&a), Some(p)]).unwrap();
                     assert_eq!(got.shape, vec![1, m, n / 2]);
@@ -791,7 +793,7 @@ mod tests {
                             if gate == 0 { gelu(lo) * hi } else { gelu(hi) * lo }
                         })
                         .collect();
-                    close(&got.data, &want, &format!("gated gate={gate} bits={bits}"));
+                    close(&got.data, &want, &format!("gated {activation} gate={gate} bits={bits}"));
                 }
             } else {
                 let mut nd = node("OxiMatMulSplit", &["a", "p"], &[("nbits", 1)], &[("split", vec![32, 64])]);

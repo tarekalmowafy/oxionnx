@@ -11,7 +11,6 @@
 //!   RmsNorm, InstanceNorm, LpNorm, MeanVarianceNorm)
 
 mod activations;
-pub(crate) use activations::gelu_exact;
 mod normalization;
 mod parameterized;
 

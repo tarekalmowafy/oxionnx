@@ -4,8 +4,9 @@
 //! MatMul+Transpose fusion, Add+MatMul→Gemm fusion, Conv+Add+Relu (ResNet),
 //! Gather+Gather composition, Dropout elimination, Transpose+Reshape simplification,
 //! spatial (InstanceNorm-style) normalization chains, scaled dot-product attention,
-//! MatMul + GELU (plain and gated), MatMul + Split projections (with head norm
-//! and rotary), residual Add + norm (`Skip[Simplified]LayerNormalization`).
+//! written-out exact GELU, MatMul + GELU / SiLU (plain and gated), MatMul + Split
+//! projections (with head norm and rotary), residual Add + norm
+//! (`Skip[Simplified]LayerNormalization`).
 //!
 //! All of them are wired into [`crate::optimizer::optimize_with_level`] at
 //! `PassLevel::Extended` and above, except `fuse_conv_add_relu`,
@@ -20,17 +21,21 @@
 
 mod attention;
 mod conv;
+mod gelu_erf;
 mod instance_norm;
 mod matmul;
 mod matmul_act;
 mod matmul_split;
+mod repeat_kv;
 mod simplify;
 mod skip_norm;
 
 pub use attention::fuse_attention;
+pub use gelu_erf::fuse_gelu_erf;
 pub use instance_norm::fuse_instance_norm;
 pub use matmul_act::fuse_matmul_act;
 pub use matmul_split::fuse_matmul_split;
+pub use repeat_kv::fuse_repeat_kv;
 pub use skip_norm::fuse_skip_norm;
 
 pub use conv::{

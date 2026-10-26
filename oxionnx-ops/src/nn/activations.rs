@@ -278,19 +278,10 @@ pub fn silu(x: &Tensor) -> Tensor {
     silu_impl(x)
 }
 
-#[cfg(feature = "simd")]
 fn silu_impl(x: &Tensor) -> Tensor {
-    let mut data = x.data.clone();
-    crate::simd_ops::simd_silu(&mut data);
+    let mut data = vec![0.0; x.data.len()];
+    crate::gelu::apply_par(crate::gelu::Kind::Silu, &x.data, None, &mut data);
     Tensor::new(data, x.shape.clone())
-}
-
-#[cfg(not(feature = "simd"))]
-fn silu_impl(x: &Tensor) -> Tensor {
-    Tensor::new(
-        x.data.iter().map(|&v| v / (1.0 + (-v).exp())).collect(),
-        x.shape.clone(),
-    )
 }
 
 /// HardSigmoid: y = clamp(alpha * x + beta, 0, 1)
