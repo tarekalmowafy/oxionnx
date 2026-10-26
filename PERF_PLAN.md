@@ -166,7 +166,7 @@ The MatMul, QKV and attention fusions were written against EmbeddingGemma-2's gr
 
 ## Phase 5: precision and quantisation
 
-### [~] P5.1 BF16 weights accuracy on jina-embeddings-v5-text-nano ([#PR_P51](https://github.com/tarekalmowafy/oxionnx/pull/PR_P51))
+### [~] P5.1 BF16 weights accuracy on jina-embeddings-v5-text-nano ([#17](https://github.com/tarekalmowafy/oxionnx/pull/17))
 - **Problem:** with `OXIONNX_BF16_WEIGHTS=1`, the minimum cosine against FP32 is 0.9974 (all other models ≥ 0.9999).
 - **Plan:** find the sensitive projections by switching BF16 per layer, then keep those in FP32 by default, or expose a per-op opt-out.
 - **Finding:** the plan's premise was wrong. The weights are not the cause: jina's (like most zoo checkpoints') are stored in BF16, so packing them as BF16 is exact (FP32 GEMM on BF16-rounded weights: cos 1.000000). The error comes from rounding the *activations* to BF16 in the kernel. A few inputs amplify that ~240x across the layers (doc batches: min 0.973, 2 of 32 docs), and no projection type or layer subset is responsible: keeping any one type, or the first/last half of the layers, in FP32 still leaves 0.85-0.9998, non-monotonically. A per-op rule cannot fix it.
