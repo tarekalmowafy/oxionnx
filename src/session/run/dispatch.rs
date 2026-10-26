@@ -1305,7 +1305,7 @@ fn fully_writes_slot(node: &Node, idx: usize) -> bool {
         "Split" | "SkipSimplifiedLayerNormalization" | "OxiMatMulSplit" | "MatMulNBits" | "OxiMatMulNBits"
         | "GatherBlockQuantized" | "com.microsoft.MultiHeadAttention" | "GroupQueryAttention" => true,
         "LayerNormalization" | "SkipLayerNormalization" => true,
-        "com.microsoft.RotaryEmbedding" | "OxiAttention" | "OxiMatMulAct" => idx == 0,
+        "com.microsoft.RotaryEmbedding" | "OxiAttention" | "OxiMatMulAct" | "OxiRotateHalf" => idx == 0,
         "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "SiLU" | "Erf" | "Concat" | "Transpose"
         | "SimplifiedLayerNormalization" => idx == 0,
         "Slice" | "Expand" | "Tile" => idx == 0,
@@ -1331,7 +1331,7 @@ fn shape_depends_only_on_input_shapes(node: &Node, weights: &HashMap<String, Ten
         "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "SiLU" | "Erf" | "Concat" | "Transpose"
         | "SimplifiedLayerNormalization" => true,
         "SkipSimplifiedLayerNormalization" | "com.microsoft.RotaryEmbedding" | "OxiAttention" | "OxiMatMulAct"
-        | "OxiMatMulSplit" | "MatMulNBits" | "OxiMatMulNBits" | "GatherBlockQuantized" => true,
+        | "OxiRotateHalf" | "OxiMatMulSplit" | "MatMulNBits" | "OxiMatMulNBits" | "GatherBlockQuantized" => true,
         "LayerNormalization" | "SkipLayerNormalization" => true,
         // Outputs depend on input shapes only (GQA's present length also on
         // `total_sequence_length`, fixed by the input shapes in practice; the

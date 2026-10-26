@@ -115,14 +115,45 @@ These items mostly touch independent files and can proceed in parallel.
 
 The MatMul, QKV and attention fusions were written against EmbeddingGemma-2's graph. BERT, ModernBERT, GTE and Qwen3-style exports from onnx-community / Optimum mostly miss them. One symptom: granite-97m-multilingual queries go only from 20.4 to 17.4 ms with 8× the threads.
 
-### [ ] P2.1 Projection fusions for HF exports
+### [x] P2.1 Projection fusions for HF exports ([#21](https://github.com/tarekalmowafy/oxionnx/pull/21))
 - **Plan:** extend `OxiMatMulSplit` (QKV projection, split, and optional rotary or head norm) and the MatMul + bias epilogue to the projection patterns of BERT, ModernBERT, GTE and Qwen3 exports. These include separate Q/K/V MatMuls sharing an input, to be packed into one GEMM, plus `Add` bias, Reshape/Transpose to heads, and `com.microsoft.RotaryEmbedding`.
 - **Files:** `src/optimizer/fusion/matmul_split.rs`, `src/optimizer/fusion/matmul_act.rs`, `oxionnx-ops/src/fused_matmul.rs`.
+- **What it took**, by measured payoff (doc-b8 profiles on master):
+  - The written-out rotary (`Slice`/`Split`, `Neg`, `Concat`, 2× `Mul`, `Add`) of granite-en/small/97m/311m and arctic is now one `OxiRotateHalf`. It is bit-identical, with cos/sin broadcast in either head layout.
+  - Eager attention (arctic, the granite-ml torch exports) now fuses into `OxiAttention`. Q/K/V sit behind head transposes or are already head-major, scalar scales apply to Q and Kᵀ, and the output reshape is computed at run time. `OxiAttention` takes 4-D Q/K/V in either layout.
+  - Separate Q/K/V MatMuls of one input are packed into one `MatMul → Split` (`pack_shared_projections`), which `OxiMatMulSplit` then absorbs together with each output's own head norm (Qwen3 q_norm/k_norm) and rotary.
+  - Both need the exports' shape arithmetic resolved under a symbolic batch/sequence: `Shape(q)[3]/2` slice bounds, `1/sqrt(Shape(q)[-1])` scales. `shape_values` propagates partially known shapes and folds those. Two cleanups also landed: `Constant` nodes now become weights before fusion, and the node list is stably topologically sorted (and DCE no longer assumes order).
+- **Result** (ms, oxionnx FP32, master → PR, ORT in brackets; cosine vs ORT 1.0000000 on all 11 zoo models and EmbeddingGemma-2, queries and doc-b8):
+  - 8 docs, 8 threads:
+    - granite-97m: 135 → 97 (231)
+    - granite-311m: 439 → 334 (524)
+    - arctic: 326 → 297 (353)
+    - granite-en: 363 → 338 (475)
+    - granite-small: 112 → 101 (168)
+    - pplx: 1143 → 1114
+    - qwen3: 1307 → 1281
+    - gemma, voyage, jina: ±1%
+  - BF16, 8 docs: granite-311m 328 → 229, arctic 218 → 182.
+  - Query, 8 threads: −7..−16% on 10 models (arctic 16.2 → 13.6, ORT 15.6, so arctic now beats ORT here too; pplx 33.5 → 30.5; qwen3 35.3 → 32.7). granite-en reads +6% in the sweep but −1% in an interleaved A/B.
+  - Query, 1 thread: −2..−6% on the granite models; harrier-0.6b/pplx/jina read +2..6% in the sweep but +0.5/+1.5% in an interleaved A/B (GEMM-bound, at noise level).
+  - Per-op, doc-b8: granite-311m Split 41 + Transpose 38 + Softmax 19 + rotary ops ~35 → `OxiAttention` 40 + `OxiRotateHalf` 13; Qwen3-family `RotaryEmbedding` (22–27) and head-norm SLNs (11–17) go to 0.
+- **Not done / open:** granite-ml still materialises its 5-D QKV `Transpose` + `Split` (9 + 7 ms on 311m). The rotary of granite-en/ml/arctic could move into the `OxiMatMulSplit` epilogue (cos/sin are run-time tensors there). The packed Q/K/V GEMM with norm + rotary epilogue costs about what the separate ops did on qwen3/jina doc batches (net −2%/+1%).
 
-### [ ] P2.2 Run contrib attention ops on the packed-GEMM attention kernel
+### [x] P2.2 Run contrib attention ops on the packed-GEMM attention kernel ([#21](https://github.com/tarekalmowafy/oxionnx/pull/21))
 - **Plan:** run `com.microsoft.MultiHeadAttention` and `com.microsoft.GroupQueryAttention` (added in #11) on the packed AVX-512/AVX2 GEMM that `OxiAttention` uses for QKᵀ and PV, with the same blocking and threading.
 - **Current cost:** MHA/GQA time is 140–144 ms against ORT's 199–221 ms on the 0.6B models, so this item is mostly about thread scaling and the small models.
 - **Files:** `oxionnx-ops/src/registry/contrib_attention.rs`, `oxionnx-ops/src/contrib.rs`.
+- **Result:** no kernel change was needed. Since #11/#14, both contrib ops already call `contrib::attention_ext_into`, the kernel `OxiAttention` uses: Kᵀ/V are packed once per (batch, KV head) for the packed GEMM, with the same row blocking and rayon split. The `kv_bnsh` flag from phase 1 still works, and this PR adds `q_bnsh`. Attention op time, doc-b8 at 8 threads, oxionnx vs ORT:
+  - qwen3 98 vs 249
+  - pplx 104 vs 188
+  - harrier-0.6b 111 vs 225
+  - granite-en 48 vs 154
+  - voyage 41 vs 84
+  - jina 24 vs 71
+  - granite-small 18 vs 63
+  - harrier-270m 62 vs 55 (the only one behind)
+
+  Query at 8 threads: 0.4–1.5 ms against ORT's 0.4–3.0. Not worth more work now.
 
 ### [x] P2.3 `SkipLayerNormalization` / `SkipSimplifiedLayerNormalization` for all exporters ([#16](https://github.com/tarekalmowafy/oxionnx/pull/16))
 - **Plan:** match the residual `Add` + norm pairs these exports use, and keep the native ops on the output-slot path.

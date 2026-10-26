@@ -142,7 +142,8 @@ pub struct SplitSpec<'a> {
     /// Output column counts, summing to the weight's `n`.
     pub splits: Vec<usize>,
     pub bias: Option<&'a [f32]>,
-    pub norm: Option<HeadNorm<'a>>,
+    /// Per output: the per-head RMSNorm (all with the same head width).
+    pub norms: Vec<Option<HeadNorm<'a>>>,
     pub col_scale: Option<&'a [f32]>,
     pub rotary: Option<SplitRotary<'a>>,
     /// Per output: apply `rotary` (its heads are then `rotary`'s head size wide).
@@ -151,10 +152,15 @@ pub struct SplitSpec<'a> {
 
 impl SplitSpec<'_> {
     /// Column block that never straddles an output or a head: the head width
-    /// when there is a norm or rotary, else the largest common divisor of the
-    /// splits. `head` is the rotary head size, if any.
+    /// when there is a norm or rotary, else the largest of 256/128/64/32 that
+    /// divides every split (the splits' common divisor if none does). `head` is the rotary head size, if any.
     pub fn block(&self, head: Option<usize>) -> Option<usize> {
-        let d = self.norm.map(|n| n.gamma.len()).or(head);
+        let mut widths = self.norms.iter().flatten().map(|n| n.gamma.len());
+        let norm_d = widths.next();
+        if widths.any(|w| Some(w) != norm_d) {
+            return None;
+        }
+        let d = norm_d.or(head);
         let gcd = |mut a: usize, mut b: usize| {
             while b != 0 {
                 (a, b) = (b, a % b);
@@ -165,7 +171,9 @@ impl SplitSpec<'_> {
         match d {
             Some(d) if d > 0 && g % d == 0 && head.is_none_or(|h| h == d) => Some(d),
             Some(_) => None,
-            None => (g > 0).then_some(g),
+            // The GEMM's own column blocking is at most 256 wide; a wider
+            // epilogue block (e.g. 768 for a plain Q/K/V split) slows it down.
+            None => (g > 0).then(|| [256, 128, 64, 32].into_iter().find(|w| g % w == 0).unwrap_or(g)),
         }
     }
 
@@ -183,12 +191,13 @@ impl SplitSpec<'_> {
 
     /// Finish columns `j0..j0 + v.len()` of product row `i` (one block; `v` is
     /// scratch) and write them to `out`, the matching slice of their output.
-    fn finish(&self, i: usize, j0: usize, rotate: bool, v: &mut [f32], out: &mut [f32]) {
+    fn finish(&self, i: usize, j0: usize, o: usize, v: &mut [f32], out: &mut [f32]) {
+        let rotate = self.rotate[o];
         let w = v.len();
         if let Some(b) = self.bias {
             v.iter_mut().zip(&b[j0..j0 + w]).for_each(|(x, b)| *x += b);
         }
-        if let Some(HeadNorm { gamma, eps }) = self.norm {
+        if let Some(HeadNorm { gamma, eps }) = self.norms.get(o).copied().flatten() {
             let mut lanes = [0.0f32; 8];
             let mut chunks = v.chunks_exact(8);
             for c in &mut chunks {
@@ -224,7 +233,7 @@ pub fn matmul_split_unfused(m: usize, product: &mut [f32], spec: &SplitSpec<'_>,
             let (o, start) = spec.output_of(j0);
             let w = spec.splits[o];
             let dst = &mut outs[o][i * w + j0 - start..i * w + j0 - start + block];
-            spec.finish(i, j0, spec.rotate[o], v, dst);
+            spec.finish(i, j0, o, v, dst);
         }
     }
 }
@@ -343,7 +352,7 @@ mod packed {
                 let i = i0 + r;
                 // SAFETY: row i, columns j0-start.. of output o belong to this block only.
                 let dst = std::slice::from_raw_parts_mut(self.outs[o].0.add(i * w + j0 - start), self.block);
-                self.spec.finish(i, j0, self.spec.rotate[o], v, dst);
+                self.spec.finish(i, j0, o, v, dst);
             }
         }
     }
@@ -469,7 +478,8 @@ mod tests {
                 let spec = SplitSpec {
                     splits: splits.clone(),
                     bias: (variant % 2 == 1).then_some(&bias[..]),
-                    norm: (variant >= 1).then_some(HeadNorm { gamma: &gamma, eps: 1e-6 }),
+                    // Variant 2 norms only the first output (per-output norms).
+                    norms: (0..splits.len()).map(|o| (variant == 1 || variant == 3 || (variant == 2 && o == 0)).then_some(HeadNorm { gamma: &gamma, eps: 1e-6 })).collect(),
                     col_scale: (variant >= 1).then_some(&cs[..]),
                     rotary,
                     rotate: (0..splits.len()).map(|o| o < 2).collect(),
