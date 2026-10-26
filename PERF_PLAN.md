@@ -158,7 +158,7 @@ The MatMul, QKV and attention fusions were written against EmbeddingGemma-2's gr
   - Review activation-pool sizing.
   - Reuse slots across unfused chains.
 
-### [x] P4.2 Large `Gather` tables ([#17](https://github.com/tarekalmowafy/oxionnx/pull/17))
+### [x] P4.2 Large `Gather` tables ([#18](https://github.com/tarekalmowafy/oxionnx/pull/18))
 - **Problem:** embedding tables such as EmbeddingGemma's 537 MB token embeddings are kept fully resident as FP32. ORT and llama.cpp memory-map theirs and only touch the rows a batch uses.
 - **Plan:** keep `Gather`-only initializers in the mapped file, or as BF16, and decode rows on demand.
 - **Done:** tables of at least 4 MiB that only `Gather` (axis 0) or `GatherBlockQuantized` read stay in the mmap'd `.onnx` / external-data file (MADV_RANDOM), and the ops read only the rows they need. Tied tables, graph outputs and `with_keep_weights` are decoded as before. The BF16 option turned out to be unnecessary, because mapping also covers BF16 mode and inline models.
