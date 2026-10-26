@@ -150,7 +150,7 @@ The MatMul, QKV and attention fusions were written against EmbeddingGemma-2's gr
 
 ## Phase 4: memory
 
-### [x] P4.1 Activation memory ([#20](https://github.com/tarekalmowafy/oxionnx/pull/20))
+### [x] P4.1 Activation memory ([#23](https://github.com/tarekalmowafy/oxionnx/pull/23))
 - **Problem:** peak RSS on the newer models is 1.1–2.5× ORT's and 2–4× llama-server's. For example, Qwen3 peaks at 4533 MiB on oxionnx FP32, 2861 MiB on ORT and 2153 MiB on llama-server.
 - **Plan:**
   - Stop materialising `repeat_kv` and similar broadcast copies (P1.2).
