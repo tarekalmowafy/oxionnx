@@ -64,11 +64,13 @@ where
 const MAP_CHUNK: usize = 16 * 1024;
 
 /// `data[i] = f(data[i])`, in parallel for large tensors.
+#[inline]
 pub(crate) fn map_inplace(data: &mut [f32], f: impl Fn(f32) -> f32 + Sync + Send) {
     for_each_row(data, MAP_CHUNK, |_, c| c.iter_mut().for_each(|x| *x = f(*x)));
 }
 
 /// `dst[i] = f(src[i])` (equal lengths), in parallel for large tensors.
+#[inline]
 pub(crate) fn map_into(src: &[f32], dst: &mut [f32], f: impl Fn(f32) -> f32 + Sync + Send) {
     debug_assert_eq!(src.len(), dst.len());
     for_each_row(dst, MAP_CHUNK, |ci, c| {

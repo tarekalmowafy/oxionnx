@@ -123,8 +123,8 @@ macro_rules! unary_op_inplace {
                 mut input: Tensor,
                 _ctx: &OpContext<'_>,
             ) -> Result<Vec<Tensor>, OnnxError> {
-                let f: fn(f32) -> f32 = $inplace_fn;
-                crate::par::map_inplace(&mut input.data, f);
+                // The op itself, not a `fn` pointer, so it inlines and vectorizes.
+                crate::par::map_inplace(&mut input.data, $inplace_fn);
                 Ok(vec![input])
             }
             fn native_dtypes(&self) -> &'static [oxionnx_core::DType] {
@@ -162,7 +162,7 @@ macro_rules! unary_op_inplace {
                 let out = &mut slots[0];
                 let f: fn(f32) -> f32 = $inplace_fn;
                 if out.shape == input.shape && out.data.len() == input.data.len() {
-                    crate::par::map_into(&input.data, &mut out.data, f);
+                    crate::par::map_into(&input.data, &mut out.data, $inplace_fn);
                 } else {
                     let data: Vec<f32> = input.data.iter().map(|&v| f(v)).collect();
                     *out = oxionnx_core::Tensor::new(data, input.shape.clone());
@@ -202,8 +202,8 @@ macro_rules! unary_op_inplace_exact_int {
                 mut input: Tensor,
                 _ctx: &OpContext<'_>,
             ) -> Result<Vec<Tensor>, OnnxError> {
-                let f: fn(f32) -> f32 = $inplace_fn;
-                crate::par::map_inplace(&mut input.data, f);
+                // The op itself, not a `fn` pointer, so it inlines and vectorizes.
+                crate::par::map_inplace(&mut input.data, $inplace_fn);
                 Ok(vec![input])
             }
             fn native_dtypes(&self) -> &'static [oxionnx_core::DType] {
@@ -270,7 +270,7 @@ macro_rules! unary_op_inplace_exact_int {
                 let out = &mut slots[0];
                 let f: fn(f32) -> f32 = $inplace_fn;
                 if out.shape == input.shape && out.data.len() == input.data.len() {
-                    crate::par::map_into(&input.data, &mut out.data, f);
+                    crate::par::map_into(&input.data, &mut out.data, $inplace_fn);
                 } else {
                     let data: Vec<f32> = input.data.iter().map(|&v| f(v)).collect();
                     *out = oxionnx_core::Tensor::new(data, input.shape.clone());
