@@ -251,6 +251,109 @@ pub fn rotate_head(xi: &[f32], c: &[f32], sn: &[f32], rotary_dim: usize, interle
     o[rotary_dim..xi.len()].copy_from_slice(&xi[rotary_dim..]);
 }
 
+// ── Written-out rotary (rotate_half) ─────────────────────────────────────────
+
+/// Element strides of `shape` broadcast onto `target` (left-padded), 0 on
+/// broadcast axes; `None` unless `shape` broadcasts to exactly `target`.
+pub fn broadcast_strides(shape: &[usize], target: &[usize]) -> Option<Vec<usize>> {
+    if shape.len() > target.len() {
+        return None;
+    }
+    let pad = target.len() - shape.len();
+    let mut strides = vec![0; target.len()];
+    let mut acc = 1;
+    for i in (0..shape.len()).rev() {
+        let (d, t) = (shape[i], target[pad + i]);
+        if d != 1 && d != t {
+            return None;
+        }
+        strides[pad + i] = if d == 1 { 0 } else { acc };
+        acc *= d;
+    }
+    Some(strides)
+}
+
+/// A `cos` or `sin` operand of [`rotate_half_into`], broadcast to `x`.
+#[derive(Clone, Copy)]
+pub struct RotateHalfTable<'a> {
+    pub data: &'a [f32],
+    pub shape: &'a [usize],
+}
+
+/// `out = x * cos + rotate_half(x) * sin`, the rotary embedding HF exports
+/// write out op by op, with `rotate_half(x) = concat(-x[.., hi], x[.., lo])`
+/// along the last axis of `x` (`lo`/`hi` are column ranges whose widths sum to
+/// that axis). `cos`/`sin` broadcast to `x`'s shape (any layout: `[B, S, 1, D]`
+/// against `[B, S, H, D]`, `[1, 1, S, D]` against `[B, H, S, D]`, ...).
+///
+/// Computes exactly what the unfused `Mul`/`Neg`/`Concat`/`Mul`/`Add` chain
+/// computes (`x*c + (-y)*s` is `x*c - y*s` in IEEE arithmetic).
+pub fn rotate_half_into(
+    x: &[f32],
+    shape: &[usize],
+    cos: RotateHalfTable<'_>,
+    sin: RotateHalfTable<'_>,
+    lo: std::ops::Range<usize>,
+    hi: std::ops::Range<usize>,
+    out: &mut [f32],
+) -> Result<(), String> {
+    let d = *shape.last().ok_or("rotate_half: scalar input")?;
+    let numel: usize = shape.iter().product();
+    if x.len() != numel || out.len() != numel || cos.data.len() != cos.shape.iter().product::<usize>() || sin.data.len() != sin.shape.iter().product::<usize>() {
+        return Err(format!("rotate_half: buffer sizes do not match {shape:?}"));
+    }
+    if lo.end > d || hi.end > d || lo.len() + hi.len() != d {
+        return Err(format!("rotate_half: halves {lo:?} / {hi:?} do not split the last axis ({d})"));
+    }
+    let cs = broadcast_strides(cos.shape, shape).ok_or_else(|| format!("rotate_half: cos {:?} does not broadcast to {shape:?}", cos.shape))?;
+    let ss = broadcast_strides(sin.shape, shape).ok_or_else(|| format!("rotate_half: sin {:?} does not broadcast to {shape:?}", sin.shape))?;
+    if numel == 0 {
+        return Ok(());
+    }
+    let lead = &shape[..shape.len() - 1];
+    let rows = numel / d;
+    // Offset of the cos/sin row for row `r` of x (leading axes in row-major order).
+    let offset = |r: usize, st: &[usize]| {
+        let (mut r, mut off) = (r, 0);
+        for i in (0..lead.len()).rev() {
+            off += (r % lead[i]) * st[i];
+            r /= lead[i];
+        }
+        off
+    };
+    let (cj, sj) = (cs[shape.len() - 1], ss[shape.len() - 1]);
+    let wh = hi.len();
+    let op = SendPtr(out.as_mut_ptr());
+    let min_rows = (crate::par::MIN_ELEMS_PER_TASK / d).max(1);
+    par_ranges(rows, min_rows, |r0, r1| {
+        let op = op;
+        for r in r0..r1 {
+            let xi = &x[r * d..(r + 1) * d];
+            let (co, so) = (offset(r, &cs), offset(r, &ss));
+            // SAFETY: row `r` is written by this task only.
+            let o = unsafe { std::slice::from_raw_parts_mut(op.0.add(r * d), d) };
+            if cj == 1 && sj == 1 {
+                let (c, s) = (&cos.data[co..co + d], &sin.data[so..so + d]);
+                let (o1, o2) = o.split_at_mut(wh);
+                let (x1, x2) = xi.split_at(wh);
+                let (yh, yl) = (&xi[hi.clone()], &xi[lo.clone()]);
+                for j in 0..wh {
+                    o1[j] = x1[j] * c[j] - yh[j] * s[j];
+                }
+                for j in 0..d - wh {
+                    o2[j] = x2[j] * c[wh + j] + yl[j] * s[wh + j];
+                }
+            } else {
+                for j in 0..d {
+                    let (c, s) = (cos.data[co + j * cj], sin.data[so + j * sj]);
+                    o[j] = if j < wh { xi[j] * c - xi[hi.start + j] * s } else { xi[j] * c + xi[lo.start + j - wh] * s };
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
 // ── Fused attention ──────────────────────────────────────────────────────────
 
 /// Geometry of one fused attention call.
@@ -320,6 +423,9 @@ pub struct AttnExt<'a> {
     pub sink: AttnSink<'a>,
     /// K/V are `[B, Hkv, T, D]` (head-major) instead of `[B, T, Hkv*D]`.
     pub kv_bnsh: bool,
+    /// Q is `[B, Hq, S, D]` (head-major) instead of `[B, S, Hq*D]`. The output
+    /// is `[B, S, Hq*D]` either way.
+    pub q_bnsh: bool,
 }
 
 impl AttnExt<'_> {
@@ -388,6 +494,8 @@ pub fn attention_ext_into(
     }
     let group = q_heads / kv_heads;
     // K/V element strides per batch, per KV head and per key row.
+    // Q element strides per batch, per head and per query row.
+    let (qbs, qhs, qrow) = if ext.q_bnsh { (q_heads * seq_q * head_dim, seq_q * head_dim, head_dim) } else { (seq_q * qrs, head_dim, qrs) };
     let (kbs, khs, krow) = if ext.kv_bnsh {
         (kv_heads * seq_kv * head_dim, seq_kv * head_dim, head_dim)
     } else {
@@ -430,7 +538,7 @@ pub fn attention_ext_into(
         let s0 = blk * rows_per;
         let m = rows_per.min(seq_q - s0);
         scores.resize(m * seq_kv, 0.0);
-        let qp = q[(b * seq_q + s0) * qrs + h * head_dim..].as_ptr();
+        let qp = q[b * qbs + h * qhs + s0 * qrow..].as_ptr();
         let kp = k[b * kbs + g * khs..].as_ptr();
         let vp = v[b * kbs + g * khs..].as_ptr();
         let pk = packs.as_ref().map(|p| &p[b * kv_heads + g]);
@@ -441,14 +549,14 @@ pub fn attention_ext_into(
             #[cfg(target_arch = "x86_64")]
             Some((kt, _)) => unsafe {
                 // scores[m, T] = Q[m, D] · Kᵀ; `scale` is applied with the bias below.
-                crate::gemm_packed::gemm_strided_serial(m, qp, qrs, kt, scores.as_mut_ptr(), seq_kv);
+                crate::gemm_packed::gemm_strided_serial(m, qp, qrow, kt, scores.as_mut_ptr(), seq_kv);
             },
             _ => unsafe {
                 // scores[m, T] = scale * Q[m, D] · K[T, D]ᵀ
                 row_scale = 1.0;
                 matrixmultiply::sgemm(
                     m, head_dim, seq_kv, scale,
-                    qp, qrs as isize, 1,
+                    qp, qrow as isize, 1,
                     kp, 1, krow as isize,
                     0.0, scores.as_mut_ptr(), seq_kv as isize, 1,
                 );
@@ -641,6 +749,44 @@ mod tests {
                 }
             }
             close(&got, &want, 1e-6);
+        }
+    }
+
+    #[test]
+    fn head_major_q_and_kv_match_row_major() {
+        // [B, S, H, D] -> [B, H, S, D]
+        fn to_bnsh(x: &[f32], b: usize, s: usize, h: usize, d: usize) -> Vec<f32> {
+            let mut o = vec![0.0; x.len()];
+            for bi in 0..b {
+                for si in 0..s {
+                    for hi in 0..h {
+                        o[((bi * h + hi) * s + si) * d..][..d].copy_from_slice(&x[((bi * s + si) * h + hi) * d..][..d]);
+                    }
+                }
+            }
+            o
+        }
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        for (b, s, t, hq, hkv, d) in [(2, 7, 7, 4, 2, 16), (1, 70, 70, 2, 2, 8), (3, 5, 9, 6, 1, 4)] {
+            let (q, k, v) = (rand(b * s * hq * d, 21), rand(b * t * hkv * d, 22), rand(b * t * hkv * d, 23));
+            let dims = AttnDims { batch: b, seq_q: s, seq_kv: t, q_heads: hq, kv_heads: hkv, head_dim: d, scale: 0.3 };
+            let bias: Vec<f32> = (0..b * t).map(|i| if i % 3 == 0 { -1e9 } else { 0.0 }).collect();
+            let ab = || Some(AttnBias { data: &bias, strides: [t, 0, 0, 0, 1] });
+            for threads in [1, 4] {
+                let run = |q: &[f32], k: &[f32], v: &[f32], ext: AttnExt<'_>| {
+                    let mut o = vec![f32::NAN; b * s * hq * d];
+                    let mut f = || attention_ext_into(q, k, v, ab(), ext, dims, &mut o).unwrap();
+                    if threads == 1 { f() } else { pool.install(f) }
+                    o
+                };
+                let want = run(&q, &k, &v, AttnExt::default());
+                let (qh, kh, vh) = (to_bnsh(&q, b, s, hq, d), to_bnsh(&k, b, t, hkv, d), to_bnsh(&v, b, t, hkv, d));
+                for (q_bnsh, kv_bnsh) in [(true, false), (false, true), (true, true)] {
+                    let ext = AttnExt { q_bnsh, kv_bnsh, ..AttnExt::default() };
+                    let got = run(if q_bnsh { &qh } else { &q }, if kv_bnsh { &kh } else { &k }, if kv_bnsh { &vh } else { &v }, ext);
+                    assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "q_bnsh={q_bnsh} kv_bnsh={kv_bnsh}");
+                }
+            }
         }
     }
 

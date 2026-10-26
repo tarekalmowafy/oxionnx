@@ -70,6 +70,63 @@ pub(crate) fn prepack_weights(
     bytes
 }
 
+/// Decide, on the optimized graph, which tables the loader left in the mapped
+/// model file stay there (see [`OperatorRegistry::mapped_weight`]): those whose
+/// every consumer reads them from the file ([`Operator::reads_mapped`]) and
+/// that are not graph outputs. The others (say an optimizer pass gave one a new
+/// consumer, or the session keeps its weights) are decoded into their tensor
+/// now, exactly as the loader would have. Returns the bytes left mapped.
+///
+/// [`OperatorRegistry::mapped_weight`]: oxionnx_core::OperatorRegistry::mapped_weight
+/// [`Operator::reads_mapped`]: oxionnx_core::Operator::reads_mapped
+pub(crate) fn settle_mapped(
+    nodes: &[Node],
+    weights: &mut HashMap<String, Tensor>,
+    output_names: &[String],
+    registry: &OperatorRegistry,
+) -> usize {
+    let names = registry.mapped_weight_names();
+    if names.is_empty() {
+        return 0;
+    }
+    let keep_all = registry.keep_weights() || nodes.iter().any(|n| !n.attrs.graphs.is_empty());
+    let mut mapped = 0;
+    for name in names {
+        let Some(t) = weights.get(&name) else {
+            registry.remove_mapped_weight(&name);
+            continue;
+        };
+        let readers_ok = !keep_all
+            && !output_names.contains(&name)
+            && nodes.iter().all(|node| {
+                node.inputs.iter().enumerate().filter(|(_, n)| **n == name).all(|(i, _)| {
+                    registry.get(node.op.as_str()).is_some_and(|op| {
+                        let ctx = OpContext {
+                            node,
+                            inputs: node.inputs.iter().map(|n| weights.get(n)).collect(),
+                            outer_scope: None,
+                            weights: Some(&*weights),
+                            registry: Some(registry),
+                        };
+                        op.reads_mapped(&ctx, i)
+                    })
+                })
+            });
+        if readers_ok && is_released(t) {
+            if let Some(m) = registry.mapped_weight(&name) {
+                mapped += m.bytes().len();
+            }
+            continue;
+        }
+        if let Some(m) = registry.remove_mapped_weight(&name) {
+            if let Some(t) = weights.get_mut(&name) {
+                t.data = m.materialize();
+            }
+        }
+    }
+    mapped
+}
+
 /// Hand the freed weights back to the OS. glibc keeps them in its heap: after
 /// the first large free its mmap threshold rises, so later weight-sized blocks
 /// live in the heap rather than in their own mappings, and freeing them does
@@ -102,6 +159,11 @@ pub(crate) fn rebuild_released(
     for node in nodes {
         for (i, name) in node.inputs.iter().enumerate() {
             if out.contains_key(name) || !weights.get(name).is_some_and(is_released) {
+                continue;
+            }
+            // A table left in the mapped model file holds the original bytes.
+            if let Some(m) = registry.mapped_weight(name) {
+                out.insert(name.clone(), Tensor { data: m.materialize(), shape: weights[name].shape.clone() });
                 continue;
             }
             let Some(op) = registry.get(node.op.as_str()) else { continue };

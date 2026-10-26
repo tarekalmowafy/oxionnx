@@ -325,6 +325,69 @@ mod tests {
         assert_eq!(bucket_for(1_000_000), SizeClass::Large);
     }
     #[test]
+    fn test_size_class_budget_evicts_least_recently_released() {
+        let mut pool = SizeClassPool::new();
+        pool.raise_budget(3 * 4 * 100_000);
+        for _ in 0..3 {
+            pool.release(vec![1.0_f32; 100_000]);
+        }
+        assert_eq!(pool.buffer_count(), 3);
+        // One more does not fit: the oldest goes.
+        let mut newest = vec![0.0_f32; 100_000];
+        newest[0] = 7.0;
+        pool.release(newest);
+        assert_eq!(pool.buffer_count(), 3);
+        assert!(pool.stats().current_bytes <= 3 * 4 * 100_000);
+        // A buffer bigger than the whole budget is not cached at all.
+        pool.release(vec![0.0_f32; 400_000]);
+        assert_eq!(pool.buffer_count(), 3);
+        // The newest survived the eviction.
+        let bufs: Vec<Vec<f32>> = (0..3).map(|_| pool.acquire_for_overwrite(100_000)).collect();
+        assert!(bufs.iter().any(|b| b[0] == 7.0));
+    }
+    #[test]
+    fn test_size_class_budget_grows_on_a_miss_an_eviction_caused() {
+        let mut pool = SizeClassPool::new();
+        pool.raise_budget(4 * 100_000);
+        pool.release(vec![0.0_f32; 100_000]);
+        pool.release(vec![0.0_f32; 100_000]); // evicts the first
+        assert_eq!(pool.budget(), Some(4 * 100_000));
+        let a = pool.acquire_for_overwrite(100_000);
+        let b = pool.acquire_for_overwrite(100_000); // miss: the evicted one would have served it
+        assert_eq!(pool.budget(), Some(2 * 4 * 100_000));
+        pool.release(a);
+        pool.release(b);
+        assert_eq!(pool.buffer_count(), 2, "both fit now");
+
+        // A miss long after the eviction (two runs later) is not blamed on it.
+        let mut pool = SizeClassPool::new();
+        pool.raise_budget(4 * 100_000);
+        pool.release(vec![0.0_f32; 100_000]);
+        pool.release(vec![0.0_f32; 100_000]);
+        pool.end_run();
+        pool.end_run();
+        let _a = pool.acquire_for_overwrite(100_000);
+        let _b = pool.acquire_for_overwrite(100_000);
+        assert_eq!(pool.budget(), Some(4 * 100_000));
+    }
+    #[test]
+    fn test_size_class_budgeted_pool_does_not_grow_a_short_large_buffer() {
+        let mut pool = SizeClassPool::new();
+        pool.raise_budget(64 << 20);
+        let mut short = vec![0.0_f32; 120_000];
+        short.truncate(90_000);
+        pool.release(short);
+        // Serving 100_000 would zero-fill a 10_000-element tail: allocate instead.
+        let buf = pool.acquire_for_overwrite(100_000);
+        assert_eq!(buf.len(), 100_000);
+        assert_eq!(pool.stats().reuse_count, 0);
+        assert_eq!(pool.stats().zeroed_bytes, 0);
+        // A long-enough one is still truncated and reused.
+        let got = pool.acquire_for_overwrite(80_000);
+        assert_eq!(pool.stats().reuse_count, 1);
+        assert_eq!(got.len(), 80_000);
+    }
+    #[test]
     fn test_size_class_best_fit() {
         let mut pool = SizeClassPool::new();
         let buf = vec![0.0_f32; 1000];

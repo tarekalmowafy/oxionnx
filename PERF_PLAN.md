@@ -115,14 +115,45 @@ These items mostly touch independent files and can proceed in parallel.
 
 The MatMul, QKV and attention fusions were written against EmbeddingGemma-2's graph. BERT, ModernBERT, GTE and Qwen3-style exports from onnx-community / Optimum mostly miss them. One symptom: granite-97m-multilingual queries go only from 20.4 to 17.4 ms with 8× the threads.
 
-### [ ] P2.1 Projection fusions for HF exports
+### [x] P2.1 Projection fusions for HF exports ([#21](https://github.com/tarekalmowafy/oxionnx/pull/21))
 - **Plan:** extend `OxiMatMulSplit` (QKV projection, split, and optional rotary or head norm) and the MatMul + bias epilogue to the projection patterns of BERT, ModernBERT, GTE and Qwen3 exports. These include separate Q/K/V MatMuls sharing an input, to be packed into one GEMM, plus `Add` bias, Reshape/Transpose to heads, and `com.microsoft.RotaryEmbedding`.
 - **Files:** `src/optimizer/fusion/matmul_split.rs`, `src/optimizer/fusion/matmul_act.rs`, `oxionnx-ops/src/fused_matmul.rs`.
+- **What it took**, by measured payoff (doc-b8 profiles on master):
+  - The written-out rotary (`Slice`/`Split`, `Neg`, `Concat`, 2× `Mul`, `Add`) of granite-en/small/97m/311m and arctic is now one `OxiRotateHalf`. It is bit-identical, with cos/sin broadcast in either head layout.
+  - Eager attention (arctic, the granite-ml torch exports) now fuses into `OxiAttention`. Q/K/V sit behind head transposes or are already head-major, scalar scales apply to Q and Kᵀ, and the output reshape is computed at run time. `OxiAttention` takes 4-D Q/K/V in either layout.
+  - Separate Q/K/V MatMuls of one input are packed into one `MatMul → Split` (`pack_shared_projections`), which `OxiMatMulSplit` then absorbs together with each output's own head norm (Qwen3 q_norm/k_norm) and rotary.
+  - Both need the exports' shape arithmetic resolved under a symbolic batch/sequence: `Shape(q)[3]/2` slice bounds, `1/sqrt(Shape(q)[-1])` scales. `shape_values` propagates partially known shapes and folds those. Two cleanups also landed: `Constant` nodes now become weights before fusion, and the node list is stably topologically sorted (and DCE no longer assumes order).
+- **Result** (ms, oxionnx FP32, master → PR, ORT in brackets; cosine vs ORT 1.0000000 on all 11 zoo models and EmbeddingGemma-2, queries and doc-b8):
+  - 8 docs, 8 threads:
+    - granite-97m: 135 → 97 (231)
+    - granite-311m: 439 → 334 (524)
+    - arctic: 326 → 297 (353)
+    - granite-en: 363 → 338 (475)
+    - granite-small: 112 → 101 (168)
+    - pplx: 1143 → 1114
+    - qwen3: 1307 → 1281
+    - gemma, voyage, jina: ±1%
+  - BF16, 8 docs: granite-311m 328 → 229, arctic 218 → 182.
+  - Query, 8 threads: −7..−16% on 10 models (arctic 16.2 → 13.6, ORT 15.6, so arctic now beats ORT here too; pplx 33.5 → 30.5; qwen3 35.3 → 32.7). granite-en reads +6% in the sweep but −1% in an interleaved A/B.
+  - Query, 1 thread: −2..−6% on the granite models; harrier-0.6b/pplx/jina read +2..6% in the sweep but +0.5/+1.5% in an interleaved A/B (GEMM-bound, at noise level).
+  - Per-op, doc-b8: granite-311m Split 41 + Transpose 38 + Softmax 19 + rotary ops ~35 → `OxiAttention` 40 + `OxiRotateHalf` 13; Qwen3-family `RotaryEmbedding` (22–27) and head-norm SLNs (11–17) go to 0.
+- **Not done / open:** granite-ml still materialises its 5-D QKV `Transpose` + `Split` (9 + 7 ms on 311m). The rotary of granite-en/ml/arctic could move into the `OxiMatMulSplit` epilogue (cos/sin are run-time tensors there). The packed Q/K/V GEMM with norm + rotary epilogue costs about what the separate ops did on qwen3/jina doc batches (net −2%/+1%).
 
-### [ ] P2.2 Run contrib attention ops on the packed-GEMM attention kernel
+### [x] P2.2 Run contrib attention ops on the packed-GEMM attention kernel ([#21](https://github.com/tarekalmowafy/oxionnx/pull/21))
 - **Plan:** run `com.microsoft.MultiHeadAttention` and `com.microsoft.GroupQueryAttention` (added in #11) on the packed AVX-512/AVX2 GEMM that `OxiAttention` uses for QKᵀ and PV, with the same blocking and threading.
 - **Current cost:** MHA/GQA time is 140–144 ms against ORT's 199–221 ms on the 0.6B models, so this item is mostly about thread scaling and the small models.
 - **Files:** `oxionnx-ops/src/registry/contrib_attention.rs`, `oxionnx-ops/src/contrib.rs`.
+- **Result:** no kernel change was needed. Since #11/#14, both contrib ops already call `contrib::attention_ext_into`, the kernel `OxiAttention` uses: Kᵀ/V are packed once per (batch, KV head) for the packed GEMM, with the same row blocking and rayon split. The `kv_bnsh` flag from phase 1 still works, and this PR adds `q_bnsh`. Attention op time, doc-b8 at 8 threads, oxionnx vs ORT:
+  - qwen3 98 vs 249
+  - pplx 104 vs 188
+  - harrier-0.6b 111 vs 225
+  - granite-en 48 vs 154
+  - voyage 41 vs 84
+  - jina 24 vs 71
+  - granite-small 18 vs 63
+  - harrier-270m 62 vs 55 (the only one behind)
+
+  Query at 8 threads: 0.4–1.5 ms against ORT's 0.4–3.0. Not worth more work now.
 
 ### [x] P2.3 `SkipLayerNormalization` / `SkipSimplifiedLayerNormalization` for all exporters ([#16](https://github.com/tarekalmowafy/oxionnx/pull/16))
 - **Plan:** match the residual `Add` + norm pairs these exports use, and keep the native ops on the output-slot path.
@@ -158,17 +189,22 @@ The MatMul, QKV and attention fusions were written against EmbeddingGemma-2's gr
 
 ## Phase 4: memory
 
-### [ ] P4.1 Activation memory
+### [x] P4.1 Activation memory ([#23](https://github.com/tarekalmowafy/oxionnx/pull/23))
 - **Problem:** peak RSS on the newer models is 1.1–2.5× ORT's and 2–4× llama-server's. For example, Qwen3 peaks at 4533 MiB on oxionnx FP32, 2861 MiB on ORT and 2153 MiB on llama-server.
 - **Plan:**
   - Stop materialising `repeat_kv` and similar broadcast copies (P1.2).
   - Do more element-wise work in place.
   - Review activation-pool sizing.
   - Reuse slots across unfused chains.
+- **Finding** (`OXIONNX_TRACE_MEM=1`, doc-b8): the peak was the activation pool's idle free lists, not live activations. On granite-97m the live set peaks at 55 MiB, but the pool cached 650 MiB. Kernels allocate their own outputs on the first run, and every buffer went into the pool, which never shrank. Two leaks made it worse. A 24 MiB buffer could be handed to a 32 KiB tensor (rotary cos/sin) and held for the whole run, so on granite-small the live set grew run after run (45 → 446 MiB). Outputs that nothing reads (GroupQueryAttention's `present_k/v` on harrier) stayed live until the run ended. In-place element-wise work and slot reuse across chains are not the bottleneck once the pool is bounded, so they are not done here.
+- **Done:** `SizeClassPool` has a byte budget on its free lists and evicts the least-recently released buffer first. The session sets the budget to the peak of live non-output bytes, with a 64 MiB floor. It grows when a miss is one that an eviction from this run or the previous one would have served, capped at 3× the base. Recycled buffers must fit tightly (≤ 2× the request, or ≤ 64 KiB over). A budgeted pool allocates a fresh large buffer rather than zero-fill the tail of a shorter one. Unread outputs are freed right after their node.
+- **Result** (FP32, max peak RSS over the light-sweep cells, master → PR, ORT): voyage 2318 → 1832 (1432); granite-small 1051 → 428 (441); granite-en 1292 → 923 (865); granite-97m 1376 → 815 (744); granite-311m 2344 → 1881 (2087); harrier-270m 2293 → 2066 (954); harrier-0.6b 3970 → 3202 (3141); pplx 3411 → 3105 (2370); jina 1452 → 1120 (845); Qwen3 3930 → 3367 (2861); arctic 2503 → 1801 (2215). Speed is unchanged or better: doc-b8 8T Qwen3 1348 → 1206 ms, harrier-0.6b 1230 → 1135, harrier-270m 335 → 308; the other cells are within ±3% noise. Cosine vs ORT is 1.0000000. On most models the peak is now the weights after load, or the load transient itself (granite-97m/311m, arctic). That is P4.2.
 
-### [ ] P4.2 Large `Gather` tables
-- **Problem:** embedding tables such as EmbeddingGemma's 537 MB per-layer embeddings are kept fully resident as FP32. ORT and llama.cpp memory-map theirs and only touch the rows a batch uses.
+### [x] P4.2 Large `Gather` tables ([#18](https://github.com/tarekalmowafy/oxionnx/pull/18))
+- **Problem:** embedding tables such as EmbeddingGemma's 537 MB token embeddings are kept fully resident as FP32. ORT and llama.cpp memory-map theirs and only touch the rows a batch uses.
 - **Plan:** keep `Gather`-only initializers in the mapped file, or as BF16, and decode rows on demand.
+- **Done:** tables of at least 4 MiB that only `Gather` (axis 0) or `GatherBlockQuantized` read stay in the mmap'd `.onnx` / external-data file (MADV_RANDOM), and the ops read only the rows they need. Tied tables, graph outputs and `with_keep_weights` are decoded as before. The BF16 option turned out to be unnecessary, because mapping also covers BF16 mode and inline models.
+- **Result:** output is bit-identical (all 32 queries and doc batches, FP32 and BF16, 11 zoo models plus gemma FP32/Q8/Q4). RSS after load, base → new: gemma FP32 1247 → 748 MiB, BF16 1173 → 441, Q8 560 → 377, Q4 424 → 359. Qwen3-0.6B 3055 → 2459, harrier-270m 2009 → 751, arctic-m-v2 1598 → 867, granite-311m-ml 1381 → 623. Peak RSS falls 200–1100 MiB on the large-vocabulary models. Speed is unchanged within noise.
 
 ---
 

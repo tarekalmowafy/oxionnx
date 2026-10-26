@@ -1,5 +1,6 @@
 mod dispatch;
 mod entry;
+mod memtrace;
 mod parallel;
 pub(super) mod plan;
 pub(crate) mod scheduling;

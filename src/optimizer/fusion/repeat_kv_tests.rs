@@ -279,10 +279,10 @@ fn reads_constants_from_constant_nodes() {
 #[test]
 fn dead_copy_removal_does_not_need_sorted_nodes() {
     let c = decoder(3, 2, Shapes::Dynamic, true);
-    let sorted: HashSet<String> = fused(&c).into_iter().map(|n| n.name).collect();
+    let sorted: std::collections::HashSet<String> = fused(&c).into_iter().map(|n| n.name).collect();
     let mut rev = c.nodes.clone();
     rev.reverse();
-    let unsorted: HashSet<String> = fuse_repeat_kv(rev, &c.weights, &c.outputs).into_iter().map(|n| n.name).collect();
+    let unsorted: std::collections::HashSet<String> = fuse_repeat_kv(rev, &c.weights, &c.outputs).into_iter().map(|n| n.name).collect();
     assert_eq!(sorted, unsorted);
     assert!(sorted.contains("k_cat") && sorted.contains("k_split") && !sorted.contains("k_expand"));
 }

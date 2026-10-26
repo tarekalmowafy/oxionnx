@@ -116,6 +116,10 @@ impl SessionBuilder {
     /// when that data is needed. [`Session::save_optimized`] works either way
     /// for FP32 weights (they are rebuilt exactly from the packed copy).
     ///
+    /// This also decodes the large embedding tables that [`Self::load`] would
+    /// otherwise leave in the memory-mapped model file (see
+    /// [`Session::weights`]).
+    ///
     /// Default: `false`.
     #[must_use]
     pub fn with_keep_weights(mut self, keep: bool) -> Self {
@@ -213,9 +217,14 @@ impl SessionBuilder {
 
     /// Load an ONNX model from a file path.
     /// Supports models with external data by resolving paths relative to the file's directory.
+    ///
+    /// Large embedding tables stay in the memory-mapped model (or external
+    /// data) file for the life of the session (see [`Session::weights`]), so
+    /// that file must not be truncated or rewritten in place while the session
+    /// exists (replacing it with a new file, or deleting it, is fine).
     pub fn load(mut self, path: &Path) -> Result<Session, OnnxError> {
         let registry = self.take_registry();
-        let (raw_meta, graph, weights) = super::loading::parse_file(path)?;
+        let (raw_meta, graph, weights) = super::loading::parse_file(path, &registry)?;
         let metadata = raw_meta_to_model_metadata(raw_meta);
         let built = Session::build_from_graph(
             graph,

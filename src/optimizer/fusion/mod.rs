@@ -6,12 +6,12 @@
 //! spatial (InstanceNorm-style) normalization chains, scaled dot-product attention,
 //! written-out exact GELU, MatMul + GELU / SiLU (plain and gated), MatMul + Split
 //! projections (with head norm and rotary), residual Add + norm
-//! (`Skip[Simplified]LayerNormalization`).
+//! (`Skip[Simplified]LayerNormalization`), written-out rotary (`OxiRotateHalf`).
 //!
 //! All of them are wired into [`crate::optimizer::optimize_with_level`] at
 //! `PassLevel::Extended` and above, except `fuse_conv_add_relu`,
 //! `fuse_instance_norm`, `fuse_attention`, `fuse_matmul_act`,
-//! `fuse_matmul_split` and `fuse_skip_norm`, which emit the optimizer-only `ConvAddRelu` /
+//! `fuse_matmul_split`, `fuse_rotate_half` and `fuse_skip_norm`, which emit the optimizer-only `ConvAddRelu` /
 //! `OxiInstanceNorm` / `OxiAttention` / `OxiMatMulAct` / `OxiMatMulSplit` ops
 //! and therefore run only when the active `OperatorRegistry` provides a kernel
 //! for them.
@@ -26,7 +26,9 @@ mod instance_norm;
 mod matmul;
 mod matmul_act;
 mod matmul_split;
+mod qkv_pack;
 mod repeat_kv;
+mod rotate_half;
 mod simplify;
 mod skip_norm;
 
@@ -35,7 +37,9 @@ pub use gelu_erf::fuse_gelu_erf;
 pub use instance_norm::fuse_instance_norm;
 pub use matmul_act::fuse_matmul_act;
 pub use matmul_split::fuse_matmul_split;
+pub use qkv_pack::pack_shared_projections;
 pub use repeat_kv::fuse_repeat_kv;
+pub use rotate_half::fuse_rotate_half;
 pub use skip_norm::fuse_skip_norm;
 
 pub use conv::{

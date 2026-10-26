@@ -12,8 +12,14 @@
 //! [y = Reshape(SimplifiedLayerNormalization(Reshape(y, [0,-1,D]), gamma), [0,-1,N])]   // per-head RMSNorm
 //! [y = Mul(y, c)]                                           // c: constant [N]
 //! y_0, .., y_k = Split(y, axis=-1)
+//! [y_o = Reshape(SimplifiedLayerNormalization(Reshape(y_o, [0,-1,D]), gamma_o), [0,-1,N_o])]  // per output,
+//!                                                           // when y was not normed before the split
 //! [y_o = com.microsoft.RotaryEmbedding(y_o, position_ids, cos, sin)]   // any of the outputs
 //! ```
+//!
+//! The per-output norms are the separate Q/K norms of Qwen3-style blocks once
+//! [`super::pack_shared_projections`] has packed their projections; they must
+//! share the head width and epsilon.
 //!
 //! The rotary nodes must share their position/cos/sin inputs and attributes.
 //! Every removed intermediate must have exactly one consumer and must not be a
@@ -174,7 +180,25 @@ impl<'a> Matcher<'a> {
         let mut outputs = Vec::new();
         let mut rotate = Vec::new();
         let mut rotary: Option<&Node> = None;
-        for o in &self.nodes[split].outputs {
+        // Per-output head norms (separate Q/K norms of packed projections),
+        // unless every column was already normed before the split.
+        let mut norm_out = Vec::new();
+        let mut gammas: Vec<String> = Vec::new();
+        let mut post_eps: Option<f32> = None;
+        for (oi, o) in self.nodes[split].outputs.iter().enumerate() {
+            let mut o: &str = o;
+            let normed = if inputs[3].is_empty() { self.head_norm(o, sizes[oi] as usize) } else { None };
+            norm_out.push(normed.is_some() as i64);
+            if let Some((gamma, eps, nodes, out)) = normed {
+                if post_eps.is_some_and(|e| e != eps) {
+                    return None;
+                }
+                post_eps = Some(eps);
+                gammas.push(gamma.into());
+                remove.extend(nodes);
+                o = out;
+            }
+            let o = &o.to_string();
             match self.cons(o, ROTARY).filter(|&r| self.nodes[r].inputs.first() == Some(o)) {
                 Some(r) => {
                     let rn = &self.nodes[r];
@@ -207,6 +231,12 @@ impl<'a> Matcher<'a> {
             for k in ["interleaved", "num_heads", "rotary_embedding_dim"] {
                 attrs.ints.insert(k.into(), rn.attrs.i(k, 0));
             }
+        }
+        if let Some(eps) = post_eps {
+            attrs.floats.insert("epsilon".into(), eps);
+            attrs.int_lists.insert("norm_out".into(), norm_out);
+            inputs.resize(8, String::new());
+            inputs.extend(gammas);
         }
         while inputs.last().is_some_and(String::is_empty) {
             inputs.pop();

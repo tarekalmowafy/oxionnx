@@ -11,6 +11,7 @@ pub(crate) mod graph_utils;
 pub mod nbits;
 pub mod shape_inference;
 pub(crate) mod shape_inference_ext;
+pub mod shape_values;
 pub mod symbolic_shape;
 
 use crate::graph::{Node, OpKind};
@@ -48,11 +49,15 @@ pub fn optimize(
 /// Apply the optimization passes selected by `level`.
 ///
 /// Pass order at [`PassLevel::All`]:
+///  0. **Normalisation** — stable topological sort, and `Constant` nodes
+///     become weights.
 ///  1. **Shape inference** — infer tensor shapes from weights and propagate
 ///     through the graph.  For every `Shape` node whose input has a known
 ///     shape, the output is materialised as a constant weight so that
 ///     downstream ops (Reshape, Gather, …) become constant-foldable.
-///  2. **Constant folding** — evaluate nodes whose inputs are all constants.
+///  2. **Constant folding** — evaluate nodes whose inputs are all constants,
+///     including shape arithmetic over partially known shapes
+///     ([`shape_values::fold_shape_values`]).
 ///  3. **Dead-node elimination** — remove nodes not reachable from outputs.
 ///  4. **CSE** — merge duplicate sub-expressions.
 ///  5. **Fusion passes** — inference Dropout removal, MatMul+Add, Conv+BN,
@@ -60,10 +65,12 @@ pub fn optimize(
 ///     LayerNorm, spatial (InstanceNorm-style) normalization chains,
 ///     Transpose/Reshape cancellation, MatMul+Transpose, Add+MatMul→Gemm,
 ///     Gather composition, Conv+Add+Relu, and — when the registry has the
-///     fused kernels — attention (`OxiAttention`), MatMul+GELU/SiLU (`OxiMatMulAct`)
-///     and MatMul+Split projections (`OxiMatMulSplit`).
+///     fused kernels — written-out rotary (`OxiRotateHalf`), attention (`OxiAttention`,
+///     also on head-split eager-attention exports), MatMul+GELU/SiLU (`OxiMatMulAct`)
+///     and MatMul+Split projections (`OxiMatMulSplit`, after packing separate
+///     projections of one input into one MatMul).
 ///
-/// [`PassLevel::Extended`] runs step 3 and step 5; [`PassLevel::Basic`] runs
+/// [`PassLevel::Extended`] runs steps 0, 3 and 5; [`PassLevel::Basic`] runs
 /// step 3 only.  Every pass keeps the declared `output_names` produced.
 pub fn optimize_with_level(
     nodes: Vec<Node>,
@@ -110,6 +117,15 @@ pub fn optimize_with_input_shapes(
     level: PassLevel,
     input_shapes: &HashMap<String, Vec<usize>>,
 ) -> Vec<Node> {
+    // Producers before consumers (a few exports list them out of order, and
+    // several passes below walk the list once), and `Constant` nodes as plain
+    // weights, so no matcher has to look through them.
+    let nodes = if level == PassLevel::Basic {
+        nodes
+    } else {
+        let nodes = dead_code::stable_topological_sort(nodes);
+        constant_fold::fold_constant_nodes(nodes, weights, output_names)
+    };
     // Quantized weights go into their kernel layout first, so every later pass
     // sees the final op and no ORT-layout copy outlives the build.
     let nodes = if registry.get("OxiMatMulNBits").is_some() {
@@ -120,7 +136,8 @@ pub fn optimize_with_input_shapes(
     let nodes = if level == PassLevel::All {
         let known_shapes = shape_inference::infer_shapes(&nodes, weights, input_shapes);
         materialize_shape_ops(&nodes, weights, &known_shapes);
-        constant_fold::constant_fold(nodes, weights, registry, output_names)
+        let nodes = constant_fold::constant_fold(nodes, weights, registry, output_names);
+        shape_values::fold_shape_values(nodes, weights, registry, output_names, input_shapes)
     } else {
         nodes
     };
@@ -146,6 +163,21 @@ pub fn optimize_with_input_shapes(
     // Inference-mode Dropout is the identity; removing it first lets the
     // downstream patterns (e.g. Softmax → Dropout → MatMul) match.
     let nodes = fusion::eliminate_dropout_inference(nodes, weights, output_names);
+    // Written-out rotary embeddings, before attention, whose Q/K they produce.
+    let nodes = if registry.get("OxiRotateHalf").is_some() {
+        let facts = shape_values::analyse(&nodes, weights, input_shapes);
+        let nodes = fusion::fuse_rotate_half(nodes, weights, &facts, output_names);
+        if level == PassLevel::All {
+            // A rotated tensor now provably has its input's shape, which
+            // resolves shape arithmetic on it (e.g. `1/sqrt(Shape(q)[-1])`).
+            let nodes = shape_values::fold_shape_values(nodes, weights, registry, output_names, input_shapes);
+            dead_code::dead_node_elimination(nodes, output_names)
+        } else {
+            nodes
+        }
+    } else {
+        nodes
+    };
     // Before the MatMul/Transpose fusions, which would otherwise absorb pieces of
     // the attention chain (e.g. an unscaled `MatMul(q, k) + mask`).
     let nodes = if registry.get("OxiAttention").is_some() {
@@ -164,7 +196,9 @@ pub fn optimize_with_input_shapes(
         nodes
     };
     // After the gated-GELU fusion, whose `MatMul -> Split` prefix this also matches.
+    // Separate Q/K/V projections of one input become one `MatMul -> Split` first.
     let nodes = if registry.get("OxiMatMulSplit").is_some() {
+        let nodes = fusion::pack_shared_projections(nodes, weights, output_names);
         fusion::fuse_matmul_split(nodes, weights, output_names)
     } else {
         nodes

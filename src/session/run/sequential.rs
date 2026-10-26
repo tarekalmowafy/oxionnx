@@ -725,6 +725,11 @@ impl Session {
             }
 
             let t_rel = phase_timers::start();
+            if let Some(mut mem) = state.mem.take() {
+                // Measured before the inputs are released: this is the true live peak.
+                mem.after_node(node, state, self.pool.as_ref().map(|m| m as &Mutex<SizeClassPool>));
+                state.mem = Some(mem);
+            }
             self.decrement_refs_state(node, state, ref_counts, output_set);
             phase_timers::stop(&phase_timers::RELEASE, t_rel);
             // Released after a node that ran on the CPU too: "last consumer" is

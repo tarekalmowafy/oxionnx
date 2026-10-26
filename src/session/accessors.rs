@@ -181,6 +181,11 @@ impl Session {
     /// keep their shape but have empty `data`: the session holds their packed
     /// copy instead (BF16 with
     /// [`SessionBuilder::with_bf16_weights`](super::SessionBuilder::with_bf16_weights)).
+    /// Large tables read only by `Gather` / `GatherBlockQuantized` row lookups
+    /// (embedding tables) are reported the same way when the session was
+    /// loaded from a file: their bytes stay in the memory-mapped `.onnx` or
+    /// external-data file, and only the pages of the rows a run reads become
+    /// resident (`OXIONNX_MAP_TABLES=0` turns this off).
     /// Build with
     /// [`SessionBuilder::with_keep_weights`](super::SessionBuilder::with_keep_weights)
     /// to keep their data.

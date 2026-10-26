@@ -46,13 +46,28 @@ fn a_larger_recycled_buffer_is_truncated_to_the_request() {
     let big = pool.acquire(20_000);
     pool.release(big);
 
-    let small = pool.acquire_for_overwrite(500);
-    assert_eq!(small.len(), 500);
+    let small = pool.acquire_for_overwrite(12_000);
+    assert_eq!(small.len(), 12_000);
     assert!(
         small.capacity() >= 20_000,
         "it really is the recycled buffer, not a fresh allocation: capacity {}",
         small.capacity(),
     );
+}
+
+/// A buffer far larger than the request is not handed out for it: it would stay
+/// resident under a small tensor while the next large request allocates afresh.
+#[test]
+fn a_far_larger_recycled_buffer_is_not_used_for_a_small_request() {
+    let mut pool = SizeClassPool::new();
+    let big = pool.acquire(1_000_000);
+    pool.release(big);
+
+    for small in [pool.acquire_for_overwrite(500), pool.acquire(8_192)] {
+        assert!(small.capacity() < 1_000_000, "capacity {}", small.capacity());
+    }
+    assert_eq!(pool.stats().reuse_count, 0);
+    assert_eq!(pool.buffer_count(), 1, "the big buffer is still cached");
 }
 
 /// Growing a short recycled buffer has nothing to grow it *with* except zeros,

@@ -181,3 +181,88 @@ fn rejects_wrong_scores_shape_at_run_time() {
     let ctx = OpContext { node, inputs, outer_scope: None, weights: Some(&w), registry: Some(&registry) };
     assert!(registry.get("OxiAttention").unwrap().execute(&ctx).is_err());
 }
+
+/// Eager attention on head-split Q/K/V, as the GTE / ModernBERT torch exports
+/// write it (H=3, D=4): `q`/`k`/`v` arrive as `[B, S, H, D]` (`head_major =
+/// false`) or `[B, H, S, D]`, Q and Kᵀ are each scaled by a constant, and the
+/// output reshape takes a run-time shape. `composite_k` routes K through
+/// `Transpose [0,2,1,3]` then `[0,1,3,2]` (rotary applied head-major).
+fn eager_graph(b: usize, s: usize, head_major: bool, composite_k: bool) -> (Vec<Node>, HashMap<String, Tensor>, Vec<(&'static str, Tensor)>) {
+    let (h, d) = (3usize, 4usize);
+    let mut w = HashMap::new();
+    w.insert("qs".into(), Tensor::new(vec![0.7], vec![1]));
+    w.insert("ks".into(), Tensor::new(vec![0.6], vec![]));
+    let mut nodes = Vec::new();
+    // Rank-4 sources with symbolic batch/sequence (the reshape fixes only the head axes).
+    let src_shape = if head_major { [0, h as i64, -1, d as i64] } else { [0, -1, h as i64, d as i64] };
+    let tgt = ints(&mut w, "c_src", &src_shape);
+    for t in ["q", "k", "v"] {
+        let (inp, out) = (format!("{t}_in"), format!("{t}4"));
+        nodes.push(node(OpKind::Reshape, &format!("{t}_rs"), &[&inp, &tgt], &out));
+    }
+    let (q_h, k_t, v_h) = if head_major {
+        nodes.push(transpose("k_tr", "k4", "kt", &[0, 1, 3, 2]));
+        ("q4", "kt", "v4")
+    } else {
+        nodes.push(transpose("q_tr", "q4", "qt", &[0, 2, 1, 3]));
+        if composite_k {
+            nodes.push(transpose("k_tr0", "k4", "kh", &[0, 2, 1, 3]));
+            nodes.push(transpose("k_tr", "kh", "kt", &[0, 1, 3, 2]));
+        } else {
+            nodes.push(transpose("k_tr", "k4", "kt", &[0, 2, 3, 1]));
+        }
+        nodes.push(transpose("v_tr", "v4", "vt", &[0, 2, 1, 3]));
+        ("qt", "kt", "vt")
+    };
+    nodes.extend([
+        node(OpKind::Mul, "q_scale", &[q_h, "qs"], "qsc"),
+        node(OpKind::Mul, "k_scale", &["ks", k_t], "ksc"),
+        node(OpKind::MatMul, "qk", &["qsc", "ksc"], "qk"),
+        node(OpKind::Add, "add_mask", &["qk", "mask"], "scb"),
+        softmax("scb", "p"),
+        node(OpKind::MatMul, "pv", &["p", v_h], "pv"),
+        transpose("o_tr", "pv", "ot", &[0, 2, 1, 3]),
+        node(OpKind::Reshape, "o_flat", &["ot", "out_shape"], "out"),
+    ]);
+    let n = b * s * h * d;
+    let feeds = vec![
+        ("q_in", Tensor::new(rand(n, 11), vec![b, s * h * d])),
+        ("k_in", Tensor::new(rand(n, 12), vec![b, s * h * d])),
+        ("v_in", Tensor::new(rand(n, 13), vec![b, s * h * d])),
+        ("mask", Tensor::new(rand(b * s, 14), vec![b, 1, 1, s])),
+        ("out_shape", Tensor::new(vec![b as f32, -1.0, (h * d) as f32], vec![3])),
+    ];
+    (nodes, w, feeds)
+}
+
+#[test]
+fn fuses_eager_head_split_attention_in_both_layouts() {
+    for (head_major, composite_k) in [(false, false), (false, true), (true, false)] {
+        let (nodes, w, feeds) = eager_graph(2, 5, head_major, composite_k);
+        let fused = fuse_attention(nodes.clone(), &w, &["out".to_string()]);
+        let ops: Vec<&str> = fused.iter().map(|n| n.op.as_str()).collect();
+        assert_eq!(ops, ["Reshape", "Reshape", "Reshape", "OxiAttention", "Reshape"], "head_major={head_major} composite_k={composite_k}");
+        let att = &fused[3];
+        assert_eq!(att.attrs.i("q_bnsh", -1), head_major as i64);
+        assert_eq!(att.attrs.i("kv_bnsh", -1), head_major as i64);
+        let want = run(&nodes, &w, &feeds, "out");
+        let got = run(&fused, &w, &feeds, "out");
+        assert!(max_diff(&got, &want) < 1e-5, "head_major={head_major}: diff {}", max_diff(&got, &want));
+    }
+}
+
+#[test]
+fn eager_form_needs_known_head_major_ranks() {
+    // Head-major Q/V straight from graph inputs: their rank is unknown, so no fusion.
+    let (mut nodes, w, _) = eager_graph(1, 3, true, false);
+    nodes.retain(|n| n.name != "q_rs" && n.name != "v_rs");
+    for n in &mut nodes {
+        for i in &mut n.inputs {
+            if i == "q4" || i == "v4" {
+                *i = format!("{}_in", &i[..1]);
+            }
+        }
+    }
+    let kept = fuse_attention(nodes.clone(), &w, &["out".to_string()]);
+    assert_eq!(kept.len(), nodes.len());
+}

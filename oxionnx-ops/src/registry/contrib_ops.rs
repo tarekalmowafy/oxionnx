@@ -247,6 +247,11 @@ pub const BIAS_LAYOUT_BHST: i64 = 1;
 /// time to equal `[B, G, R, S, T]`.
 /// Attributes: `q_num_heads`, `kv_num_heads`, `scale`, `bias_layout`.
 /// Output: `[B, S, Hq*D]`.
+///
+/// Or the head-split form: `q` `[B, S, Hq, D]` and `k`/`v` `[B, T, Hkv, D]`,
+/// each in head-major order instead (`[B, H, S, D]`) when the attribute
+/// `q_bnsh` / `kv_bnsh` is 1; head counts come from the shapes (the
+/// attributes, if set, must agree). Output: `[B, S, Hq, D]`.
 pub struct OxiAttentionOp;
 
 /// Resolve Reshape semantics (`0` copies the input dim, one `-1` is inferred).
@@ -275,25 +280,7 @@ fn resolve_reshape(target: &[f32], input: &[usize]) -> Option<Vec<usize>> {
     Some(out)
 }
 
-/// Element strides of `shape` broadcast onto `target` (left-padded), 0 on
-/// broadcast axes; `None` when not broadcastable.
-fn broadcast_strides(shape: &[usize], target: &[usize]) -> Option<Vec<usize>> {
-    if shape.len() > target.len() {
-        return None;
-    }
-    let pad = target.len() - shape.len();
-    let mut strides = vec![0; target.len()];
-    let mut acc = 1;
-    for i in (0..shape.len()).rev() {
-        let (d, t) = (shape[i], target[pad + i]);
-        if d != 1 && d != t {
-            return None;
-        }
-        strides[pad + i] = if d == 1 { 0 } else { acc };
-        acc *= d;
-    }
-    Some(strides)
-}
+use crate::contrib::broadcast_strides;
 
 impl OxiAttentionOp {
     fn run(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
@@ -301,16 +288,35 @@ impl OxiAttentionOp {
         let bias = ctx.optional_input(3);
         let scores_shape = ctx.optional_input(4);
         let attrs = ctx.attrs();
-        let hq = attrs.i("q_num_heads", 0).max(0) as usize;
-        let hkv = attrs.i("kv_num_heads", 0).max(0) as usize;
+        let hq_attr = attrs.i("q_num_heads", 0).max(0) as usize;
+        let hkv_attr = attrs.i("kv_num_heads", 0).max(0) as usize;
+        let (q_bnsh, kv_bnsh) = (attrs.i("q_bnsh", 0) != 0, attrs.i("kv_bnsh", 0) != 0);
         let bad = |m: String| err(format!("OxiAttention '{}': {m}", ctx.node.name));
-        if q.ndim() != 3 || k.ndim() != 3 || v.shape != k.shape || hq == 0 || hkv == 0 || hq % hkv != 0 {
-            return Err(bad(format!("unsupported shapes q {:?} k {:?} v {:?}, heads {hq}/{hkv}", q.shape, k.shape, v.shape)));
-        }
-        let (b, s, t) = (q.shape[0], q.shape[1], k.shape[1]);
-        let d = q.shape[2] / hq;
-        if d * hq != q.shape[2] || k.shape[0] != b || k.shape[2] != hkv * d {
-            return Err(bad(format!("q {:?} / k {:?} do not split into {hq}/{hkv} heads", q.shape, k.shape)));
+        let (b, s, t, hq, hkv, d, out_shape);
+        if q.ndim() == 4 {
+            // Head-split 4-D form: heads and head size come from the shapes.
+            if k.ndim() != 4 || v.shape != k.shape {
+                return Err(bad(format!("unsupported shapes q {:?} k {:?} v {:?}", q.shape, k.shape, v.shape)));
+            }
+            let (qs, ks) = (&q.shape, &k.shape);
+            (b, hq, s, d) = if q_bnsh { (qs[0], qs[1], qs[2], qs[3]) } else { (qs[0], qs[2], qs[1], qs[3]) };
+            let (kb, kh, kt, kd) = if kv_bnsh { (ks[0], ks[1], ks[2], ks[3]) } else { (ks[0], ks[2], ks[1], ks[3]) };
+            (hkv, t) = (kh, kt);
+            if kb != b || kd != d || hq == 0 || hkv == 0 || hq % hkv != 0 || (hq_attr != 0 && hq_attr != hq) || (hkv_attr != 0 && hkv_attr != hkv) {
+                return Err(bad(format!("q {:?} / k {:?} do not form attention heads (q_bnsh {q_bnsh}, kv_bnsh {kv_bnsh})", q.shape, k.shape)));
+            }
+            out_shape = vec![b, s, hq, d];
+        } else {
+            (hq, hkv) = (hq_attr, hkv_attr);
+            if q.ndim() != 3 || k.ndim() != 3 || v.shape != k.shape || hq == 0 || hkv == 0 || hq % hkv != 0 || q_bnsh || kv_bnsh {
+                return Err(bad(format!("unsupported shapes q {:?} k {:?} v {:?}, heads {hq}/{hkv}", q.shape, k.shape, v.shape)));
+            }
+            (b, s, t) = (q.shape[0], q.shape[1], k.shape[1]);
+            d = q.shape[2] / hq;
+            if d * hq != q.shape[2] || k.shape[0] != b || k.shape[2] != hkv * d {
+                return Err(bad(format!("q {:?} / k {:?} do not split into {hq}/{hkv} heads", q.shape, k.shape)));
+            }
+            out_shape = q.shape.clone();
         }
         let (g, r) = (hkv, hq / hkv);
         if let Some(ss) = scores_shape {
@@ -333,9 +339,10 @@ impl OxiAttentionOp {
             }
         };
         let scale = attrs.f("scale", 1.0 / (d as f32).sqrt());
-        shape_slot(&mut slots[0], &q.shape);
+        shape_slot(&mut slots[0], &out_shape);
         let dims = AttnDims { batch: b, seq_q: s, seq_kv: t, q_heads: hq, kv_heads: hkv, head_dim: d, scale };
-        contrib::attention_into(&q.data, &k.data, &v.data, bias, dims, &mut slots[0].data).map_err(bad)
+        let ext = contrib::AttnExt { q_bnsh, kv_bnsh, ..contrib::AttnExt::default() };
+        contrib::attention_ext_into(&q.data, &k.data, &v.data, bias, ext, dims, &mut slots[0].data).map_err(bad)
     }
 }
 
@@ -681,6 +688,83 @@ impl Operator for OxiMatMulActOp {
     }
 }
 
+// ── OxiRotateHalf (optimizer-only) ───────────────────────────────────────────
+
+/// The written-out rotary embedding of HF exports,
+/// `x * cos + concat(-x[.., hi], x[.., lo]) * sin` along the last axis, emitted
+/// by the optimizer's rotate-half fusion (see [`crate::contrib::rotate_half_into`]).
+///
+/// Inputs: `x`, `cos`, `sin` (`cos`/`sin` broadcast to `x`). The halves come
+/// from the attributes: `lo` / `hi` = `[start, end]` with `Slice` semantics
+/// (negative = from the end, clamped), or `split` = `[a, b]` (exactly
+/// `[0, a)` and `[a, a + b)`, `a + b` must be the last axis), or `halves` = 1
+/// (`Split` into two: `[0, ceil(D/2))` and the rest).
+/// Output: the shape of `x`.
+pub struct OxiRotateHalfOp;
+
+impl OxiRotateHalfOp {
+    fn halves(attrs: &oxionnx_core::Attributes, d: usize) -> Result<(std::ops::Range<usize>, std::ops::Range<usize>), String> {
+        let clamp = |v: i64| (if v < 0 { v + d as i64 } else { v }).clamp(0, d as i64) as usize;
+        let range = |k: &str| -> Result<std::ops::Range<usize>, String> {
+            match attrs.ints(k) {
+                [s, e] => Ok(clamp(*s)..clamp(*e).max(clamp(*s))),
+                other => Err(format!("attribute {k} = {other:?} is not [start, end]")),
+            }
+        };
+        if attrs.i("halves", 0) != 0 {
+            let c = d.div_ceil(2);
+            return Ok((0..c, c..d));
+        }
+        match attrs.ints("split") {
+            [a, b] if *a >= 0 && *b >= 0 => {
+                let (a, b) = (*a as usize, *b as usize);
+                if a + b != d {
+                    return Err(format!("split [{a}, {b}] does not cover the last axis ({d})"));
+                }
+                Ok((0..a, a..d))
+            }
+            [] => Ok((range("lo")?, range("hi")?)),
+            other => Err(format!("split = {other:?} is not two sizes")),
+        }
+    }
+
+    fn run(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
+        use crate::contrib::RotateHalfTable;
+        let (x, cos, sin) = (ctx.input(0)?, ctx.input(1)?, ctx.input(2)?);
+        let bad = |m: String| err(format!("OxiRotateHalf '{}': {m}", ctx.node.name));
+        let d = *x.shape.last().ok_or_else(|| bad("scalar input".into()))?;
+        let (lo, hi) = Self::halves(ctx.attrs(), d).map_err(bad)?;
+        shape_slot(&mut slots[0], &x.shape);
+        contrib::rotate_half_into(
+            &x.data,
+            &x.shape,
+            RotateHalfTable { data: &cos.data, shape: &cos.shape },
+            RotateHalfTable { data: &sin.data, shape: &sin.shape },
+            lo,
+            hi,
+            &mut slots[0].data,
+        )
+        .map_err(bad)
+    }
+}
+
+impl Operator for OxiRotateHalfOp {
+    fn op_type(&self) -> &str {
+        "OxiRotateHalf"
+    }
+    fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+        let mut slots = empty_slots(ctx);
+        self.run(ctx, &mut slots)?;
+        Ok(slots)
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
+    fn execute_into_slots(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
+        self.run(ctx, slots)
+    }
+}
+
 // ── OxiMatMulSplit (optimizer-only) ──────────────────────────────────────────
 
 /// Projection by a constant 2-D weight, split along its columns into several
@@ -694,7 +778,9 @@ impl Operator for OxiMatMulActOp {
 /// `position_ids`, `cos_cache`, `sin_cache`.
 /// Attributes: `split` (output widths), `epsilon`, `rotate` (per output, 1 =
 /// rotary), `interleaved`, `num_heads`, `rotary_embedding_dim` (as for the
-/// rotary op, applied to each rotated output).
+/// rotary op, applied to each rotated output), `norm_out` (per output, 1 = a
+/// per-head RMSNorm after the split, its `[D]` gamma one of inputs 8..; used
+/// instead of `head_gamma`, which norms every output).
 /// Outputs: `[.., split[o]]` each (`[d0, M/d0, split[o]]` with the head norm,
 /// as the norm's reshape pair produces).
 #[derive(Default)]
@@ -722,8 +808,26 @@ impl OxiMatMulSplitOp {
             }
         }
         let m = x.data.len() / k.max(1);
+        // Per-output head norms: `norm_out[o]` = 1 takes the next gamma from inputs 8...
+        let norm_out: Vec<bool> = attrs.ints("norm_out").iter().map(|&v| v != 0).collect();
+        if !norm_out.is_empty() && (gamma.is_some() || norm_out.len() != splits.len()) {
+            return Err(bad(format!("norm_out {norm_out:?} needs no head_gamma and one flag per output")));
+        }
+        let eps = attrs.f("epsilon", 1e-5);
+        let mut norms = Vec::with_capacity(splits.len());
+        let mut next = 8;
+        for o in 0..splits.len() {
+            norms.push(match (gamma, norm_out.get(o)) {
+                (Some(g), _) => Some(HeadNorm { gamma: &g.data, eps }),
+                (None, Some(true)) => {
+                    next += 1;
+                    Some(HeadNorm { gamma: &ctx.input(next - 1)?.data, eps })
+                }
+                _ => None,
+            });
+        }
         // Output row geometry: the head norm's reshape pair yields [d0, M/d0, .].
-        let lead: Vec<usize> = if gamma.is_some() {
+        let lead: Vec<usize> = if norms.iter().any(Option::is_some) {
             if x.ndim() < 2 {
                 return Err(bad("head norm needs x of rank >= 2".into()));
             }
@@ -762,7 +866,7 @@ impl OxiMatMulSplitOp {
         let spec = SplitSpec {
             splits: splits.clone(),
             bias: bias.map(|t| &t.data[..]),
-            norm: gamma.map(|g| HeadNorm { gamma: &g.data, eps: attrs.f("epsilon", 1e-5) }),
+            norms,
             col_scale: col_scale.map(|t| &t.data[..]),
             rotary,
             rotate,

@@ -650,6 +650,7 @@ impl GroupQueryAttentionOp {
             softcap,
             sink,
             kv_bnsh: false,
+            q_bnsh: false,
         };
         let scale = scale_attr(ctx, d);
         let dims = AttnDims { batch: b, seq_q: s, seq_kv: tbuf, q_heads: hq, kv_heads: hkv, head_dim: d, scale };

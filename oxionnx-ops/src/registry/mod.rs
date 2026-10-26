@@ -184,6 +184,7 @@ pub fn default_registry() -> OperatorRegistry {
     r.register(Box::new(contrib_attention::MsMultiHeadAttentionOp));
     r.register(Box::new(contrib_attention::GroupQueryAttentionOp));
     r.register(Box::new(contrib_ops::OxiAttentionOp));
+    r.register(Box::new(contrib_ops::OxiRotateHalfOp));
     r.register(Box::new(contrib_ops::OxiMatMulActOp::default()));
     r.register(Box::new(contrib_ops::OxiMatMulSplitOp::default()));
     r.register(Box::new(nbits_ops::MatMulNBitsOp::new(false)));

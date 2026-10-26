@@ -9,6 +9,9 @@ use std::path::Path;
 use super::types::{raw_meta_to_model_metadata, ModelMetadata, OptLevel};
 use super::Session;
 
+/// Smallest byte budget of a session's activation pool (see `SizeClassPool`).
+const MIN_POOL_BUDGET_BYTES: usize = 64 << 20;
+
 // ── Load-path instrumentation ───────────────────────────────────────────────
 
 /// The `tracing` target every load-path span and event is emitted under.
@@ -63,34 +66,107 @@ pub(crate) fn parse_stage<T, E>(
 /// soon as the tensor has been decoded (see
 /// [`crate::model::load_with_metadata_releasing`]). Loading a model with inline
 /// weights then needs about one copy of the weights in memory, not three.
+///
+/// Large tables read only by row lookups (embedding `Gather`s, see
+/// [`oxionnx_proto::lazy`]) are not decoded at all: they stay in the mapped
+/// `.onnx` or external-data file, registered with `registry`
+/// ([`OperatorRegistry::mapped_weight`]), and only the pages of the rows a run
+/// reads become resident. Not with [`OperatorRegistry::keep_weights`], or with
+/// `OXIONNX_MAP_TABLES=0`.
 pub(crate) fn parse_file(
     path: &Path,
+    registry: &OperatorRegistry,
 ) -> Result<(oxionnx_proto::model::RawModelMeta, Graph, HashMap<String, Tensor>), OnnxError> {
     let base_path = path.parent().unwrap_or_else(|| Path::new("."));
     #[cfg(not(target_arch = "wasm32"))]
     {
         let file = std::fs::File::open(path)
             .map_err(|e| OnnxError::Parse(format!("Cannot read ONNX file {}: {e}", path.display())))?;
-        // SAFETY: the mapping is read-only and private, and lives only for this
-        // parse: every tensor is copied out into owned storage before the map is
-        // dropped at the end of this block. As with any file mapping, the file
-        // must not be truncated or rewritten while the model loads.
+        // SAFETY: the mapping is read-only and private. Tensors are copied out
+        // into owned storage, except the mapped tables, which keep the map
+        // alive through the registry and only ever read it. As with any file
+        // mapping, the file must not be truncated or rewritten while the
+        // session uses it.
         #[allow(unsafe_code)]
-        let map = unsafe { memmap2::Mmap::map(&file) }
-            .map_err(|e| OnnxError::Parse(format!("Cannot map ONNX file {}: {e}", path.display())))?;
+        let map = std::sync::Arc::new(
+            unsafe { memmap2::Mmap::map(&file) }
+                .map_err(|e| OnnxError::Parse(format!("Cannot map ONNX file {}: {e}", path.display())))?,
+        );
         let release = |range: std::ops::Range<usize>| release_pages(&map, range);
-        parse_stage("file", map.len(), || {
-            crate::model::load_with_metadata_releasing(&map, Some(base_path), &mut { release })
+        let min_lazy = map_tables(registry).then_some(oxionnx_proto::lazy::DEFAULT_MIN_LAZY_BYTES);
+        let (meta, graph, weights, lazy) = parse_stage("file", map.len(), || {
+            crate::model::load_with_metadata_lazy(&map, Some(base_path), &mut { release }, min_lazy)
         })
-        .map_err(OnnxError::Parse)
+        .map_err(OnnxError::Parse)?;
+        register_mapped(lazy, &map, registry)?;
+        Ok((meta, graph, weights))
     }
     #[cfg(target_arch = "wasm32")]
     {
+        let _ = registry;
         let bytes = std::fs::read(path)
             .map_err(|e| OnnxError::Parse(format!("Cannot read ONNX file {}: {e}", path.display())))?;
         parse_stage("file", bytes.len(), || crate::model::load_with_metadata_and_path(&bytes, base_path))
             .map_err(OnnxError::Parse)
     }
+}
+
+/// Whether [`parse_file`] leaves row-lookup tables in the mapped file.
+#[cfg(not(target_arch = "wasm32"))]
+fn map_tables(registry: &OperatorRegistry) -> bool {
+    !registry.keep_weights() && std::env::var("OXIONNX_MAP_TABLES").map_or(true, |v| v != "0")
+}
+
+/// Register the tables the loader left in the file: inline ones point into
+/// `model` (the mapped `.onnx`), external ones into a mapping of their data
+/// file (one per file).
+#[cfg(not(target_arch = "wasm32"))]
+fn register_mapped(
+    lazy: Vec<oxionnx_proto::lazy::LazyInit>,
+    model: &std::sync::Arc<memmap2::Mmap>,
+    registry: &OperatorRegistry,
+) -> Result<(), OnnxError> {
+    use oxionnx_core::mapped::SharedBytes;
+    use oxionnx_proto::lazy::LazySource;
+    let mut files: HashMap<std::path::PathBuf, std::sync::Arc<memmap2::Mmap>> = HashMap::new();
+    let mut total = 0usize;
+    for l in lazy {
+        let (map, range) = match l.source {
+            LazySource::Inline(range) => (model.clone(), range),
+            LazySource::External { path, offset, length } => {
+                let map = match files.get(&path) {
+                    Some(m) => m.clone(),
+                    None => {
+                        let file = std::fs::File::open(&path).map_err(|e| {
+                            OnnxError::Parse(format!("Cannot read external data file {}: {e}", path.display()))
+                        })?;
+                        // SAFETY: as for the model file in `parse_file`.
+                        #[allow(unsafe_code)]
+                        let m = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
+                            OnnxError::Parse(format!("Cannot map external data file {}: {e}", path.display()))
+                        })?);
+                        files.insert(path.clone(), m.clone());
+                        m
+                    }
+                };
+                let start = usize::try_from(offset)
+                    .map_err(|_| OnnxError::Parse(format!("'{}': offset {offset} is not addressable", l.name)))?;
+                (map, start..start.saturating_add(length))
+            }
+        };
+        // Rows are read at random: fault in single pages, not read-ahead windows.
+        #[cfg(unix)]
+        let _ = map.advise_range(memmap2::Advice::Random, range.start, range.len());
+        total += range.len();
+        let owner: SharedBytes = map;
+        let weight = oxionnx_core::MappedWeight::new(owner, range, l.data_type)
+            .ok_or_else(|| OnnxError::Parse(format!("'{}': stored bytes are outside the mapped file", l.name)))?;
+        registry.set_mapped_weight(l.name, weight);
+    }
+    if total > 0 {
+        tracing::debug!(target: LOAD_TARGET, stage = "map_tables", bytes = total, "row-lookup tables left in the mapped file");
+    }
+    Ok(())
 }
 
 /// Drop the whole pages of `range` from a read-only file mapping. They are not
@@ -115,9 +191,11 @@ fn release_pages(map: &memmap2::Mmap, range: std::ops::Range<usize>) {
 impl Session {
     /// Load an ONNX model from a `.onnx` file.
     /// Supports models with external data by resolving paths relative to the file's directory.
+    /// As with [`super::SessionBuilder::load`], large embedding tables are
+    /// read from the mapped file while the session lives.
     pub fn from_file(path: &Path) -> Result<Self, OnnxError> {
         let registry = oxionnx_ops::default_registry();
-        let (raw_meta, graph, weights) = parse_file(path)?;
+        let (raw_meta, graph, weights) = parse_file(path, &registry)?;
         let metadata = raw_meta_to_model_metadata(raw_meta);
         Self::build_from_graph(
             graph,
@@ -146,7 +224,7 @@ impl Session {
         path: &Path,
         registry: OperatorRegistry,
     ) -> Result<Self, OnnxError> {
-        let (raw_meta, graph, weights) = parse_file(path)?;
+        let (raw_meta, graph, weights) = parse_file(path, &registry)?;
         let metadata = raw_meta_to_model_metadata(raw_meta);
         Self::build_from_graph(
             graph,
@@ -341,7 +419,16 @@ impl Session {
                 &weights,
                 &declared_input_shapes,
             );
-            (Some(Mutex::new(SizeClassPool::new())), Some(shapes))
+            // A budgeted pool: each run raises the budget to the peak bytes of live
+            // intermediates it reaches (see `SessionRunState::insert`), so the
+            // free lists never hold much more than one run can use. The floor
+            // keeps small graphs (single queries) fully pooled: below it the
+            // cache costs little, and handing every buffer back to the allocator
+            // instead made RSS creep up more over a stream of differently sized
+            // runs, as freed memory spread over the worker threads' heaps.
+            let mut pool = SizeClassPool::new();
+            pool.raise_budget(MIN_POOL_BUDGET_BYTES);
+            (Some(Mutex::new(pool)), Some(shapes))
         } else {
             (None, None)
         };
@@ -412,6 +499,13 @@ impl Session {
         // On wasm32 there is no thread pool, so the argument is intentionally unused.
         #[cfg(target_arch = "wasm32")]
         let _ = num_threads;
+
+        // Tables left in the mapped model file stay there only if every
+        // consumer of the optimized graph reads them from it.
+        let mapped_bytes = super::prepack::settle_mapped(&sorted_nodes, &mut weights, &output_names, &registry);
+        if mapped_bytes > 0 {
+            tracing::debug!(target: LOAD_TARGET, stage = "map_tables", mapped_bytes, "tables served from the mapped file");
+        }
 
         // Load-time weight packing (BF16 weights); runs after shape inference
         // and planning, which may still read initializer data.
