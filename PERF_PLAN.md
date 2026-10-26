@@ -95,10 +95,11 @@ These items mostly touch independent files and can proceed in parallel.
 - **Expected:** about −390 ms on arctic per 8-doc batch. Also helps other BERT-family exports.
 - **Files:** `src/optimizer/fusion/` (GELU pattern), `src/optimizer/fusion/matmul_act.rs`, `oxionnx-ops/src/gelu.rs`.
 
-### [ ] P1.5 LayerNormalization kernel
+### [x] P1.5 LayerNormalization kernel ([#16](https://github.com/tarekalmowafy/oxionnx/pull/16))
 - **Problem:** `LayerNormalization` costs 55 ms on granite-english-r2 (ModernBERT) and 30 ms on arctic per 8-doc batch, against 20 ms on ORT, which fuses it with the residual add (`SkipLayerNormalization`).
 - **Plan:** a vectorised row kernel that computes mean and variance in one pass and runs in parallel over rows, with an output-slot path. Fuse `Add → LayerNormalization` into `SkipLayerNormalization`; the native op already exists for the simplified variant.
 - **Files:** `oxionnx-ops/src/nn/` (layer norm), `src/optimizer/fusion/`.
+- **Result:** `oxionnx-ops/src/norm_rows.rs` is a shared row kernel: memory is read once, the variance is a corrected two-pass over the L1-resident row, rows run in parallel, and the loops are AVX-512/AVX2 multiversioned. `Add → LayerNormalization` is fused into `SkipLayerNormalization`. Norm + residual `Add`, doc-b8 at 8T, in ms: granite-en-r2 60.2 → 19.7 (ORT 30.8); arctic 44.4 → 11.7 (ORT 27.4); granite-311m 77.9 → 23.7; granite-97m 23.9 → 7.7; granite-small 15.6 → 5.7. doc-b8 wall time: granite-en-r2 −11%, granite-311m −7%, granite-small −7%. Cosine vs ORT 1.0000000.
 
 ---
 
@@ -115,8 +116,14 @@ The MatMul, QKV and attention fusions were written against EmbeddingGemma-2's gr
 - **Current cost:** MHA/GQA time is 140–144 ms against ORT's 199–221 ms on the 0.6B models, so this item is mostly about thread scaling and the small models.
 - **Files:** `oxionnx-ops/src/registry/contrib_attention.rs`, `oxionnx-ops/src/contrib.rs`.
 
-### [ ] P2.3 `SkipLayerNormalization` / `SkipSimplifiedLayerNormalization` for all exporters
+### [x] P2.3 `SkipLayerNormalization` / `SkipSimplifiedLayerNormalization` for all exporters ([#16](https://github.com/tarekalmowafy/oxionnx/pull/16))
 - **Plan:** match the residual `Add` + norm pairs these exports use, and keep the native ops on the output-slot path.
+- **Result:** `fuse_skip_norm` covers four cases:
+  - ModernBERT/granite: `Add → LN`, with the sum reused, and also with beta from a `Constant` node.
+  - arctic: decomposed LN after `Add(x, MatMul + bias)`, with the bias folded in.
+  - Gemma 3 / harrier-270m: `Add → SimplifiedLayerNormalization`.
+
+  The Qwen3/pplx/voyage/jina/harrier-0.6b exports already use `SkipSimplifiedLayerNormalization`. Their other SLNs are per-head norms, so there was nothing to fuse there. None of the zoo exports writes out RMSNorm as Pow/ReduceMean/…; the lone Pow/Sqrt/Div is the final L2 normalise. On those models oxionnx norm time was already 3–4× below ORT's: 25–30 ms against 96–110 ms on the 0.6B models. Norm time on them is unchanged within about 2 ms.
 
 ---
 
