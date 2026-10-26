@@ -1304,6 +1304,7 @@ fn fully_writes_slot(node: &Node, idx: usize) -> bool {
     match node.op.as_str() {
         "Split" | "SkipSimplifiedLayerNormalization" | "OxiMatMulSplit" | "MatMulNBits" | "OxiMatMulNBits"
         | "GatherBlockQuantized" | "com.microsoft.MultiHeadAttention" | "GroupQueryAttention" => true,
+        "LayerNormalization" | "SkipLayerNormalization" => true,
         "com.microsoft.RotaryEmbedding" | "OxiAttention" | "OxiMatMulAct" => idx == 0,
         "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "SiLU" | "Erf" | "Concat" | "Transpose"
         | "SimplifiedLayerNormalization" => idx == 0,
@@ -1331,6 +1332,7 @@ fn shape_depends_only_on_input_shapes(node: &Node, weights: &HashMap<String, Ten
         | "SimplifiedLayerNormalization" => true,
         "SkipSimplifiedLayerNormalization" | "com.microsoft.RotaryEmbedding" | "OxiAttention" | "OxiMatMulAct"
         | "OxiMatMulSplit" | "MatMulNBits" | "OxiMatMulNBits" | "GatherBlockQuantized" => true,
+        "LayerNormalization" | "SkipLayerNormalization" => true,
         // Outputs depend on input shapes only (GQA's present length also on
         // `total_sequence_length`, fixed by the input shapes in practice; the
         // kernels size their outputs themselves either way).

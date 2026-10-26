@@ -56,70 +56,9 @@ pub fn skip_rms_norm_into(
     sum_out: Option<&mut [f32]>,
     inv_std_out: Option<&mut [f32]>,
 ) -> Result<(), String> {
-    if hidden == 0 || x.is_empty() {
-        return Ok(());
-    }
-    if x.len() % hidden != 0 || skip.is_empty() || skip.len() % hidden != 0 || x.len() % skip.len() != 0 {
-        return Err(format!(
-            "SkipSimplifiedLayerNormalization: skip ({} elems) does not tile input ({} elems, hidden {hidden})",
-            skip.len(),
-            x.len()
-        ));
-    }
-    if gamma.len() != hidden || bias.is_some_and(|b| b.len() != hidden) {
-        return Err(format!(
-            "SkipSimplifiedLayerNormalization: gamma/bias must have {hidden} elements"
-        ));
-    }
-    if out.len() < x.len()
-        || sum_out.as_ref().is_some_and(|s| s.len() < x.len())
-        || inv_std_out.as_ref().is_some_and(|s| s.len() < x.len() / hidden)
-    {
-        return Err("SkipSimplifiedLayerNormalization: output buffer too small".into());
-    }
-    let rows = x.len() / hidden;
-    let skip_rows = skip.len() / hidden;
-    let op = SendPtr(out.as_mut_ptr());
-    let sp = sum_out.map(|s| SendPtr(s.as_mut_ptr()));
-    let ip = inv_std_out.map(|s| SendPtr(s.as_mut_ptr()));
-    let min_rows = (crate::par::MIN_ELEMS_PER_TASK / hidden).max(1);
-    par_ranges(rows, min_rows, |lo, hi| {
-        let (op, sp, ip) = (op, sp, ip);
-        for r in lo..hi {
-            let xi = &x[r * hidden..(r + 1) * hidden];
-            let si = &skip[(r % skip_rows) * hidden..(r % skip_rows + 1) * hidden];
-            // SAFETY: row `r` of each output is written by this task only.
-            let o = unsafe { std::slice::from_raw_parts_mut(op.0.add(r * hidden), hidden) };
-            // Stage the sum in `o`, then normalise it in place.
-            let mut lanes = [0.0f32; 8];
-            let mut j = 0;
-            while j + 8 <= hidden {
-                for l in 0..8 {
-                    let v = xi[j + l] + si[j + l] + bias.map_or(0.0, |b| b[j + l]);
-                    o[j + l] = v;
-                    lanes[l] += v * v;
-                }
-                j += 8;
-            }
-            let mut tail = 0.0f32;
-            for jj in j..hidden {
-                let v = xi[jj] + si[jj] + bias.map_or(0.0, |b| b[jj]);
-                o[jj] = v;
-                tail += v * v;
-            }
-            let inv = ((lanes.iter().sum::<f32>() + tail) / hidden as f32 + eps).sqrt().recip();
-            if let Some(p) = sp {
-                unsafe { std::slice::from_raw_parts_mut(p.0.add(r * hidden), hidden) }.copy_from_slice(o);
-            }
-            if let Some(p) = ip {
-                unsafe { *p.0.add(r) = inv };
-            }
-            for (ov, &g) in o.iter_mut().zip(gamma) {
-                *ov = *ov * inv * g;
-            }
-        }
-    });
-    Ok(())
+    let args = crate::norm_rows::NormRows { x, skip: Some(skip), bias, gamma, beta: None, hidden, eps, rms: true };
+    crate::norm_rows::norm_rows_into(&args, crate::norm_rows::NormRowsOut { out, sum: sum_out, mean: None, inv_std: inv_std_out })
+        .map_err(|e| format!("SkipSimplifiedLayerNormalization: {e}"))
 }
 
 // ── com.microsoft::RotaryEmbedding ───────────────────────────────────────────

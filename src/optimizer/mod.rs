@@ -184,6 +184,14 @@ pub fn optimize_with_input_shapes(
     let pre_fold_shapes = shape_inference::infer_shapes(&nodes, weights, input_shapes);
     let nodes = fusion::fold_batch_norm_inference(nodes, weights, &pre_fold_shapes);
     let nodes = fusion::fuse_layer_norm(nodes, weights, &pre_fold_shapes, output_names);
+    // Residual Add + norm, after the decomposed-LayerNorm fold above.
+    let nodes = fusion::fuse_skip_norm(
+        nodes,
+        weights,
+        output_names,
+        registry.get("SkipLayerNormalization").is_some(),
+        registry.get("SkipSimplifiedLayerNormalization").is_some(),
+    );
     // Spatial normalization chains, *after* LayerNorm: on a 4-D tensor
     // `axes=[2,3]` is also the trailing pair `[-2,-1]`, so running LayerNorm
     // first gives it first refusal on any chain it can fold the affine term

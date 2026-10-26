@@ -179,6 +179,7 @@ pub fn default_registry() -> OperatorRegistry {
 
     // ── ONNX Runtime contrib ops and optimizer-only fused ops ──────────────
     r.register(Box::new(contrib_ops::SkipSimplifiedLayerNormOp));
+    r.register(Box::new(contrib_ops::SkipLayerNormOp));
     r.register(Box::new(contrib_ops::MsRotaryEmbeddingOp));
     r.register(Box::new(contrib_attention::MsMultiHeadAttentionOp));
     r.register(Box::new(contrib_attention::GroupQueryAttentionOp));
