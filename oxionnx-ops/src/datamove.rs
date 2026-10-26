@@ -101,7 +101,7 @@ pub(crate) fn strided_copy(src: &[f32], offset: isize, shape: &[usize], strides:
         }
     };
     let t = crate::par::threads();
-    let min = crate::par::MIN_ELEMS_PER_TASK;
+    let min = crate::par::min_elems();
     if t <= 1 || dst.len() < 2 * min || rows < 2 {
         walk(0, dst);
         return;

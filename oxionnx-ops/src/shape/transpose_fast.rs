@@ -84,7 +84,7 @@ pub(crate) fn transpose_into(src: &[f32], shape: &[usize], perm: &[usize], out: 
         let run = in_shape[nd - 1];
         let n_outer = numel / run;
         let outer_shape = &out_shape[..nd - 1];
-        let per_task = (crate::par::MIN_ELEMS_PER_TASK / run).max(1);
+        let per_task = (crate::par::min_elems() / run).max(1);
         par_blocks(n_outer, per_task, numel, |lo, hi| {
             for blk in lo..hi {
                 let (mut r, mut in_off) = (blk, 0);
@@ -108,9 +108,15 @@ pub(crate) fn transpose_into(src: &[f32], shape: &[usize], perm: &[usize], out: 
     let (in_q, out_p) = (is[q], os[p]);
     let others: Vec<usize> = (0..nd).filter(|&k| k != p && k != nd - 1).collect();
     let n_outer = numel / (rows * cols);
-    let per_task = (crate::par::MIN_ELEMS_PER_TASK / (rows * cols)).max(1);
+    let per_task = (crate::par::min_elems() / (rows * cols)).max(1);
     par_blocks(n_outer, per_task, numel, |lo, hi| {
+        // Each B x B tile is staged through a stack buffer: contiguous 64-byte
+        // reads of B input rows, then contiguous writes of B output rows. Writing
+        // each element straight to its strided output position instead was ~5x
+        // slower ([48, 768] -> [768, 48]: 108 us vs 19 us on Zen 4), the
+        // interleaved strided stores and loads defeating the load/store units.
         const B: usize = 16;
+        let mut tmp = [[0f32; B]; B];
         for blk in lo..hi {
             let (mut r, mut in_base, mut out_base) = (blk, 0, 0);
             for &k in others.iter().rev() {
@@ -120,12 +126,19 @@ pub(crate) fn transpose_into(src: &[f32], shape: &[usize], perm: &[usize], out: 
                 out_base += c * os[k];
             }
             for i0 in (0..rows).step_by(B) {
+                let bi = B.min(rows - i0);
                 for j0 in (0..cols).step_by(B) {
-                    for j in j0..(j0 + B).min(cols) {
-                        let s = &src[in_base + j * in_q + i0..in_base + j * in_q + (i0 + B).min(rows)];
-                        for (ii, &v) in s.iter().enumerate() {
-                            // SAFETY: (blk, i, j) maps to a unique in-bounds output index.
-                            unsafe { *op.0.add(out_base + (i0 + ii) * out_p + j) = v };
+                    let bj = B.min(cols - j0);
+                    for (j, t) in tmp.iter_mut().enumerate().take(bj) {
+                        let s0 = in_base + (j0 + j) * in_q + i0;
+                        t[..bi].copy_from_slice(&src[s0..s0 + bi]);
+                    }
+                    for i in 0..bi {
+                        // SAFETY: output row (blk, i0 + i), columns j0..j0 + bj, is
+                        // in bounds and written by this block only.
+                        let o = unsafe { std::slice::from_raw_parts_mut(op.0.add(out_base + (i0 + i) * out_p + j0), bj) };
+                        for (j, x) in o.iter_mut().enumerate() {
+                            *x = tmp[j][i];
                         }
                     }
                 }
@@ -138,7 +151,7 @@ pub(crate) fn transpose_into(src: &[f32], shape: &[usize], perm: &[usize], out: 
 fn par_blocks(n: usize, per_task: usize, numel: usize, f: impl Fn(usize, usize) + Sync) {
     let tasks = n.div_ceil(per_task);
     #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
-    if tasks > 1 && numel >= 2 * crate::par::MIN_ELEMS_PER_TASK && crate::par::threads() > 1 {
+    if tasks > 1 && numel >= 2 * crate::par::min_elems() && crate::par::threads() > 1 {
         use rayon::prelude::*;
         (0..tasks).into_par_iter().for_each(|t| f(t * per_task, ((t + 1) * per_task).min(n)));
         return;
@@ -193,6 +206,62 @@ mod tests {
                 let mut got = vec![f32::NAN; n];
                 pool.install(|| transpose_into(&src, &shape, &perm, &mut got));
                 assert_eq!(got, want, "shape {shape:?} perm {perm:?}");
+            }
+        }
+    }
+
+    /// Timing (not a test): `TRANSPOSE_BENCH=1,48,12,64:0,2,3,1` `cargo test --release ... bench_transpose -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_transpose() {
+        let spec = std::env::var("TRANSPOSE_BENCH").unwrap_or_else(|_| "1,48,12,64:0,2,3,1;1,48,12,64:0,2,1,3".into());
+        for case in spec.split(';') {
+            let (sh, pm) = case.split_once(':').unwrap();
+            let shape: Vec<usize> = sh.split(',').map(|v| v.parse().unwrap()).collect();
+            let perm: Vec<usize> = pm.split(',').map(|v| v.parse().unwrap()).collect();
+            let n: usize = shape.iter().product();
+            let src: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            let mut out = vec![0f32; n];
+            let pl = coalesce(&shape, &perm);
+            println!("plan in_shape {:?} perm {:?}", pl.in_shape, pl.perm);
+            let mut best = f64::MAX;
+            for _ in 0..200 {
+                let t0 = std::time::Instant::now();
+                transpose_into(&src, &shape, &perm, &mut out);
+                best = best.min(t0.elapsed().as_secs_f64() * 1e6);
+            }
+            println!("transpose {shape:?} perm {perm:?}: {best:.1} us");
+            if pl.in_shape.len() == 2 {
+                let (cols, rows) = (pl.in_shape[0], pl.in_shape[1]);
+                let mut best = f64::MAX;
+                for _ in 0..200 {
+                    let t0 = std::time::Instant::now();
+                    for i in 0..rows { for j in 0..cols { out[i * cols + j] = src[j * rows + i]; } }
+                    std::hint::black_box(&out);
+                    best = best.min(t0.elapsed().as_secs_f64() * 1e6);
+                }
+                println!("  naive 2-D: {best:.1} us");
+                let mut best = f64::MAX;
+                for _ in 0..200 {
+                    let t0 = std::time::Instant::now();
+                    const B: usize = 16;
+                    let mut tmp = [[0f32; B]; B];
+                    for i0 in (0..rows).step_by(B) {
+                        for j0 in (0..cols).step_by(B) {
+                            let (bi, bj) = (B.min(rows - i0), B.min(cols - j0));
+                            for j in 0..bj {
+                                tmp[j][..bi].copy_from_slice(&src[(j0 + j) * rows + i0..(j0 + j) * rows + i0 + bi]);
+                            }
+                            for i in 0..bi {
+                                let o = &mut out[(i0 + i) * cols + j0..(i0 + i) * cols + j0 + bj];
+                                for j in 0..bj { o[j] = tmp[j][i]; }
+                            }
+                        }
+                    }
+                    std::hint::black_box(&out);
+                    best = best.min(t0.elapsed().as_secs_f64() * 1e6);
+                }
+                println!("  tile+tmp: {best:.1} us");
             }
         }
     }

@@ -227,9 +227,9 @@ impl Session {
         // and no ordering cycle exists.
         if let Ok(cached) = self.resolved_shapes.lock() {
             if self.memo_matches_inputs(&cached, &input_shapes) {
-                let plan = Arc::new(cached.clone());
+                let plan = Arc::clone(&cached);
                 drop(cached);
-                self.shape_plans.store(&input_shapes, &plan);
+                self.shape_plans.store_arc(&input_shapes, &plan);
                 return Ok(plan);
             }
         }
@@ -239,9 +239,9 @@ impl Session {
             &self.weights,
             &input_shapes,
         ));
-        self.shape_plans.store(&input_shapes, &shapes);
+        self.shape_plans.store_arc(&input_shapes, &shapes);
         if let Ok(mut memo) = self.resolved_shapes.lock() {
-            memo.clone_from(&shapes);
+            *memo = Arc::clone(&shapes);
         }
         Ok(shapes)
     }
@@ -265,7 +265,7 @@ impl Session {
         if self.memo_matches_inputs(&memo, input_shapes) {
             return;
         }
-        memo.clone_from(plan);
+        *memo = Arc::clone(plan);
     }
 
     /// Was `memo` produced from exactly the input shapes `input_shapes` describes?
@@ -307,7 +307,7 @@ impl Session {
     pub fn resolved_shapes(&self) -> HashMap<String, Vec<usize>> {
         self.resolved_shapes
             .lock()
-            .map(|s| s.clone())
+            .map(|s| (**s).clone())
             .unwrap_or_default()
     }
 }

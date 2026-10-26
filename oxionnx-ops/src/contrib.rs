@@ -141,7 +141,7 @@ pub fn ms_rotary_into(
     let cache = RotaryCache::new(position_ids, cos, sin, per_token_cache, batch, seq, rotary_dim / 2)?;
     let total_heads = batch * seq * num_heads;
     let op = SendPtr(out.as_mut_ptr());
-    let min_heads = (crate::par::MIN_ELEMS_PER_TASK / head_size.max(1)).max(1);
+    let min_heads = (crate::par::min_elems() / head_size.max(1)).max(1);
     par_ranges(total_heads, min_heads, |lo, hi| {
         let op = op;
         for hrow in lo..hi {

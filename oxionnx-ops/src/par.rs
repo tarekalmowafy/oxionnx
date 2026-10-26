@@ -6,6 +6,16 @@
 /// Minimum number of f32 elements a copy/elementwise task should touch.
 pub(crate) const MIN_ELEMS_PER_TASK: usize = 32 * 1024;
 
+/// The task size actually used: [`MIN_ELEMS_PER_TASK`], or `OXIONNX_PAR_MIN_ELEMS`
+/// (read once) for tuning experiments.
+#[inline]
+pub(crate) fn min_elems() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("OXIONNX_PAR_MIN_ELEMS").ok().and_then(|v| v.parse().ok()).filter(|&v| v > 0).unwrap_or(MIN_ELEMS_PER_TASK)
+    })
+}
+
 /// Number of worker threads available to the current rayon context.
 pub(crate) fn threads() -> usize {
     #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
@@ -30,7 +40,8 @@ where
     }
     let rows = out.len() / row_len;
     let t = threads();
-    if t <= 1 || out.len() < 2 * MIN_ELEMS_PER_TASK || rows < 2 {
+    let min = min_elems();
+    if t <= 1 || out.len() < 2 * min || rows < 2 {
         for (i, row) in out.chunks_mut(row_len).enumerate() {
             f(i, row);
         }
@@ -39,7 +50,7 @@ where
     #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     {
         use rayon::prelude::*;
-        let rows_per_task = MIN_ELEMS_PER_TASK.div_ceil(row_len).max(rows.div_ceil(4 * t)).max(1);
+        let rows_per_task = min.div_ceil(row_len).max(rows.div_ceil(4 * t)).max(1);
         out.par_chunks_mut(rows_per_task * row_len).enumerate().for_each(|(ti, block)| {
             for (j, row) in block.chunks_mut(row_len).enumerate() {
                 f(ti * rows_per_task + j, row);

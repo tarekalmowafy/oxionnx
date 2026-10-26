@@ -34,9 +34,9 @@ impl Session {
         let can_slot = !can_inplace && operator.supports_output_slots();
 
         if can_slot {
-            let t_acq = std::time::Instant::now();
+            let t_acq = phase_timers::start();
             let acquired = Self::acquire_output_slots(node, resolved_shapes, pool);
-            phase_timers::add(&phase_timers::ACQUIRE, t_acq.elapsed());
+            phase_timers::stop(&phase_timers::ACQUIRE, t_acq);
             if let Some(mut slots) = acquired {
                 let resolved_inputs: Vec<Option<&Tensor>> = node
                     .inputs
@@ -1351,15 +1351,32 @@ fn shape_depends_only_on_input_shapes(node: &Node, weights: &HashMap<String, Ten
 /// Prototype (onnx_spike) diagnostic: cumulative executor phase timers, printed per
 /// run when `OXIONNX_TRACE_TIMERS` is set.
 pub(crate) mod phase_timers {
+    //! `OXIONNX_TRACE_TIMERS=1`: per-run breakdown of where `run()` spends its
+    //! time outside the kernels, printed to stderr after every run.
     use std::sync::atomic::{AtomicU64, Ordering};
     pub(crate) static ACQUIRE: AtomicU64 = AtomicU64::new(0);
     pub(crate) static DISPATCH: AtomicU64 = AtomicU64::new(0);
     pub(crate) static KERNEL: AtomicU64 = AtomicU64::new(0);
     pub(crate) static RELEASE: AtomicU64 = AtomicU64::new(0);
     pub(crate) static RUN: AtomicU64 = AtomicU64::new(0);
+    /// `resolve_run_shapes` (shape-plan lookup, or inference on a miss).
+    pub(crate) static SHAPES: AtomicU64 = AtomicU64::new(0);
+    /// Storing shapes learned during the run into the plan cache.
+    pub(crate) static LEARN: AtomicU64 = AtomicU64::new(0);
     pub(crate) fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("OXIONNX_TRACE_TIMERS").is_some())
+    }
+    /// `Some(now)` when tracing, so untraced runs skip the clock reads.
+    #[inline]
+    pub(crate) fn start() -> Option<std::time::Instant> {
+        on().then(std::time::Instant::now)
+    }
+    #[inline]
+    pub(crate) fn stop(c: &AtomicU64, t: Option<std::time::Instant>) {
+        if let Some(t) = t {
+            add(c, t.elapsed());
+        }
     }
     pub(crate) fn add(c: &AtomicU64, d: std::time::Duration) {
         c.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
@@ -1367,8 +1384,8 @@ pub(crate) mod phase_timers {
     pub(crate) fn report() {
         let ms = |c: &AtomicU64| c.swap(0, Ordering::Relaxed) as f64 / 1e6;
         eprintln!(
-            "oxionnx-timers run {:.1} ms: dispatch {:.1} (kernel {:.1}, acquire {:.1}), release {:.1}",
-            ms(&RUN), ms(&DISPATCH), ms(&KERNEL), ms(&ACQUIRE), ms(&RELEASE)
+            "oxionnx-timers run {:.3} ms: dispatch {:.3} (kernel {:.3}, acquire {:.3}), release {:.3}, shapes {:.3}, learn {:.3}",
+            ms(&RUN), ms(&DISPATCH), ms(&KERNEL), ms(&ACQUIRE), ms(&RELEASE), ms(&SHAPES), ms(&LEARN)
         );
     }
 }
