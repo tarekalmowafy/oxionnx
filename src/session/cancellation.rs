@@ -394,11 +394,15 @@ pub(crate) fn wrap_registry(
 ) -> OperatorRegistry {
     let opset = inner.model_opset();
     let bf16_weights = inner.bf16_weights();
+    let bf16_split = inner.bf16_split_activations();
     let inner = Arc::new(inner);
     let mut wrapped = OperatorRegistry::new();
     wrapped.set_model_opset(opset);
     if let Some(on) = bf16_weights {
         wrapped.set_bf16_weights(on);
+    }
+    if let Some(on) = bf16_split {
+        wrapped.set_bf16_split_activations(on);
     }
     for op_type in reachable_op_types(nodes) {
         // `contains` and `get` agree by construction; the `let ... else` keeps

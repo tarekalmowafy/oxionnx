@@ -210,9 +210,11 @@ The MatMul, QKV and attention fusions were written against EmbeddingGemma-2's gr
 
 ## Phase 5: precision and quantisation
 
-### [ ] P5.1 BF16 weights accuracy on jina-embeddings-v5-text-nano
+### [~] P5.1 BF16 weights accuracy on jina-embeddings-v5-text-nano ([#17](https://github.com/tarekalmowafy/oxionnx/pull/17))
 - **Problem:** with `OXIONNX_BF16_WEIGHTS=1`, the minimum cosine against FP32 is 0.9974 (all other models ≥ 0.9999).
 - **Plan:** find the sensitive projections by switching BF16 per layer, then keep those in FP32 by default, or expose a per-op opt-out.
+- **Finding:** the plan's premise was wrong. The weights are not the cause: jina's (like most zoo checkpoints') are stored in BF16, so packing them as BF16 is exact (FP32 GEMM on BF16-rounded weights: cos 1.000000). The error comes from rounding the *activations* to BF16 in the kernel. A few inputs amplify that ~240x across the layers (doc batches: min 0.973, 2 of 32 docs), and no projection type or layer subset is responsible: keeping any one type, or the first/last half of the layers, in FP32 still leaves 0.85-0.9998, non-monotonically. A per-op rule cannot fix it.
+- **Result:** opt-in `with_bf16_split_activations` / `OXIONNX_BF16_WEIGHTS=split` splits each activation into two BF16 terms (`hi + lo`, 16 significant bits): cos ≥ 0.99994 on all 11 zoo models, 1.000000 on the 9 with BF16 checkpoints (jina docs 0.973 → 1.000000). It costs the whole BF16 compute gain: 1.4-2.3x slower than one-term BF16, 0.90-1.30x FP32 time (jina 1T query 17.0 → 31.9 ms, FP32 32.2; doc-b8 8T 178.5 → 312.2 ms, FP32 289.9), and it keeps the BF16 memory saving. The default stays one-term BF16 (unchanged speed; ≥ 0.9999 except jina docs 0.973 and harrier-0.6b docs 0.99979). Open: which default the user wants.
 
 ### [ ] P5.2 Quantised builds of the newer models
 - **Plan:** run the published Q8/Q4 (MatMulNBits) exports of the zoo models with the int8 kernels from #6 and #8, and compare with llama.cpp Q8_0/Q4.

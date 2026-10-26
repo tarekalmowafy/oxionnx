@@ -36,6 +36,8 @@ pub struct SessionBuilder {
     pub(crate) cancellation: Option<CancellationToken>,
     /// [`SessionBuilder::with_bf16_weights`]; `None` follows `OXIONNX_BF16_WEIGHTS`.
     pub(crate) bf16_weights: Option<bool>,
+    /// [`SessionBuilder::with_bf16_split_activations`]; `None` follows `OXIONNX_BF16_WEIGHTS=split`.
+    pub(crate) bf16_split: Option<bool>,
     /// [`SessionBuilder::with_keep_weights`].
     pub(crate) keep_weights: bool,
 }
@@ -71,6 +73,7 @@ impl SessionBuilder {
             providers: Vec::new(),
             cancellation: None,
             bf16_weights: None,
+            bf16_split: None,
             keep_weights: false,
         }
     }
@@ -81,6 +84,9 @@ impl SessionBuilder {
         let registry = self.registry.take().unwrap_or_else(oxionnx_ops::default_registry);
         if let Some(on) = self.bf16_weights {
             registry.set_bf16_weights(on);
+        }
+        if let Some(on) = self.bf16_split {
+            registry.set_bf16_split_activations(on);
         }
         registry.set_keep_weights(self.keep_weights);
         registry
@@ -93,19 +99,44 @@ impl SessionBuilder {
     /// FP32 data freed ([`Session::weights`] reports them with their shape and
     /// empty data), so they take half the memory and bandwidth; GEMM
     /// throughput roughly doubles. Precision is BF16 for the weights and for
-    /// the activations entering those GEMMs (typically cosine > 0.9999
-    /// against FP32 outputs); activation x activation products (attention)
-    /// stay FP32. Such a session cannot be saved with
+    /// the activations entering those GEMMs; activation x activation products
+    /// (attention) stay FP32. Such a session cannot be saved with
     /// [`Session::save_optimized`].
+    ///
+    /// Rounding the activations (a relative error of up to 2^-9 each) is what
+    /// costs accuracy; the weight rounding usually costs nothing, as most
+    /// checkpoints are stored in BF16. Most models stay above cosine 0.9999
+    /// against FP32, but some amplify the activation error on some inputs
+    /// (jina-embeddings-v5-text-nano: 0.973 on one of 32 documents).
+    /// [`SessionBuilder::with_bf16_split_activations`] removes that error at
+    /// about FP32 speed.
     ///
     /// Only on CPUs with `avx512f` + `avx512bf16`; elsewhere the weights stay
     /// FP32 and results are bit-identical to the default.
     ///
     /// Default: off, unless the `OXIONNX_BF16_WEIGHTS` environment variable is
-    /// `1` (or `true` / `on` / `yes`); an explicit call overrides the variable.
+    /// `1` (or `true` / `on` / `yes`, or `split`, which also sets
+    /// [`SessionBuilder::with_bf16_split_activations`]); an explicit call
+    /// overrides the variable.
     #[must_use]
     pub fn with_bf16_weights(mut self, enabled: bool) -> Self {
         self.bf16_weights = Some(enabled);
+        self
+    }
+
+    /// With [`SessionBuilder::with_bf16_weights`], split each activation
+    /// entering the BF16 GEMMs into two BF16 terms, `hi = bf16(a)` and
+    /// `lo = bf16(a - hi)` (16 significant bits instead of 8), and multiply by
+    /// both. The error is then that of the weight rounding alone (none for
+    /// checkpoints stored in BF16: cosine 1.000000 against FP32 on those), but
+    /// the GEMMs do twice the dot products and run at about FP32 speed; the
+    /// weights still take half the memory.
+    ///
+    /// Default: off, unless `OXIONNX_BF16_WEIGHTS=split`; an explicit call
+    /// overrides the variable. No effect without BF16 weights.
+    #[must_use]
+    pub fn with_bf16_split_activations(mut self, enabled: bool) -> Self {
+        self.bf16_split = Some(enabled);
         self
     }
 
