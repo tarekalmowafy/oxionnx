@@ -41,6 +41,7 @@
 
 use crate::graph::{Attributes, Node, OpKind};
 use crate::optimizer::graph_utils::{const_scalar, TensorUsage};
+use crate::optimizer::shape_values::ShapeFacts;
 use crate::tensor::Tensor;
 use std::collections::{HashMap, HashSet};
 
@@ -51,6 +52,7 @@ const BIAS_LAYOUT_BHST: i64 = 1;
 struct Matcher<'a> {
     nodes: &'a [Node],
     weights: &'a HashMap<String, Tensor>,
+    facts: ShapeFacts,
     usage: TensorUsage,
     producer: HashMap<&'a str, usize>,
     consumer: HashMap<&'a str, usize>,
@@ -79,7 +81,8 @@ impl<'a> Matcher<'a> {
                 }
             }
         }
-        Self { nodes, weights, usage: TensorUsage::new(nodes, output_names), producer, consumer }
+        let facts = crate::optimizer::shape_values::analyse(nodes, weights, &HashMap::new());
+        Self { nodes, weights, facts, usage: TensorUsage::new(nodes, output_names), producer, consumer }
     }
 
     /// Producer of `tensor` if it is an `op` node whose output can be removed.
@@ -178,7 +181,9 @@ impl<'a> Matcher<'a> {
         let ax = self.nodes[sm].attrs.ints.get("axis").copied();
         let sm_in = self.input(sm, 0)?;
         let sm_out = self.out(sm);
-        self.try_5d(sm, sm_in, sm_out, ax).or_else(|| self.try_4d(sm, sm_in, sm_out, ax))
+        self.try_5d(sm, sm_in, sm_out, ax)
+            .or_else(|| self.try_4d(sm, sm_in, sm_out, ax))
+            .or_else(|| self.try_heads(sm, sm_in, sm_out, ax))
     }
 
     fn try_5d(&self, sm: usize, sm_in: &'a str, sm_out: &'a str, ax: Option<i64>) -> Option<Fused> {
@@ -273,6 +278,104 @@ impl<'a> Matcher<'a> {
         let mut remove = vec![sm, pv, ot];
         remove.extend(qk_nodes.iter().chain(&q_nodes).chain(&k_nodes).chain(&v_nodes).chain(add.iter()));
         Some(self.build(remove, o, [q_src, k_src, v_src], bias, None, h, h, scale, BIAS_LAYOUT_BHST))
+    }
+
+    /// `Mul(t, c)` by a constant scalar `c`: returns `(t, c, node)`, else `(tensor, 1, None)`.
+    fn scalar_mul(&self, tensor: &'a str) -> (&'a str, f32, Option<usize>) {
+        if let Some(m) = self.prod(tensor, OpKind::Mul) {
+            if let (Some(a), Some(b)) = (self.input(m, 0), self.input(m, 1)) {
+                for (x, c) in [(a, b), (b, a)] {
+                    if let Some(v) = const_scalar(self.weights, c) {
+                        if self.weights.get(x).is_none() {
+                            return (x, v, Some(m));
+                        }
+                    }
+                }
+            }
+        }
+        (tensor, 1.0, None)
+    }
+
+    fn is_rank4(&self, tensor: &str) -> bool {
+        self.facts.rank(tensor) == Some(4)
+    }
+
+    /// **Head-split form** (eager-attention exports: GTE/arctic, ModernBERT
+    /// torch exports), on Q/K/V of any producer, either `[B, S, H, D]` behind a
+    /// head transpose or already head-major `[B, H, S, D]`:
+    ///
+    /// ```text
+    /// q' = Transpose(q, [0,2,1,3])  |  q (head-major)
+    /// k' = Transpose(k, [0,2,3,1])  |  Transpose(Transpose(k, [0,2,1,3]), [0,1,3,2])  |  Transpose(k_hm, [0,1,3,2])
+    /// v' = Transpose(v, [0,2,1,3])  |  v (head-major)
+    /// p  = Softmax(Add([Mul|Div](MatMul(Mul(q', a)?, Mul(k', b)?), c)?, bias)?, axis=-1)   // a, b, c constant scalars
+    /// o  = Transpose(MatMul(p, v'), [0,2,1,3])                                            // [B, S, H, D]
+    /// ```
+    ///
+    /// The fused node produces `o` (4-D); a following reshape to `[B, S, H*D]`
+    /// stays and is free. Head counts come from the shapes at run time.
+    fn try_heads(&self, sm: usize, sm_in: &'a str, sm_out: &'a str, ax: Option<i64>) -> Option<Fused> {
+        if !matches!(ax, Some(-1) | Some(3)) {
+            return None;
+        }
+        let (scores, bias, add) = self.masked(sm_in, OpKind::MatMul)?;
+        let (qk, scale, qk_nodes) = self.scaled_qk(scores)?;
+        let mut remove = vec![sm];
+        remove.extend(qk_nodes.iter().chain(add.iter()));
+        let (qa, c1, n1) = self.scalar_mul(self.input(qk, 0)?);
+        let (kb, c2, n2) = self.scalar_mul(self.input(qk, 1)?);
+        remove.extend(n1.iter().chain(n2.iter()));
+        // Q
+        let (q, q_bnsh) = match self.prod(qa, OpKind::Transpose).filter(|&t| self.perm_is(t, &[0, 2, 1, 3])) {
+            Some(t) => {
+                remove.push(t);
+                (self.input(t, 0)?, false)
+            }
+            None if self.is_rank4(qa) => (qa, true),
+            None => return None,
+        };
+        // K: as [B, T, H, D] (behind the transposes) and/or as head-major [B, H, T, D].
+        let kt = self.prod(kb, OpKind::Transpose)?;
+        remove.push(kt);
+        let (k_bshd, k_bnsh) = if self.perm_is(kt, &[0, 2, 3, 1]) {
+            (Some((self.input(kt, 0)?, None)), None)
+        } else if self.perm_is(kt, &[0, 1, 3, 2]) {
+            let kh = self.input(kt, 0)?;
+            let inner = self.prod(kh, OpKind::Transpose).filter(|&t| self.perm_is(t, &[0, 2, 1, 3]));
+            match inner {
+                Some(t) => (Some((self.input(t, 0)?, Some(t))), self.is_rank4(kh).then_some(kh)),
+                None => (None, self.is_rank4(kh).then_some(kh)),
+            }
+        } else {
+            return None;
+        };
+        // V
+        let pv = self.cons(sm_out, OpKind::MatMul)?;
+        if self.input(pv, 0)? != sm_out {
+            return None;
+        }
+        let vv = self.input(pv, 1)?;
+        let v_bshd = self.prod(vv, OpKind::Transpose).filter(|&t| self.perm_is(t, &[0, 2, 1, 3]));
+        let (k, v, kv_bnsh) = match (k_bshd, v_bshd) {
+            (Some((k, inner)), Some(vt)) => {
+                remove.extend(inner.iter().copied().chain([vt]));
+                (k, self.input(vt, 0)?, false)
+            }
+            _ => match k_bnsh {
+                Some(kh) if self.is_rank4(vv) => (kh, vv, true),
+                _ => return None,
+            },
+        };
+        // Out: Transpose [0,2,1,3] back to [B, S, H, D].
+        let ot = self.cons(self.out(pv), OpKind::Transpose)?;
+        if !self.perm_is(ot, &[0, 2, 1, 3]) {
+            return None;
+        }
+        remove.push(pv);
+        let mut f = self.build(remove, ot, [q, k, v], bias, None, 0, 0, scale * c1 * c2, BIAS_LAYOUT_BHST);
+        f.node.attrs.ints.insert("q_bnsh".into(), q_bnsh as i64);
+        f.node.attrs.ints.insert("kv_bnsh".into(), kv_bnsh as i64);
+        Some(f)
     }
 
     #[allow(clippy::too_many_arguments)]
