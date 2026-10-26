@@ -170,8 +170,9 @@ The MatMul, QKV and attention fusions were written against EmbeddingGemma-2's gr
 - **Problem:** with `OXIONNX_BF16_WEIGHTS=1`, the minimum cosine against FP32 is 0.9974 (all other models ≥ 0.9999).
 - **Plan:** find the sensitive projections by switching BF16 per layer, then keep those in FP32 by default, or expose a per-op opt-out.
 
-### [ ] P5.2 Quantised builds of the newer models
+### [x] P5.2 Quantised builds of the newer models ([#PR_P52](https://github.com/tarekalmowafy/oxionnx/pull/PR_P52))
 - **Plan:** run the published Q8/Q4 (MatMulNBits) exports of the zoo models with the int8 kernels from #6 and #8, and compare with llama.cpp Q8_0/Q4.
+- **Result:** all 20 published exports of the 11 zoo models now run (`model_quantized`/`model_q4`; `model_quint8_avx2` for granite-ml). Two fixes: (1) the MatMulNBits exports are not topologically sorted (the quantizer appends its nodes), which broke the optimizer (voyage failed to run), so unsorted graphs are now sorted before optimizing; (2) the 6 `quantize_dynamic` Q8 exports (DynamicQuantizeLinear + MatMulInteger) ran a scalar integer loop (granite-small doc-b8 52.6 s → 80.5 ms; granite-311m 15.7 s → 287 ms), and are now rewritten to `OxiMatMulNBits` (weights) or a float `MatMul` (activation × activation products). That also beats ORT's own Q8 accuracy (qwen3 docs min cos 0.711 → 0.981, granite-97m 0.904 → 0.999). oxionnx Q8/Q4 is the fastest engine in 56 of 60 quantised cells (ORT Q8 wins 1T queries on 3 `quantize_dynamic` models and arctic doc-b8 by 3%, with far lower accuracy). Open: the int8-activation kernel costs accuracy on sensitive inputs (harrier-0.6b Q8 docs 0.887 vs ORT 0.998; `OXIONNX_NBITS_COMPUTE=f32` gives 0.996), and peak RSS is above ORT's (int8 initializers load as f32 lanes; loader, P4.2). Tables: onnx_spike results/ci1/p5/tables_p52.md.
 
 ---
 

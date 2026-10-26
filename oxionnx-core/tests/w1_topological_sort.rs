@@ -116,3 +116,30 @@ fn topological_sort_orders_diamond_dependency_correctly() {
     assert!(pos(0) < pos(2), "producer of `a` must precede its consumer");
     assert!(pos(1) < pos(2), "producer of `b` must precede its consumer");
 }
+
+#[test]
+fn is_topologically_sorted_detects_late_producers() {
+    let known = vec!["x".to_string(), "w".to_string()];
+    let sorted = Graph {
+        nodes: vec![
+            node(OpKind::MatMul, &["x", "w"], &["y"]),
+            node(OpKind::Relu, &["y", ""], &["z"]),
+        ],
+        ..Default::default()
+    };
+    assert!(sorted.is_topologically_sorted(&known));
+    let reversed = Graph {
+        nodes: sorted.nodes.iter().rev().cloned().collect(),
+        ..Default::default()
+    };
+    assert!(!reversed.is_topologically_sorted(&known));
+    // A name in `known` does not wait for a node that also produces it.
+    let shadowed = Graph {
+        nodes: vec![
+            node(OpKind::Relu, &["w"], &["z"]),
+            node(OpKind::Identity, &["x"], &["w"]),
+        ],
+        ..Default::default()
+    };
+    assert!(shadowed.is_topologically_sorted(&known));
+}

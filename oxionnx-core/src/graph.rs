@@ -958,6 +958,25 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// Whether every node comes after the producers of its inputs (names in
+    /// `known` count as available from the start).
+    pub fn is_topologically_sorted(&self, known: &[String]) -> bool {
+        let known: HashSet<&str> = known.iter().map(String::as_str).collect();
+        let mut producer: HashMap<&str, usize> = HashMap::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            for out in &node.outputs {
+                producer.entry(out.as_str()).or_insert(i);
+            }
+        }
+        self.nodes.iter().enumerate().all(|(i, node)| {
+            node.inputs.iter().all(|inp| {
+                inp.is_empty()
+                    || known.contains(inp.as_str())
+                    || producer.get(inp.as_str()).map_or(true, |&p| p < i)
+            })
+        })
+    }
+
     /// Topological sort (Kahn's algorithm).
     /// Returns node indices in execution order given the set of initially-known names.
     pub fn topological_sort(&self, known: &[String]) -> Vec<usize> {
