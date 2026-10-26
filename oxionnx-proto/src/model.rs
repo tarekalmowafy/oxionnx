@@ -105,6 +105,27 @@ pub fn load_with_metadata_releasing(
     base_path: Option<&Path>,
     release: &mut dyn FnMut(Range<usize>),
 ) -> Result<(RawModelMeta, Graph, HashMap<String, Tensor>), String> {
+    let (meta, graph, weights, _) = load_with_metadata_lazy(bytes, base_path, release, None)?;
+    Ok((meta, graph, weights))
+}
+
+/// What [`load_with_metadata_lazy`] returns: metadata, graph, weights (lazy
+/// tables released) and the lazy tables' locations.
+pub type LazyLoad = (RawModelMeta, Graph, HashMap<String, Tensor>, Vec<crate::lazy::LazyInit>);
+
+/// [`load_with_metadata_releasing`] that, with `min_lazy_bytes` set, leaves
+/// the large row-lookup tables (see [`crate::lazy`]) in the file instead of
+/// decoding them. Such a table's weight-map entry is *released* (its shape,
+/// empty data) and its location is returned in the [`LazyInit`] list; its
+/// bytes are not read and `release` is not called for them.
+///
+/// [`LazyInit`]: crate::lazy::LazyInit
+pub fn load_with_metadata_lazy(
+    bytes: &[u8],
+    base_path: Option<&Path>,
+    release: &mut dyn FnMut(Range<usize>),
+    min_lazy_bytes: Option<usize>,
+) -> Result<LazyLoad, String> {
     let (model, deferred) = parser::parse_model_deferred(bytes)?;
     validate_opset(&model.opset_imports);
 
@@ -137,11 +158,24 @@ pub fn load_with_metadata_releasing(
     let mut inline: HashMap<usize, Range<usize>> = deferred.into_iter().map(|d| (d.initializer, d.range)).collect();
     let mut files = ExternalFiles::default();
     let mut weights: HashMap<String, Tensor> = HashMap::new();
+    let lazy_names = match min_lazy_bytes {
+        Some(min) => crate::lazy::plan(&graph_proto, &byte_names, min),
+        None => Default::default(),
+    };
+    let mut lazy = Vec::new();
     for (i, init) in graph_proto.initializers.iter().enumerate() {
         let as_bytes = byte_names.contains(&init.name);
         // Same external-data predicate as `reader::OnnxReader`, so both APIs
         // agree on a tensor that carries external_data without data_location.
         let external = reader::is_external(init);
+        if lazy_names.contains(&init.name) {
+            if let Some((tensor, l)) = lazy_init(init, external, inline.get(&i), base_path, &mut files, as_bytes)? {
+                inline.remove(&i);
+                weights.insert(init.name.clone(), tensor);
+                lazy.push(l);
+                continue;
+            }
+        }
         let tensor = match (external, inline.remove(&i)) {
             (true, _) => {
                 let Some(base_path) = base_path else {
@@ -174,7 +208,56 @@ pub fn load_with_metadata_releasing(
     }
 
     let (graph, weights_out) = build_graph_and_weights(graph_proto, weights, base_path)?;
-    Ok((meta, graph, weights_out))
+    Ok((meta, graph, weights_out, lazy))
+}
+
+/// The released tensor and [`crate::lazy::LazyInit`] for an initializer
+/// [`crate::lazy::plan`] chose, or `None` to decode it after all (its raw
+/// bytes are not stored as one contiguous `raw_data` payload of the expected
+/// size).
+fn lazy_init(
+    init: &TensorProto,
+    external: bool,
+    inline: Option<&Range<usize>>,
+    base_path: Option<&Path>,
+    files: &mut ExternalFiles,
+    as_bytes: bool,
+) -> Result<Option<(Tensor, crate::lazy::LazyInit)>, String> {
+    use crate::lazy::{LazyInit, LazySource};
+    let Some(shape) = init.dims.iter().map(|&d| usize::try_from(d).ok()).collect::<Option<Vec<usize>>>() else {
+        return Ok(None);
+    };
+    let elem: usize = match init.data_type {
+        reader::dtype_code::FLOAT32 => 4,
+        reader::dtype_code::UINT8 => 1,
+        _ => 2,
+    };
+    let Some(want) = shape.iter().try_fold(elem, |a, &d| a.checked_mul(d)) else { return Ok(None) };
+    let source = match (external, inline, base_path) {
+        (true, _, Some(base)) => {
+            let (path, offset, length) = files.locate(init, base)?;
+            LazySource::External { path, offset, length }
+        }
+        (false, Some(r), _) => LazySource::Inline(r.clone()),
+        _ => return Ok(None),
+    };
+    let len = match &source {
+        LazySource::Inline(r) => r.len(),
+        LazySource::External { length, .. } => *length,
+    };
+    if len != want || want == 0 {
+        return Ok(None);
+    }
+    let mut shape = shape;
+    if as_bytes {
+        // The byte-tensor shape (innermost dimension in 4-byte words); the
+        // planner only picks rows that are a whole number of words.
+        if let Some(last) = shape.last_mut() {
+            *last /= 4;
+        }
+    }
+    let tensor = Tensor { data: Vec::new(), shape };
+    Ok(Some((tensor, LazyInit { name: init.name.clone(), data_type: init.data_type, source })))
 }
 
 /// Decode an inline `TensorProto`, reporting a malformed one as a load error
@@ -233,6 +316,19 @@ impl ExternalFiles {
     /// The raw bytes of an external-data tensor.
     fn read(&mut self, tensor_proto: &TensorProto, base_path: &Path) -> Result<Vec<u8>, String> {
         use std::io::{Read, Seek, SeekFrom};
+        let (file_path, offset, len) = self.locate(tensor_proto, base_path)?;
+        let (file, size) = self.files.get_mut(&file_path).expect("opened by locate");
+        let size = *size;
+        let mut bytes = vec![0u8; len];
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(&mut bytes))
+            .map_err(|e| format!("External data for '{}': read failed: {e} (file size {size})", tensor_proto.name))?;
+        Ok(bytes)
+    }
+
+    /// The file, offset and length of an external-data tensor's bytes,
+    /// validated against the file size (the file is opened and kept).
+    fn locate(&mut self, tensor_proto: &TensorProto, base_path: &Path) -> Result<(std::path::PathBuf, u64, usize), String> {
         let mut location = None;
         let mut offset: u64 = 0;
         let mut length: Option<u64> = None;
@@ -281,8 +377,7 @@ impl ExternalFiles {
                 .len();
             self.files.insert(file_path.clone(), (file, size));
         }
-        let (file, size) = self.files.get_mut(&file_path).expect("inserted above");
-        let size = *size;
+        let size = self.files[&file_path].1;
 
         let range_err = |detail: String| {
             format!(
@@ -302,11 +397,7 @@ impl ExternalFiles {
         }
         let len = usize::try_from(end - offset)
             .map_err(|_| range_err(format!("length {} is not addressable", end - offset)))?;
-        let mut bytes = vec![0u8; len];
-        file.seek(SeekFrom::Start(offset))
-            .and_then(|_| file.read_exact(&mut bytes))
-            .map_err(|e| range_err(format!("read failed: {e}")))?;
-        Ok(bytes)
+        Ok((file_path, offset, len))
     }
 }
 

@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use oxionnx_core::graph::Attributes;
-use oxionnx_core::{OnnxError, OpContext, Operator, Tensor};
+use oxionnx_core::{MappedWeight, OnnxError, OpContext, Operator, Tensor};
 
 use crate::matmul_nbits::{self as nb, Packed, Shape, Source, Table, ZeroPoints};
 
@@ -313,6 +313,9 @@ impl Operator for MatMulNBitsOp {
 pub struct GatherBlockQuantizedOp {
     /// Byte copies of tables given one f32 per byte, keyed by data pointer.
     bytes: RwLock<HashMap<usize, Arc<Vec<u8>>>>,
+    /// Decoded copies of misaligned mapped float tables, keyed by their
+    /// [`MappedWeight`] (which the registry keeps alive for the session).
+    floats: RwLock<HashMap<usize, Arc<Vec<f32>>>>,
 }
 
 impl GatherBlockQuantizedOp {
@@ -357,10 +360,15 @@ impl GatherBlockQuantizedOp {
         let per_index: usize = dims[1..dims.len() - 1].iter().product();
         // Rows of the table and of packed zero points, with their strides in bytes.
         let data_rows = self.byte_rows(ctx, 0, data, row_bytes).map_err(bad)?;
+        let scales = self.floats(ctx, 2, scales).map_err(bad)?;
         let zp_rows;
+        let zp_floats;
         let (zp, zp_stride) = match zp {
             None => (ZeroPoints::Default, 0),
-            Some(z) if dtype(attrs, 3) == DT_FLOAT => (ZeroPoints::Float(&z.data), 0),
+            Some(z) if dtype(attrs, 3) == DT_FLOAT => {
+                zp_floats = self.floats(ctx, 3, z).map_err(bad)?;
+                (ZeroPoints::Float(zp_floats.get()), 0)
+            }
             Some(z) => {
                 let kb = cols.div_ceil(block);
                 zp_rows = self.byte_rows(ctx, 3, z, (kb * bits).div_ceil(8)).map_err(bad)?;
@@ -374,7 +382,7 @@ impl GatherBlockQuantizedOp {
             cols,
             bits,
             block,
-            scales: &scales.data,
+            scales: scales.get(),
             zp,
             zp_stride,
         };
@@ -400,10 +408,12 @@ impl GatherBlockQuantizedOp {
     }
 }
 
-/// Byte rows borrowed from a loader byte tensor, or a (cached) copy.
+/// Byte rows borrowed from a loader byte tensor, or a (cached) copy, or the
+/// mapped model file.
 enum Bytes<'t> {
     Borrowed(&'t [u8]),
     Shared(Arc<Vec<u8>>),
+    Mapped(Arc<MappedWeight>),
 }
 
 impl Bytes<'_> {
@@ -411,8 +421,39 @@ impl Bytes<'_> {
         match self {
             Bytes::Borrowed(b) => b,
             Bytes::Shared(b) => b,
+            Bytes::Mapped(m) => m.bytes(),
         }
     }
+}
+
+/// Float input data: the tensor's own, the mapped model file's (aligned), or
+/// a decoded copy of a misaligned mapped table.
+enum Floats<'t> {
+    Borrowed(&'t [f32]),
+    Mapped(Arc<MappedWeight>),
+    Shared(Arc<Vec<f32>>),
+}
+
+impl Floats<'_> {
+    fn get(&self) -> &[f32] {
+        match self {
+            Floats::Borrowed(f) => f,
+            Floats::Mapped(m) => m.as_f32().expect("checked when built"),
+            Floats::Shared(f) => f,
+        }
+    }
+}
+
+/// The mapped copy of released table input `idx` (see [`oxionnx_core::mapped`]).
+fn mapped_input(ctx: &OpContext<'_>, idx: usize, t: &Tensor) -> Result<Option<Arc<MappedWeight>>, String> {
+    if t.data.len() == t.shape.iter().product::<usize>() {
+        return Ok(None);
+    }
+    let name = ctx.node.inputs.get(idx).map(String::as_str).unwrap_or_default();
+    ctx.registry
+        .and_then(|r| r.mapped_weight(name))
+        .map(Some)
+        .ok_or_else(|| format!("input {idx} ('{name}') was released and has no mapped copy"))
 }
 
 impl GatherBlockQuantizedOp {
@@ -424,6 +465,14 @@ impl GatherBlockQuantizedOp {
         if let Some(last) = byte_tensor_last(attrs, idx) {
             if last != row {
                 return Err(format!("input {idx} has rows of {last} bytes, expected {row}"));
+            }
+            if let Some(m) = mapped_input(ctx, idx, t)? {
+                // The loader maps only byte tables whose rows are whole words,
+                // so the stored bytes are the byte-tensor layout.
+                if last % 4 != 0 || m.data_type() != oxionnx_core::mapped::data_type::UINT8 {
+                    return Err(format!("mapped input {idx} has rows of {last} bytes"));
+                }
+                return Ok((Bytes::Mapped(m), last));
             }
             return Ok((Bytes::Borrowed(words_as_bytes(&t.data)), last.div_ceil(4) * 4));
         }
@@ -439,6 +488,29 @@ impl GatherBlockQuantizedOp {
             }
         }
         Ok((Bytes::Shared(b), row))
+    }
+}
+
+impl GatherBlockQuantizedOp {
+    /// The f32 data of input `idx`: its own, or that of the mapped model file
+    /// when the session released it (decoded once if misaligned there).
+    fn floats<'t>(&self, ctx: &OpContext<'t>, idx: usize, t: &'t Tensor) -> Result<Floats<'t>, String> {
+        let Some(m) = mapped_input(ctx, idx, t)? else { return Ok(Floats::Borrowed(&t.data)) };
+        if m.data_type() == oxionnx_core::mapped::data_type::UINT8 || m.len() != t.shape.iter().product::<usize>() {
+            return Err(format!("mapped input {idx} does not hold {:?} floats", t.shape));
+        }
+        if m.as_f32().is_some() {
+            return Ok(Floats::Mapped(m));
+        }
+        let key = Arc::as_ptr(&m) as usize;
+        if let Some(f) = self.floats.read().ok().and_then(|c| c.get(&key).cloned()) {
+            return Ok(Floats::Shared(f));
+        }
+        let f = Arc::new(m.materialize());
+        if let Ok(mut c) = self.floats.write() {
+            c.insert(key, f.clone());
+        }
+        Ok(Floats::Shared(f))
     }
 }
 
@@ -462,6 +534,16 @@ fn words_as_bytes(w: &[f32]) -> &[u8] {
 impl Operator for GatherBlockQuantizedOp {
     fn op_type(&self) -> &str {
         "GatherBlockQuantized"
+    }
+    fn reads_mapped(&self, ctx: &OpContext<'_>, input: usize) -> bool {
+        let attrs = ctx.attrs();
+        match input {
+            // Byte tables only with whole-word rows (the stored layout).
+            0 => byte_tensor_last(attrs, 0).is_some_and(|l| l % 4 == 0),
+            3 if dtype(attrs, 3) != DT_FLOAT => byte_tensor_last(attrs, 3).is_some_and(|l| l % 4 == 0),
+            2 | 3 => true,
+            _ => false,
+        }
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let mut slots = vec![Tensor { data: vec![], shape: vec![] }];
@@ -747,6 +829,63 @@ mod tests {
         assert_eq!(y.data, want);
         let nd = node("GatherBlockQuantized", &["d", "i", "s"], &[("bits", 8), ("block_size", 32), ("gather_axis", 1)], &[]);
         assert!(run(&op, &nd, &HashMap::new(), &[Some(&d), Some(&t(vec![1.0], &[1])), Some(&s8)]).is_err());
+    }
+
+    /// Tables the session left in the mapped model file (released tensors,
+    /// bytes in the registry) give the same rows as decoded ones, with the
+    /// scales aligned or misaligned in the file and float zero points.
+    #[test]
+    fn gather_block_quantized_reads_mapped_tables() {
+        use oxionnx_core::mapped::{data_type, SharedBytes};
+        let mut rng = Lcg(5);
+        // 6 rows x 40 4-bit values (20 bytes), blocks of 16.
+        let rows = 6usize;
+        let data: Vec<u8> = (0..rows * 20).map(|_| rng.next() as u8).collect();
+        let scales: Vec<f32> = (0..rows * 3).map(|_| rng.f()).collect();
+        let zpf: Vec<f32> = (0..rows * 3).map(|_| (rng.next() % 16) as f32).collect();
+        let attrs = [("bits", 4), ("block_size", 16), ("gather_axis", 0), ("quantize_axis", 1)];
+        let lists = vec![(ATTR_U8_INPUTS, vec![0]), (ATTR_U8_LAST, vec![20]), (ATTR_DTYPES, vec![2, 0, 1, 1])];
+        let nd = node("GatherBlockQuantized", &["d", "i", "s", "z"], &attrs, &lists);
+        let idx = t(vec![5.0, 0.0, -2.0], &[3]);
+        let op = GatherBlockQuantizedOp::default();
+        let dense = {
+            let w: HashMap<String, Tensor> = [("d".to_string(), byte_tensor(&data, &[rows, 20]))].into();
+            let (s, z) = (t(scales.clone(), &[rows, 3]), t(zpf.clone(), &[rows, 3]));
+            run(&op, &nd, &w, &[Some(&w["d"]), Some(&idx), Some(&s), Some(&z)]).unwrap()
+        };
+        for pad in [0usize, 1, 4] {
+            // One file: [pad][data][scales][zp].
+            let mut file = vec![0xABu8; pad];
+            let d0 = file.len();
+            file.extend(&data);
+            let s0 = file.len();
+            file.extend(scales.iter().flat_map(|x| x.to_le_bytes()));
+            let z0 = file.len();
+            file.extend(zpf.iter().flat_map(|x| x.to_le_bytes()));
+            let owner: SharedBytes = Arc::new(file);
+            let reg = oxionnx_core::OperatorRegistry::new();
+            let add = |name: &str, r: std::ops::Range<usize>, dt| {
+                reg.set_mapped_weight(name.into(), MappedWeight::new(owner.clone(), r, dt).unwrap());
+            };
+            add("d", d0..s0, data_type::UINT8);
+            add("s", s0..z0, data_type::FLOAT);
+            add("z", z0..z0 + zpf.len() * 4, data_type::FLOAT);
+            let released = |shape: &[usize]| t(vec![], shape);
+            let (d, s, z) = (released(&[rows, 5]), released(&[rows, 3]), released(&[rows, 3]));
+            let ctx = OpContext { node: &nd, inputs: vec![Some(&d), Some(&idx), Some(&s), Some(&z)], outer_scope: None, weights: None, registry: Some(&reg) };
+            for i in [0, 2, 3] {
+                assert!(op.reads_mapped(&ctx, i), "input {i}");
+            }
+            assert!(!op.reads_mapped(&ctx, 1));
+            for _ in 0..2 {
+                let y = op.execute(&ctx).unwrap().remove(0);
+                assert_eq!(y.shape, dense.shape);
+                assert_eq!(y.data, dense.data, "pad {pad}");
+            }
+            // No mapped copy: an error, not garbage.
+            let ctx = OpContext { registry: None, ..ctx };
+            assert!(op.execute(&ctx).is_err());
+        }
     }
 
     #[cfg(target_arch = "x86_64")]

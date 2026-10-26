@@ -195,6 +195,15 @@ pub trait Operator: Send + Sync {
         None
     }
 
+    /// Whether this operator reads constant input `input` from the mapped
+    /// model file ([`OperatorRegistry::mapped_weight`]) when the session
+    /// released its tensor data. The session keeps an initializer mapped only
+    /// if every consumer says yes; otherwise it decodes it at load time.
+    /// Default: no.
+    fn reads_mapped(&self, _ctx: &OpContext<'_>, _input: usize) -> bool {
+        false
+    }
+
     // ── Phase D: native typed dispatch ─────────────────────────────────────────
 
     /// Dtypes this operator can execute without an f32 round-trip.
@@ -317,6 +326,11 @@ pub struct OperatorRegistry {
     /// Session option: keep the FP32 data of weights that operators packed at
     /// load time instead of freeing it. See [`OperatorRegistry::set_keep_weights`].
     keep_weights: AtomicBool,
+    /// Initializers left in the mapped model file, by name (their entries in
+    /// the session's weight map are released). See
+    /// [`OperatorRegistry::mapped_weight`].
+    #[cfg(feature = "std")]
+    mapped: std::sync::RwLock<HashMap<String, alloc::sync::Arc<crate::mapped::MappedWeight>>>,
 }
 
 impl OperatorRegistry {
@@ -326,7 +340,40 @@ impl OperatorRegistry {
             model_opset: AtomicI64::new(DEFAULT_OPSET),
             bf16_weights: AtomicU8::new(0),
             keep_weights: AtomicBool::new(false),
+            #[cfg(feature = "std")]
+            mapped: std::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Serve initializer `name` from `weight` (bytes left in the mapped model
+    /// file) instead of from its tensor data, which the session releases. Set
+    /// by the loader; see [`crate::mapped`].
+    #[cfg(feature = "std")]
+    pub fn set_mapped_weight(&self, name: String, weight: crate::mapped::MappedWeight) {
+        if let Ok(mut m) = self.mapped.write() {
+            m.insert(name, alloc::sync::Arc::new(weight));
+        }
+    }
+
+    /// The mapped bytes of initializer `name`, if the loader left it in the
+    /// model file. Operators that accept such an input
+    /// ([`Operator::reads_mapped`]) read it from here when its tensor is
+    /// released.
+    #[cfg(feature = "std")]
+    pub fn mapped_weight(&self, name: &str) -> Option<alloc::sync::Arc<crate::mapped::MappedWeight>> {
+        self.mapped.read().ok()?.get(name).cloned()
+    }
+
+    /// Stop serving `name` from the mapped file (the session decoded it).
+    #[cfg(feature = "std")]
+    pub fn remove_mapped_weight(&self, name: &str) -> Option<alloc::sync::Arc<crate::mapped::MappedWeight>> {
+        self.mapped.write().ok()?.remove(name)
+    }
+
+    /// Names of every mapped initializer.
+    #[cfg(feature = "std")]
+    pub fn mapped_weight_names(&self) -> Vec<String> {
+        self.mapped.read().map(|m| m.keys().cloned().collect()).unwrap_or_default()
     }
 
     /// Keep (`true`) or free (`false`, the default) the original data of the

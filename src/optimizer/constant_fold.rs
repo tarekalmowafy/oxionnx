@@ -64,10 +64,12 @@ pub fn constant_fold(
             }
 
             // Check if ALL non-empty inputs are in weights
-            let all_inputs_const = node
-                .inputs
-                .iter()
-                .all(|inp| inp.is_empty() || weights.contains_key(inp));
+            // A released initializer (a table left in the mapped model file)
+            // has no data to fold with.
+            let all_inputs_const = node.inputs.iter().all(|inp| {
+                inp.is_empty()
+                    || weights.get(inp).is_some_and(|t| t.data.len() == t.shape.iter().product::<usize>())
+            });
 
             if !all_inputs_const {
                 keep.push(node);
