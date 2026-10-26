@@ -110,9 +110,20 @@ enum Isa {
     Avx512,
 }
 
+/// The row-loop ISA, detected once (`OXIONNX_NORM_ISA=generic|avx2` caps it).
 fn isa() -> Isa {
+    static ISA: std::sync::OnceLock<Isa> = std::sync::OnceLock::new();
+    *ISA.get_or_init(detect_isa)
+}
+
+fn detect_isa() -> Isa {
     #[cfg(target_arch = "x86_64")]
     {
+        match std::env::var("OXIONNX_NORM_ISA").as_deref() {
+            Ok("generic") => return Isa::Generic,
+            Ok("avx2") if std::arch::is_x86_feature_detected!("avx2") => return Isa::Avx2,
+            _ => {}
+        }
         if std::arch::is_x86_feature_detected!("avx512f") {
             return Isa::Avx512;
         }
@@ -165,60 +176,85 @@ fn par_ranges(n: usize, min_per_task: usize, f: impl Fn(usize, usize) + Sync + S
 /// so the reductions are not bound by add latency.
 const L: usize = 64;
 
-/// Pairwise sum of the lanes, so the result does not depend on the vector width.
+/// `acc[0..16] + acc[16..32] + acc[32..48] + acc[48..64]` (whole-vector adds).
 #[inline(always)]
-fn hsum(mut acc: [f32; L]) -> f32 {
-    let mut w = L / 2;
-    while w > 0 {
-        for i in 0..w {
-            acc[i] += acc[i + w];
-        }
-        w /= 2;
+fn fold16(acc: &[f32; L]) -> [f32; 16] {
+    let mut v = [0.0f32; 16];
+    for i in 0..16 {
+        v[i] = (acc[i] + acc[i + 32]) + (acc[i + 16] + acc[i + 48]);
     }
-    acc[0]
+    v
+}
+
+/// Sum of 16 lanes as a fixed tree, so the result does not depend on the
+/// vector width.
+#[inline(always)]
+fn hsum16(v: [f32; 16]) -> f32 {
+    let mut v8 = [0.0f32; 8];
+    for i in 0..8 {
+        v8[i] = v[i] + v[i + 8];
+    }
+    let v4 = [v8[0] + v8[4], v8[1] + v8[5], v8[2] + v8[6], v8[3] + v8[7]];
+    (v4[0] + v4[2]) + (v4[1] + v4[3])
+}
+
+/// Elements of an `n`-row handled by the 64-wide loops: short rows (per-head
+/// norms, `n = 128`) use only the 16-wide loop, which costs less per row.
+#[inline(always)]
+fn wide_len(n: usize) -> usize {
+    if n >= 4 * L { n - n % L } else { 0 }
 }
 
 /// `Σ v` (or `Σ v²` when `SQ`) over `v`.
 #[inline(always)]
 fn row_sum<const SQ: bool>(v: &[f32]) -> f32 {
-    let mut acc = [0.0f32; L];
-    let mut c = v.chunks_exact(L);
-    for ch in &mut c {
-        for l in 0..L {
-            acc[l] += if SQ { ch[l] * ch[l] } else { ch[l] };
+    let (wide, rest) = v.split_at(wide_len(v.len()));
+    let mut a16 = [0.0f32; 16];
+    if !wide.is_empty() {
+        let mut acc = [0.0f32; L];
+        for ch in wide.chunks_exact(L) {
+            for l in 0..L {
+                acc[l] += if SQ { ch[l] * ch[l] } else { ch[l] };
+            }
         }
+        a16 = fold16(&acc);
     }
-    let mut c16 = c.remainder().chunks_exact(16);
+    let mut c16 = rest.chunks_exact(16);
     for ch in &mut c16 {
         for l in 0..16 {
-            acc[l] += if SQ { ch[l] * ch[l] } else { ch[l] };
+            a16[l] += if SQ { ch[l] * ch[l] } else { ch[l] };
         }
     }
     let mut tail = 0.0f32;
     for &x in c16.remainder() {
         tail += if SQ { x * x } else { x };
     }
-    hsum(acc) + tail
+    hsum16(a16) + tail
 }
 
 /// `(Σ (v - mean), Σ (v - mean)²)` over `v`.
 #[inline(always)]
 fn row_dev(v: &[f32], mean: f32) -> (f32, f32) {
-    let (mut acc, mut acc2) = ([0.0f32; L], [0.0f32; L]);
-    let mut c = v.chunks_exact(L);
-    for ch in &mut c {
-        for l in 0..L {
-            let d = ch[l] - mean;
-            acc[l] += d;
-            acc2[l] += d * d;
+    let (wide, rest) = v.split_at(wide_len(v.len()));
+    let (mut a16, mut b16) = ([0.0f32; 16], [0.0f32; 16]);
+    if !wide.is_empty() {
+        let (mut acc, mut acc2) = ([0.0f32; L], [0.0f32; L]);
+        for ch in wide.chunks_exact(L) {
+            for l in 0..L {
+                let d = ch[l] - mean;
+                acc[l] += d;
+                acc2[l] += d * d;
+            }
         }
+        a16 = fold16(&acc);
+        b16 = fold16(&acc2);
     }
-    let mut c16 = c.remainder().chunks_exact(16);
+    let mut c16 = rest.chunks_exact(16);
     for ch in &mut c16 {
         for l in 0..16 {
             let d = ch[l] - mean;
-            acc[l] += d;
-            acc2[l] += d * d;
+            a16[l] += d;
+            b16[l] += d * d;
         }
     }
     let (mut t, mut t2) = (0.0f32, 0.0f32);
@@ -227,12 +263,12 @@ fn row_dev(v: &[f32], mean: f32) -> (f32, f32) {
         t += d;
         t2 += d * d;
     }
-    (hsum(acc) + t, hsum(acc2) + t2)
+    (hsum16(a16) + t, hsum16(b16) + t2)
 }
 
-/// One `W`-wide block of [`stage_sum`].
+/// One `W`-wide block of [`stage_sum`], accumulating into `acc[..W]`.
 #[inline(always)]
-fn stage_block<const SQ: bool, const W: usize>(x: &[f32], s: &[f32], b: Option<&[f32]>, d: &mut [f32], acc: &mut [f32; L]) {
+fn stage_block<const SQ: bool, const W: usize>(x: &[f32], s: &[f32], b: Option<&[f32]>, d: &mut [f32], acc: &mut [f32; W]) {
     let (x, s, d) = (&x[..W], &s[..W], &mut d[..W]);
     match b {
         Some(b) => {
@@ -257,14 +293,19 @@ fn stage_block<const SQ: bool, const W: usize>(x: &[f32], s: &[f32], b: Option<&
 #[inline(always)]
 fn stage_sum<const SQ: bool>(x: &[f32], s: &[f32], b: Option<&[f32]>, dst: &mut [f32]) -> f32 {
     let n = dst.len();
-    let mut acc = [0.0f32; L];
+    let wide = wide_len(n);
+    let mut a16 = [0.0f32; 16];
     let mut j = 0;
-    while j + L <= n {
-        stage_block::<SQ, L>(&x[j..], &s[j..], b.map(|b| &b[j..]), &mut dst[j..], &mut acc);
-        j += L;
+    if wide > 0 {
+        let mut acc = [0.0f32; L];
+        while j + L <= wide {
+            stage_block::<SQ, L>(&x[j..], &s[j..], b.map(|b| &b[j..]), &mut dst[j..], &mut acc);
+            j += L;
+        }
+        a16 = fold16(&acc);
     }
     while j + 16 <= n {
-        stage_block::<SQ, 16>(&x[j..], &s[j..], b.map(|b| &b[j..]), &mut dst[j..], &mut acc);
+        stage_block::<SQ, 16>(&x[j..], &s[j..], b.map(|b| &b[j..]), &mut dst[j..], &mut a16);
         j += 16;
     }
     let mut tail = 0.0f32;
@@ -273,22 +314,27 @@ fn stage_sum<const SQ: bool>(x: &[f32], s: &[f32], b: Option<&[f32]>, dst: &mut 
         dst[jj] = v;
         tail += if SQ { v * v } else { v };
     }
-    hsum(acc) + tail
+    hsum16(a16) + tail
 }
 
-/// `dst = (src - mean) * inv * gamma (+ beta)`.
+/// `dst = (src - mean) * inv * gamma (+ beta)`; `mean` is ignored for RMSNorm.
 #[inline(always)]
-fn normalize(src: &[f32], dst: &mut [f32], inv: f32, mean: f32, gamma: &[f32], beta: Option<&[f32]>) {
+fn normalize(rms: bool, src: &[f32], dst: &mut [f32], inv: f32, mean: f32, gamma: &[f32], beta: Option<&[f32]>) {
     let n = dst.len();
     let (src, gamma) = (&src[..n], &gamma[..n]);
-    match beta {
-        Some(beta) => {
+    match (rms, beta) {
+        (true, _) => {
+            for j in 0..n {
+                dst[j] = src[j] * inv * gamma[j];
+            }
+        }
+        (false, Some(beta)) => {
             let beta = &beta[..n];
             for j in 0..n {
                 dst[j] = (src[j] - mean) * inv * gamma[j] + beta[j];
             }
         }
-        None => {
+        (false, None) => {
             for j in 0..n {
                 dst[j] = (src[j] - mean) * inv * gamma[j];
             }
@@ -298,17 +344,22 @@ fn normalize(src: &[f32], dst: &mut [f32], inv: f32, mean: f32, gamma: &[f32], b
 
 /// In-place [`normalize`].
 #[inline(always)]
-fn normalize_inplace(buf: &mut [f32], inv: f32, mean: f32, gamma: &[f32], beta: Option<&[f32]>) {
+fn normalize_inplace(rms: bool, buf: &mut [f32], inv: f32, mean: f32, gamma: &[f32], beta: Option<&[f32]>) {
     let n = buf.len();
     let gamma = &gamma[..n];
-    match beta {
-        Some(beta) => {
+    match (rms, beta) {
+        (true, _) => {
+            for j in 0..n {
+                buf[j] = buf[j] * inv * gamma[j];
+            }
+        }
+        (false, Some(beta)) => {
             let beta = &beta[..n];
             for j in 0..n {
                 buf[j] = (buf[j] - mean) * inv * gamma[j] + beta[j];
             }
         }
-        None => {
+        (false, None) => {
             for j in 0..n {
                 buf[j] = (buf[j] - mean) * inv * gamma[j];
             }
@@ -348,7 +399,7 @@ unsafe fn rows_generic(a: &NormRows<'_>, p: OutPtrs, lo: usize, hi: usize) {
                 if let Some(sp) = p.sum {
                     std::slice::from_raw_parts_mut(sp.0.add(r * h), h).copy_from_slice(xi);
                 }
-                normalize(xi, o, inv, mean, a.gamma, a.beta);
+                normalize(a.rms, xi, o, inv, mean, a.gamma, a.beta);
                 (inv, mean)
             }
             Some(skip) => {
@@ -359,14 +410,14 @@ unsafe fn rows_generic(a: &NormRows<'_>, p: OutPtrs, lo: usize, hi: usize) {
                         let first =
                             if a.rms { stage_sum::<true>(xi, si, a.bias, s) } else { stage_sum::<false>(xi, si, a.bias, s) };
                         let (inv, mean) = stats(a.rms, s, first, a.eps);
-                        normalize(s, o, inv, mean, a.gamma, a.beta);
+                        normalize(a.rms, s, o, inv, mean, a.gamma, a.beta);
                         (inv, mean)
                     }
                     None => {
                         let first =
                             if a.rms { stage_sum::<true>(xi, si, a.bias, o) } else { stage_sum::<false>(xi, si, a.bias, o) };
                         let (inv, mean) = stats(a.rms, o, first, a.eps);
-                        normalize_inplace(o, inv, mean, a.gamma, a.beta);
+                        normalize_inplace(a.rms, o, inv, mean, a.gamma, a.beta);
                         (inv, mean)
                     }
                 }
@@ -549,6 +600,33 @@ mod bench {
                     println!("{rows:6}x{h:4} {name:13} {us:8.1} us");
                 });
             }
+            // The previous `rms_norm_into` (8-lane, `par::for_each_row`).
+            let iters = (200_000_000 / (rows * h)).max(5);
+            pool.install(|| {
+                let run = |o: &mut [f32]| {
+                    crate::par::for_each_row(o, h, |r, out_slice| {
+                        let in_slice = &x[r * h..(r + 1) * h];
+                        let mut lanes = [0.0f32; 8];
+                        let mut chunks = in_slice.chunks_exact(8);
+                        for c in &mut chunks {
+                            for (l, &v) in lanes.iter_mut().zip(c) {
+                                *l += v * v;
+                            }
+                        }
+                        let tail: f32 = chunks.remainder().iter().map(|&v| v * v).sum();
+                        let inv = ((lanes.iter().sum::<f32>() + tail) / h as f32 + 1e-5).sqrt().recip();
+                        for ((o_v, &i_v), &s) in out_slice.iter_mut().zip(in_slice).zip(&g) {
+                            *o_v = i_v * inv * s;
+                        }
+                    })
+                };
+                run(&mut o);
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    run(&mut o);
+                }
+                println!("{rows:6}x{h:4} {:13} {:8.1} us", "old-rms", t0.elapsed().as_secs_f64() * 1e6 / iters as f64);
+            });
         }
     }
 }
