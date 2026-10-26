@@ -137,7 +137,7 @@ The MatMul, QKV and attention fusions were written against EmbeddingGemma-2's gr
 
 ## Phase 3: threading overhead on short inputs
 
-### [ ] P3.1 Short queries at high thread counts
+### [~] P3.1 Short queries at high thread counts ([#PR](https://github.com/tarekalmowafy/oxionnx/pulls?q=head%3Aperf-threads))
 - **Problem:** on EmbeddingGemma-2, 16-thread queries take 13.8 ms against llama.cpp Q4_0's 13.0. On the other models, llama-server wins most 8-thread query cells. oxionnx workers spin (`RAYON_SPIN_ROUNDS`), so a 16-thread query costs 220–273 ms of CPU, 1.3–1.6× ORT's 169 ms.
 - **Plan:**
   - Adaptive spin-then-park.
@@ -145,6 +145,14 @@ The MatMul, QKV and attention fusions were written against EmbeddingGemma-2's gr
   - Measure and reduce per-node dispatch overhead in the sequential executor.
   - Partition small GEMMs better at small M.
 - **Metric:** query latency and `cpu_cores_busy` / `cpu_ms_per_call` from `embbench`, at 8 and 16 threads.
+- **Result** (median of 3 interleaved reps on ci-1, `RAYON_SPIN_ROUNDS=1000`, wall / CPU ms per call, before → after):
+  - arctic-m-v2 queries: 1T 45.7 → 43.0; 8T 16.3 / 125 → **14.1 / 113** (ORT 15.6); 16T 15.2 / 241 → **12.2 / 195**. doc-b8 8T 328 → 317.
+  - EmbeddingGemma-2 queries: FP32 16T 17.4 / 272 → 15.7 / 251, 8T 18.0 → 17.4; BF16 16T 13.7 / 215 → **12.9 / 207** (llama.cpp Q4_0 13.0), 8T 13.6 → 13.3.
+  - granite-97m queries: 1T 10.3 → 9.1; 8T 6.1 → 5.3; 16T 5.95 / 95 → 5.5 / 87. qwen3, harrier, granite-small: within noise (±3%, harrier 16T +7% in one sweep, +2% in another).
+  - What did it: (4) small-M GEMM partitioning, which searches row × column tiles for M < 192 instead of splitting N only; and `OxiMatMulSplit` blocks capped at 256 columns (a [768,768,768] QKV ran as 3 tasks). Arctic QKV at 16T went from 4.1 to 1.6 ms per query. (2) `Transpose` 2-D tiles are staged through a stack buffer, 8x faster ([48,768]→[768,48]: 108 → 13.5 µs), worth 1.1 ms per arctic query at every thread count. Unary element-wise ops (Neg, Sqrt, …) now run in parallel: arctic doc-b8 Neg went from 7.2 to 1.3 ms at 8T.
+  - (3) Dispatch overhead outside the kernels is about 1.2 ms per query (shape plan 0.25, learned-shape store 0.1–0.2, per-node dispatch 0.4–0.6, release 0.3), measured with `OXIONNX_TRACE_TIMERS`. Shape plans are now shared via `Arc` instead of being deep-copied 3–5 times on a plan-cache miss. Every benchmark query has a new length, so each one misses the 4-entry cache. Untraced runs no longer read the clock per node.
+  - (1) Spin: not changed in the fork, because the spin knob lives in the harness's patched rayon-core. With 300 or 100 rounds instead of 1000, CPU drops 1–11% with no consistent wall change. An adaptive time-budget spin-then-park (onnx_spike `scripts/perf/threads/rayon-adaptive-spin.patch`, `RAYON_SPIN_MODE=adaptive`) was likewise within noise: −3..−11% CPU at a 300 µs cap, mixed wall. Most of the remaining CPU is spinning in gaps shorter than a futex wake-up on this VM (sched_yield ≈ 0.6 µs, 1000 rounds ≈ 1 ms). Parking cannot remove it without costing latency; the remaining lever is fewer participating threads per small op.
+  - Cosine vs ORT: FP32 1.0000000 on all five HF models (queries and doc-b8); BF16 ≥ 0.99997. EmbeddingGemma FP32 is bit-identical to master.
 
 ---
 
