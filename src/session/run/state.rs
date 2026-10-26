@@ -17,6 +17,16 @@ pub(crate) struct SessionRunState {
     /// Prototype (onnx_spike): output shapes observed this run for nodes whose
     /// shapes static inference could not resolve (see `Session::run_internal`).
     learned_shapes: Vec<(String, Vec<usize>)>,
+    /// Bytes held by the tensors in `tensors` (by capacity), not counting graph
+    /// outputs: those go to the caller, so they are never pool demand.
+    live_bytes: usize,
+    /// Graph outputs, excluded from `live_bytes` (see [`Self::set_graph_outputs`]).
+    graph_outputs: hashbrown::HashSet<String>,
+    /// The pool budget as last seen by this run; the pool is locked to raise it
+    /// only when `live_bytes` goes past this.
+    budget_seen: usize,
+    /// `OXIONNX_TRACE_MEM` diagnostic, `None` unless enabled.
+    pub(crate) mem: Option<Box<super::memtrace::MemTrace>>,
 }
 
 impl SessionRunState {
@@ -25,6 +35,26 @@ impl SessionRunState {
         Self {
             tensors: HashMap::with_capacity(capacity),
             learned_shapes: Vec::new(),
+            live_bytes: 0,
+            graph_outputs: hashbrown::HashSet::new(),
+            budget_seen: 0,
+            mem: None,
+        }
+    }
+
+    /// Name the graph outputs, which [`Self::insert`] then leaves out of the live
+    /// bytes that size the pool budget.
+    pub(crate) fn set_graph_outputs<'a>(&mut self, names: impl IntoIterator<Item = &'a String>) {
+        self.graph_outputs = names.into_iter().cloned().collect();
+    }
+
+    /// Bytes `t` counts towards the pool budget if stored under `name`.
+    #[inline]
+    fn budget_bytes(&self, name: &str, t: &Tensor) -> usize {
+        if !self.graph_outputs.is_empty() && self.graph_outputs.contains(name) {
+            0
+        } else {
+            tensor_bytes(t)
         }
     }
 
@@ -58,15 +88,47 @@ impl SessionRunState {
         tensor: Tensor,
         pool: Option<&Mutex<SizeClassPool>>,
     ) {
+        let added = self.budget_bytes(&name, &tensor);
+        self.live_bytes += added;
         if let Some(old) = self.tensors.insert(name, tensor) {
+            // Same name, so the same budget class as `added`.
+            self.live_bytes -= if added == 0 { 0 } else { tensor_bytes(&old) };
             release_to_pool(old, pool);
+        }
+        if self.live_bytes > self.budget_seen {
+            self.raise_pool_budget(pool);
+        }
+    }
+
+    /// Raise the pool's byte budget to this run's live bytes.
+    ///
+    /// The free lists never need to hold more than the peak of live intermediates:
+    /// at any point a run can only acquire what it will hold live at the same time.
+    /// Raising the budget as the live set grows (instead of measuring the peak
+    /// after the run) also bounds the very first run, in which shapes are still
+    /// being learned and kernels allocate their outputs themselves.
+    #[cold]
+    fn raise_pool_budget(&mut self, pool: Option<&Mutex<SizeClassPool>>) {
+        self.budget_seen = self.live_bytes;
+        if let Some(mut guard) = pool.and_then(|p| p.lock().ok()) {
+            if let Some(budget) = guard.budget() {
+                if budget < self.live_bytes {
+                    guard.raise_budget(self.live_bytes);
+                } else {
+                    self.budget_seen = budget;
+                }
+            }
         }
     }
 
     /// Remove a tensor from state, returning ownership (no pool release).
     /// Used for in-place execution where the caller takes ownership of the buffer.
     pub(crate) fn take(&mut self, name: &str) -> Option<Tensor> {
-        self.tensors.remove(name)
+        let t = self.tensors.remove(name);
+        if let Some(t) = &t {
+            self.live_bytes -= self.budget_bytes(name, t);
+        }
+        t
     }
 
     /// Expose the tensor map as an immutable reference (for GPU dispatch functions
@@ -129,6 +191,12 @@ impl SessionRunState {
         }
         Ok(result)
     }
+}
+
+/// Bytes a tensor's buffer holds (by capacity, which is what is resident).
+#[inline]
+fn tensor_bytes(t: &Tensor) -> usize {
+    t.data.capacity() * std::mem::size_of::<f32>()
 }
 
 /// Release a tensor's data buffer back into the pool, if a pool is available.

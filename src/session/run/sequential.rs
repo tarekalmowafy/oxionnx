@@ -722,6 +722,11 @@ impl Session {
             }
 
             let t_rel = std::time::Instant::now();
+            if let Some(mut mem) = state.mem.take() {
+                // Measured before the inputs are released: this is the true live peak.
+                mem.after_node(node, state, self.pool.as_ref().map(|m| m as &Mutex<SizeClassPool>));
+                state.mem = Some(mem);
+            }
             self.decrement_refs_state(node, state, ref_counts, output_set);
             super::dispatch::phase_timers::add(&super::dispatch::phase_timers::RELEASE, t_rel.elapsed());
             // Released after a node that ran on the CPU too: "last consumer" is

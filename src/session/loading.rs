@@ -9,6 +9,9 @@ use std::path::Path;
 use super::types::{raw_meta_to_model_metadata, ModelMetadata, OptLevel};
 use super::Session;
 
+/// Smallest byte budget of a session's activation pool (see `SizeClassPool`).
+const MIN_POOL_BUDGET_BYTES: usize = 64 << 20;
+
 // ── Load-path instrumentation ───────────────────────────────────────────────
 
 /// The `tracing` target every load-path span and event is emitted under.
@@ -341,7 +344,16 @@ impl Session {
                 &weights,
                 &declared_input_shapes,
             );
-            (Some(Mutex::new(SizeClassPool::new())), Some(shapes))
+            // A budgeted pool: each run raises the budget to the peak bytes of live
+            // intermediates it reaches (see `SessionRunState::insert`), so the
+            // free lists never hold much more than one run can use. The floor
+            // keeps small graphs (single queries) fully pooled: below it the
+            // cache costs little, and handing every buffer back to the allocator
+            // instead made RSS creep up more over a stream of differently sized
+            // runs, as freed memory spread over the worker threads' heaps.
+            let mut pool = SizeClassPool::new();
+            pool.raise_budget(MIN_POOL_BUDGET_BYTES);
+            (Some(Mutex::new(pool)), Some(shapes))
         } else {
             (None, None)
         };

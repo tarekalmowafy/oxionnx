@@ -35,7 +35,7 @@ impl Session {
 
         if can_slot {
             let t_acq = std::time::Instant::now();
-            let acquired = Self::acquire_output_slots(node, resolved_shapes, pool);
+            let acquired = Self::acquire_output_slots(node, resolved_shapes, pool, output_set);
             phase_timers::add(&phase_timers::ACQUIRE, t_acq.elapsed());
             if let Some(mut slots) = acquired {
                 let resolved_inputs: Vec<Option<&Tensor>> = node
@@ -123,6 +123,13 @@ impl Session {
         };
 
         let elapsed = start.elapsed();
+        if let Some(mem) = state.mem.as_mut() {
+            // Output bytes of the allocating paths (an in-place result usually
+            // reuses its input's buffer, so it is listed separately).
+            let bytes: usize = results.iter().map(|t| t.data.capacity() * 4).sum();
+            let suffix = if can_inplace { "[inplace]" } else { "" };
+            mem.fresh(&format!("{}{suffix}", node.op.as_str()), bytes);
+        }
         if can_slot && shape_depends_only_on_input_shapes(node, &self.weights) {
             for (out_name, tensor) in node.outputs.iter().zip(&results) {
                 if !out_name.is_empty() && !resolved_shapes.contains_key(out_name) {
@@ -217,10 +224,15 @@ impl Session {
     /// zeroing path stays the default for every existing operator), which is a
     /// change to the trait rather than to the engine.  Until it exists, the safe
     /// answer is the one the pool has always given.
+    ///
+    /// A **graph output** is handed to the caller and never comes back, so a
+    /// miss for it must not grow the pool's budget (see
+    /// [`SizeClassPool::acquire_for_output`]).
     pub(super) fn acquire_output_slots(
         node: &Node,
         resolved_shapes: &HashMap<String, Vec<usize>>,
         pool: Option<&Mutex<SizeClassPool>>,
+        output_set: &OutputSet<'_>,
     ) -> Option<Vec<Tensor>> {
         let mut guard = pool.and_then(|pool_mutex| pool_mutex.lock().ok());
         let mut slots = Vec::with_capacity(node.outputs.len());
@@ -259,6 +271,9 @@ impl Session {
             };
             let overwrite = fully_writes_slot(node, slots.len());
             let data = match guard.as_mut() {
+                Some(pool_guard) if output_set.contains(out_name.as_str()) => {
+                    pool_guard.acquire_for_output(size, overwrite)
+                }
                 Some(pool_guard) if overwrite => pool_guard.acquire_for_overwrite(size),
                 Some(pool_guard) => pool_guard.acquire(size),
                 None => vec![0.0f32; size],
