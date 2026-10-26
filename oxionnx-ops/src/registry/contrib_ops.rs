@@ -288,7 +288,8 @@ impl Operator for OxiAttentionOp {
 /// by the optimizer's MatMul-activation fusion (see [`crate::fused_matmul`]).
 ///
 /// Inputs: `x` `[.., K]`, `w` `[K, N]`, optional `bias` `[N]`, optional `mul`.
-/// Attributes: `activation` (`"gelu"`), `approximate` (`"tanh"` or `"none"`),
+/// Attributes: `activation` (`"gelu"` or `"silu"`), `approximate` (GELU:
+/// `"tanh"` or `"none"`),
 /// `gate` (`-1`: `act(x@w + bias) * mul`, output `[.., N]`; `0`/`1`: gated, the
 /// activation applies to that half of the `N` columns and multiplies the other
 /// half, output `[.., N/2]`, no `mul`).
@@ -473,10 +474,12 @@ impl OxiMatMulActOp {
         let (bias, mul) = (ctx.optional_input(2), ctx.optional_input(3));
         let attrs = ctx.attrs();
         let bad = |m: String| err(format!("OxiMatMulAct '{}': {m}", ctx.node.name));
-        if attrs.s("activation") != "gelu" {
-            return Err(bad(format!("unsupported activation {:?}", attrs.s("activation"))));
-        }
-        let act = if attrs.s("approximate") == "tanh" { Act::GeluTanh } else { Act::GeluErf };
+        let act = match (attrs.s("activation"), attrs.s("approximate")) {
+            ("gelu", "tanh") => Act::GeluTanh,
+            ("gelu", _) => Act::GeluErf,
+            ("silu", _) => Act::Silu,
+            (a, _) => return Err(bad(format!("unsupported activation {a:?}"))),
+        };
         let gate = match attrs.i("gate", -1) {
             -1 => None,
             h @ (0 | 1) => Some(h as usize),

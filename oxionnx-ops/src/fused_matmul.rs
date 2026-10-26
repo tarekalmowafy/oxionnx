@@ -5,7 +5,7 @@
 //! * gated (`gate = Some(h)`): `w` is `[k, 2H]` whose columns split into halves
 //!   `y0 = (x @ w + bias)[:, ..H]` and `y1 = ...[:, H..]`, and
 //!   `out = act(y_h) * y_(1-h)`, `out` is `[m, H]` — the
-//!   `Split -> Gelu -> Mul` of gated MLPs (GeGLU).
+//!   `Split -> Gelu -> Mul` of gated MLPs (GeGLU), or with SiLU, SwiGLU.
 //!
 //! With the packed GEMM the epilogue runs on each `rows x width` block of the
 //! product while it is in L1, so the full `[m, n]` product is never written.
@@ -28,6 +28,18 @@ pub enum Act {
     GeluTanh,
     /// Exact (erf) GELU.
     GeluErf,
+    /// SiLU `x * sigmoid(x)` (the gated form is SwiGLU).
+    Silu,
+}
+
+impl Act {
+    fn kind(self) -> gelu::Kind {
+        match self {
+            Act::GeluTanh => gelu::Kind::GeluTanh,
+            Act::GeluErf => gelu::Kind::GeluErf,
+            Act::Silu => gelu::Kind::Silu,
+        }
+    }
 }
 
 /// What follows the MatMul.
@@ -76,15 +88,7 @@ fn finish(act: Act, x: &mut [f32], xb: Option<&[f32]>, g: Option<&mut [f32]>, gb
         }
         &*g
     });
-    match act {
-        Act::GeluTanh => gelu::gelu_mul(x, g, out),
-        Act::GeluErf => {
-            for (j, o) in out.iter_mut().enumerate() {
-                let a = crate::registry::nn_ops::gelu_exact(x[j]);
-                *o = g.map_or(a, |g| a * g[j]);
-            }
-        }
-    }
+    gelu::apply(act.kind(), x, g, out);
 }
 
 /// Reference path: the full product, then the epilogue row by row.
@@ -403,7 +407,7 @@ mod tests {
             let x = rand(m * k, 1);
             let w = rand(k * n, 2);
             let bias = rand(n, 3);
-            for act in [Act::GeluTanh, Act::GeluErf] {
+            for act in [Act::GeluTanh, Act::GeluErf, Act::Silu] {
                 for gate in [None, Some(0), Some(1)] {
                     for with_bias in [false, true] {
                         let n_out = if gate.is_some() { n / 2 } else { n };

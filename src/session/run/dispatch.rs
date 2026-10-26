@@ -1305,7 +1305,7 @@ fn fully_writes_slot(node: &Node, idx: usize) -> bool {
         "Split" | "SkipSimplifiedLayerNormalization" | "OxiMatMulSplit" | "MatMulNBits" | "OxiMatMulNBits"
         | "GatherBlockQuantized" | "com.microsoft.MultiHeadAttention" | "GroupQueryAttention" => true,
         "com.microsoft.RotaryEmbedding" | "OxiAttention" | "OxiMatMulAct" => idx == 0,
-        "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "Concat" | "Transpose"
+        "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "SiLU" | "Erf" | "Concat" | "Transpose"
         | "SimplifiedLayerNormalization" => idx == 0,
         _ => false,
     }
@@ -1326,7 +1326,7 @@ fn trace_path(node: &Node, path: &str) {
 /// slots; each of these kernels still sets its output shape itself.
 fn shape_depends_only_on_input_shapes(node: &Node, weights: &HashMap<String, Tensor>) -> bool {
     match node.op.as_str() {
-        "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "Concat" | "Transpose"
+        "MatMul" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "Gelu" | "SiLU" | "Erf" | "Concat" | "Transpose"
         | "SimplifiedLayerNormalization" => true,
         "SkipSimplifiedLayerNormalization" | "com.microsoft.RotaryEmbedding" | "OxiAttention" | "OxiMatMulAct"
         | "OxiMatMulSplit" | "MatMulNBits" | "OxiMatMulNBits" | "GatherBlockQuantized" => true,

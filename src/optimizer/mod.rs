@@ -56,11 +56,11 @@ pub fn optimize(
 ///  3. **Dead-node elimination** — remove nodes not reachable from outputs.
 ///  4. **CSE** — merge duplicate sub-expressions.
 ///  5. **Fusion passes** — inference Dropout removal, MatMul+Add, Conv+BN,
-///     Conv+Relu, Conv+ReLU6, SiLU, Div+Sqrt→Rsqrt, standalone BN folding,
+///     Conv+Relu, Conv+ReLU6, exact GELU, SiLU, Div+Sqrt→Rsqrt, standalone BN folding,
 ///     LayerNorm, spatial (InstanceNorm-style) normalization chains,
 ///     Transpose/Reshape cancellation, MatMul+Transpose, Add+MatMul→Gemm,
 ///     Gather composition, Conv+Add+Relu, and — when the registry has the
-///     fused kernels — attention (`OxiAttention`), MatMul+GELU (`OxiMatMulAct`)
+///     fused kernels — attention (`OxiAttention`), MatMul+GELU/SiLU (`OxiMatMulAct`)
 ///     and MatMul+Split projections (`OxiMatMulSplit`).
 ///
 /// [`PassLevel::Extended`] runs step 3 and step 5; [`PassLevel::Basic`] runs
@@ -146,6 +146,10 @@ pub fn optimize_with_input_shapes(
     } else {
         nodes
     };
+    // Activations written out as several ops become one node first, so the
+    // MatMul-activation fusion below sees them.
+    let nodes = fusion::fuse_gelu_erf(nodes, weights, output_names);
+    let nodes = fusion::fuse_mul_sigmoid_to_silu(nodes, output_names);
     // Before MatMul+Add→Gemm, which would take the bias Add this pass folds in.
     let nodes = if registry.get("OxiMatMulAct").is_some() {
         fusion::fuse_matmul_act(nodes, weights, output_names)
@@ -164,7 +168,6 @@ pub fn optimize_with_input_shapes(
     let nodes = fusion::fuse_conv_batchnorm(nodes, weights, output_names);
     let nodes = fusion::fuse_conv_relu(nodes, weights, output_names);
     let nodes = fusion::fuse_conv_clip_to_conv_relu6(nodes, weights, output_names);
-    let nodes = fusion::fuse_mul_sigmoid_to_silu(nodes, output_names);
     let nodes = fusion::fuse_div_sqrt_to_rsqrt(nodes, weights);
     // Re-infer shapes after upstream fusions so that the standalone
     // BatchNorm fold can size its synthesized `factor`/`shift` constants

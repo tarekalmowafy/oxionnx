@@ -65,79 +65,6 @@ macro_rules! unary_nn_op {
     };
 }
 
-/// Unary NN op with in-place support via a per-element closure.
-macro_rules! unary_nn_op_inplace {
-    ($name:ident, $op_type:expr, $func:path, $inplace_fn:expr) => {
-        pub struct $name;
-        impl Operator for $name {
-            fn op_type(&self) -> &str {
-                $op_type
-            }
-            fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
-                Ok(vec![$func(ctx.input(0)?)])
-            }
-            fn supports_inplace(&self) -> bool {
-                true
-            }
-            fn execute_inplace(
-                &self,
-                mut input: Tensor,
-                _ctx: &OpContext<'_>,
-            ) -> Result<Vec<Tensor>, OnnxError> {
-                let f: fn(f32) -> f32 = $inplace_fn;
-                for x in input.data.iter_mut() {
-                    *x = f(*x);
-                }
-                Ok(vec![input])
-            }
-            fn native_dtypes(&self) -> &'static [oxionnx_core::DType] {
-                &[
-                    oxionnx_core::DType::F32,
-                    oxionnx_core::DType::F16,
-                    oxionnx_core::DType::BF16,
-                    oxionnx_core::DType::I32,
-                    oxionnx_core::DType::I64,
-                ]
-            }
-            fn execute_typed(
-                &self,
-                ctx: &oxionnx_core::TypedOpContext<'_>,
-            ) -> Result<Vec<oxionnx_core::TypedTensor>, oxionnx_core::OnnxError> {
-                oxionnx_core::default_typed_via_f32(self, ctx)
-            }
-            fn supports_output_slots(&self) -> bool {
-                true
-            }
-            fn execute_into_slots(
-                &self,
-                ctx: &oxionnx_core::OpContext<'_>,
-                slots: &mut [oxionnx_core::Tensor],
-            ) -> Result<(), oxionnx_core::OnnxError> {
-                use oxionnx_core::OnnxError;
-                if slots.len() != 1 {
-                    return Err(OnnxError::Internal(format!(
-                        "{} expects 1 output slot, got {}",
-                        self.op_type(),
-                        slots.len()
-                    )));
-                }
-                let input = ctx.input(0)?;
-                let out = &mut slots[0];
-                let f: fn(f32) -> f32 = $inplace_fn;
-                if out.shape == input.shape && out.data.len() == input.data.len() {
-                    for (dst, &src) in out.data.iter_mut().zip(input.data.iter()) {
-                        *dst = f(src);
-                    }
-                } else {
-                    let data: Vec<f32> = input.data.iter().map(|&v| f(v)).collect();
-                    *out = oxionnx_core::Tensor::new(data, input.shape.clone());
-                }
-                Ok(())
-            }
-        }
-    };
-}
-
 // ── ReluOp — manual impl to wire typed_relu ─────────────────────────────────
 
 pub struct ReluOp;
@@ -361,11 +288,24 @@ fn gelu_approximate_is_tanh(attrs: &oxionnx_core::Attributes) -> bool {
 }
 
 /// Exact GELU (`approximate="none"`, the ONNX Gelu-20 default):
-/// `x * 0.5 * (1 + erf(x / sqrt(2)))`. Reuses `erf_approx` below, whose
-/// Abramowitz & Stegun approximation is accurate to ~1.5e-7 -- comfortably
-/// inside the 1e-5 tolerance ONNX's own `test_gelu_default_*` node tests use.
+/// `x * 0.5 * (1 + erf(x / sqrt(2)))`, with the vectorised kernels' scalar
+/// formula (see [`crate::gelu`]; relative error ~5e-7).
 pub(crate) fn gelu_exact(x: f32) -> f32 {
-    x * 0.5 * (1.0 + erf_approx(x * std::f32::consts::FRAC_1_SQRT_2))
+    crate::gelu::gelu_erf(x)
+}
+
+/// Write `kind(input)` into output slot 0 (parallel, no intermediate copy).
+fn kernel_into_slot(kind: crate::gelu::Kind, input: &Tensor, slot: &mut Tensor) {
+    slot.data.resize(input.data.len(), 0.0);
+    crate::gelu::apply_par(kind, &input.data, None, &mut slot.data);
+    slot.shape.clone_from(&input.shape);
+}
+
+/// `kind(input)` as a new tensor.
+fn kernel_new(kind: crate::gelu::Kind, input: &Tensor) -> Tensor {
+    let mut out = Tensor { data: vec![0.0; input.data.len()], shape: input.shape.clone() };
+    crate::gelu::apply_par(kind, &input.data, None, &mut out.data);
+    out
 }
 
 pub struct GeluOp;
@@ -380,8 +320,7 @@ impl Operator for GeluOp {
             // "simd" feature is enabled; preserve that fast path for "tanh".
             Ok(vec![nn::gelu(x)])
         } else {
-            let data: Vec<f32> = x.data.iter().map(|&v| gelu_exact(v)).collect();
-            Ok(vec![Tensor::new(data, x.shape.clone())])
+            Ok(vec![kernel_new(crate::gelu::Kind::GeluErf, x)])
         }
     }
     fn supports_inplace(&self) -> bool {
@@ -395,9 +334,7 @@ impl Operator for GeluOp {
         if gelu_approximate_is_tanh(ctx.attrs()) {
             nn::gelu_slice(&mut input.data);
         } else {
-            for x in input.data.iter_mut() {
-                *x = gelu_exact(*x);
-            }
+            crate::gelu::apply_inplace_par(crate::gelu::Kind::GeluErf, &mut input.data);
         }
         Ok(vec![input])
     }
@@ -450,38 +387,74 @@ impl Operator for GeluOp {
         let input = ctx.input(0)?;
         let use_tanh = gelu_approximate_is_tanh(ctx.attrs());
         let slot = &mut slots[0];
-        if use_tanh && cfg!(feature = "simd") && crate::gelu::vectorized() {
+        if !use_tanh {
+            kernel_into_slot(crate::gelu::Kind::GeluErf, input, slot);
+        } else if cfg!(feature = "simd") && crate::gelu::vectorized() {
             // Same kernel as `nn::gelu_slice`, without the copy into the slot first.
             slot.data.resize(input.data.len(), 0.0);
             crate::gelu::gelu_mul_par(&input.data, None, &mut slot.data);
             slot.shape.clone_from(&input.shape);
         } else if slot.shape == input.shape && slot.data.len() == input.data.len() {
             slot.data.copy_from_slice(&input.data);
-            if use_tanh {
-                nn::gelu_slice(&mut slot.data);
-            } else {
-                for dst in slot.data.iter_mut() {
-                    *dst = gelu_exact(*dst);
-                }
-            }
+            nn::gelu_slice(&mut slot.data);
         } else {
             let mut data = input.data.clone();
-            if use_tanh {
-                nn::gelu_slice(&mut data);
-            } else {
-                for dst in data.iter_mut() {
-                    *dst = gelu_exact(*dst);
-                }
-            }
+            nn::gelu_slice(&mut data);
             *slot = Tensor::new(data, input.shape.clone());
         }
         Ok(())
     }
 }
 
-unary_nn_op_inplace!(SiLUOp, "SiLU", nn::silu, |x: f32| {
-    x / (1.0 + (-x).exp())
-});
+/// A float unary op computed by a [`crate::gelu`] kernel: parallel, in place
+/// when the input buffer is free, and straight into the output slot.
+macro_rules! kernel_unary_op {
+    ($name:ident, $op_type:expr, $kind:expr) => {
+        pub struct $name;
+        impl Operator for $name {
+            fn op_type(&self) -> &str {
+                $op_type
+            }
+            fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+                Ok(vec![kernel_new($kind, ctx.input(0)?)])
+            }
+            fn supports_inplace(&self) -> bool {
+                true
+            }
+            fn execute_inplace(&self, mut input: Tensor, _ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+                crate::gelu::apply_inplace_par($kind, &mut input.data);
+                Ok(vec![input])
+            }
+            fn native_dtypes(&self) -> &'static [oxionnx_core::DType] {
+                &[
+                    oxionnx_core::DType::F32,
+                    oxionnx_core::DType::F16,
+                    oxionnx_core::DType::BF16,
+                    oxionnx_core::DType::I32,
+                    oxionnx_core::DType::I64,
+                ]
+            }
+            fn execute_typed(
+                &self,
+                ctx: &oxionnx_core::TypedOpContext<'_>,
+            ) -> Result<Vec<oxionnx_core::TypedTensor>, oxionnx_core::OnnxError> {
+                oxionnx_core::default_typed_via_f32(self, ctx)
+            }
+            fn supports_output_slots(&self) -> bool {
+                true
+            }
+            fn execute_into_slots(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
+                if slots.len() != 1 {
+                    return Err(OnnxError::Internal(format!("{} expects 1 output slot, got {}", $op_type, slots.len())));
+                }
+                kernel_into_slot($kind, ctx.input(0)?, &mut slots[0]);
+                Ok(())
+            }
+        }
+    };
+}
+
+kernel_unary_op!(SiLUOp, "SiLU", crate::gelu::Kind::Silu);
 unary_nn_op!(HardSwishOp, "HardSwish", nn::hard_swish);
 unary_nn_op!(SoftplusOp, "Softplus", nn::softplus);
 unary_nn_op!(SoftsignOp, "Softsign", nn::softsign);
@@ -579,79 +552,8 @@ impl Operator for DropoutOp {
 
 // ── Erf (custom inline implementation) ─────────────────────────────────────
 
-/// Polynomial approximation of error function (Abramowitz & Stegun 7.1.26)
-fn erf_approx(x: f32) -> f32 {
-    let sign = if x >= 0.0 { 1.0f32 } else { -1.0f32 };
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.3275911 * x);
-    let poly = t
-        * (0.254_829_6
-            + t * (-0.284_496_72 + t * (1.421_413_8 + t * (-1.453_152_1 + t * 1.061_405_4))));
-    sign * (1.0 - poly * (-x * x).exp())
-}
-
-pub struct ErfOp;
-impl Operator for ErfOp {
-    fn op_type(&self) -> &str {
-        "Erf"
-    }
-    fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
-        let x = ctx.input(0)?;
-        let data: Vec<f32> = x.data.iter().map(|&v| erf_approx(v)).collect();
-        Ok(vec![Tensor::new(data, x.shape.clone())])
-    }
-    fn supports_inplace(&self) -> bool {
-        true
-    }
-    fn execute_inplace(
-        &self,
-        mut input: Tensor,
-        _ctx: &OpContext<'_>,
-    ) -> Result<Vec<Tensor>, OnnxError> {
-        for x in input.data.iter_mut() {
-            *x = erf_approx(*x);
-        }
-        Ok(vec![input])
-    }
-    fn native_dtypes(&self) -> &'static [oxionnx_core::DType] {
-        &[
-            oxionnx_core::DType::F32,
-            oxionnx_core::DType::F16,
-            oxionnx_core::DType::BF16,
-            oxionnx_core::DType::I32,
-            oxionnx_core::DType::I64,
-        ]
-    }
-    fn execute_typed(
-        &self,
-        ctx: &oxionnx_core::TypedOpContext<'_>,
-    ) -> Result<Vec<oxionnx_core::TypedTensor>, oxionnx_core::OnnxError> {
-        oxionnx_core::default_typed_via_f32(self, ctx)
-    }
-    fn supports_output_slots(&self) -> bool {
-        true
-    }
-    fn execute_into_slots(
-        &self,
-        ctx: &OpContext<'_>,
-        slots: &mut [Tensor],
-    ) -> Result<(), OnnxError> {
-        if slots.is_empty() {
-            return Ok(());
-        }
-        let input = ctx.input(0)?;
-        let slot = &mut slots[0];
-        if slot.shape == input.shape && slot.data.len() == input.data.len() {
-            for (dst, &src) in slot.data.iter_mut().zip(input.data.iter()) {
-                *dst = erf_approx(src);
-            }
-        } else {
-            let data: Vec<f32> = input.data.iter().map(|&v| erf_approx(v)).collect();
-            *slot = Tensor::new(data, input.shape.clone());
-        }
-        Ok(())
-    }
-}
+// The error function, vectorised (see `crate::gelu`; relative error ~5e-7).
+kernel_unary_op!(ErfOp, "Erf", crate::gelu::Kind::Erf);
 
 // ── Abs, Log, Exp (inline unary ops) ───────────────────────────────────────
 
