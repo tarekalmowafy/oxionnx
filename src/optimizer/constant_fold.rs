@@ -138,6 +138,39 @@ pub fn constant_fold(
     nodes
 }
 
+/// Move the value of every `Constant` node into `weights` and drop the node,
+/// so later passes see a plain initializer instead of having to look through
+/// the node. Uses exactly the values the `Constant` kernel would produce
+/// (`value`, `value_float`, `value_int`); a node with another attribute, more
+/// than one output, an output that is a graph output, or one whose name
+/// already names a weight is kept.
+pub fn fold_constant_nodes(nodes: Vec<Node>, weights: &mut HashMap<String, Tensor>, output_names: &[String]) -> Vec<Node> {
+    let graph_outputs: HashSet<&str> = output_names.iter().map(String::as_str).collect();
+    nodes
+        .into_iter()
+        .filter(|node| {
+            if node.op != OpKind::Constant || node.outputs.len() != 1 || !node.inputs.iter().all(String::is_empty) {
+                return true;
+            }
+            let out = &node.outputs[0];
+            if out.is_empty() || graph_outputs.contains(out.as_str()) || weights.contains_key(out) {
+                return true;
+            }
+            let value = if let Some(t) = node.attrs.tensors.get("value") {
+                t.clone()
+            } else if let Some(&v) = node.attrs.floats.get("value_float") {
+                Tensor::new(vec![v], Vec::new())
+            } else if let Some(&v) = node.attrs.ints.get("value_int") {
+                Tensor::new(vec![v as f32], Vec::new())
+            } else {
+                return true;
+            };
+            weights.insert(out.clone(), value);
+            false
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +245,31 @@ mod tests {
         assert!(result.is_empty());
         let e = weights.get("e").expect("e in weights");
         assert_eq!(e.data, vec![13.0]);
+    }
+
+    #[test]
+    fn fold_constant_nodes_moves_values_into_weights() {
+        use crate::graph::Attributes;
+        let mut c_tensor = make_node(OpKind::Constant, "c0", vec![], vec!["t"]);
+        c_tensor.attrs.tensors.insert("value".into(), Tensor::new(vec![1.0, 2.0], vec![2]));
+        let mut c_float = make_node(OpKind::Constant, "c1", vec![], vec!["f"]);
+        c_float.attrs.floats.insert("value_float".into(), 0.5);
+        let mut c_int = make_node(OpKind::Constant, "c2", vec![], vec!["i"]);
+        c_int.attrs.ints.insert("value_int".into(), 3);
+        // Kept: a value_ints constant (the kernel has no arm for it), and a graph output.
+        let mut c_ints = make_node(OpKind::Constant, "c3", vec![], vec!["is"]);
+        c_ints.attrs = Attributes::default();
+        c_ints.attrs.int_lists.insert("value_ints".into(), vec![1, 2]);
+        let mut c_out = make_node(OpKind::Constant, "c4", vec![], vec!["out"]);
+        c_out.attrs.floats.insert("value_float".into(), 1.0);
+        let add = make_node(OpKind::Add, "add", vec!["x", "t"], vec!["y"]);
+        let mut weights = HashMap::new();
+        let nodes = fold_constant_nodes(vec![c_tensor, c_float, c_int, c_ints, c_out, add], &mut weights, &["y".into(), "out".into()]);
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["c3", "c4", "add"]);
+        assert_eq!(weights["t"].data, [1.0, 2.0]);
+        assert_eq!(weights["t"].shape, [2]);
+        assert_eq!((weights["f"].data.clone(), weights["f"].shape.clone()), (vec![0.5], vec![]));
+        assert_eq!((weights["i"].data.clone(), weights["i"].shape.clone()), (vec![3.0], vec![]));
     }
 }
