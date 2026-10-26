@@ -58,3 +58,39 @@ where
         });
     }
 }
+
+/// Elements per chunk of [`map_inplace`] / [`map_into`] (task sizes still
+/// follow [`min_elems`]).
+const MAP_CHUNK: usize = 16 * 1024;
+
+/// `data[i] = f(data[i])`, in parallel for large tensors.
+pub(crate) fn map_inplace(data: &mut [f32], f: impl Fn(f32) -> f32 + Sync + Send) {
+    for_each_row(data, MAP_CHUNK, |_, c| c.iter_mut().for_each(|x| *x = f(*x)));
+}
+
+/// `dst[i] = f(src[i])` (equal lengths), in parallel for large tensors.
+pub(crate) fn map_into(src: &[f32], dst: &mut [f32], f: impl Fn(f32) -> f32 + Sync + Send) {
+    debug_assert_eq!(src.len(), dst.len());
+    for_each_row(dst, MAP_CHUNK, |ci, c| {
+        let s = &src[ci * MAP_CHUNK..ci * MAP_CHUNK + c.len()];
+        c.iter_mut().zip(s).for_each(|(d, &x)| *d = f(x));
+    });
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    #[test]
+    fn map_matches_serial_on_odd_sizes() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        for n in [0, 1, 7, super::MAP_CHUNK - 1, 3 * super::MAP_CHUNK + 5, 5 * super::MIN_ELEMS_PER_TASK + 3] {
+            let src: Vec<f32> = (0..n).map(|i| i as f32 * 0.5 - 7.0).collect();
+            let want: Vec<f32> = src.iter().map(|x| -x).collect();
+            let mut dst = vec![f32::NAN; n];
+            pool.install(|| super::map_into(&src, &mut dst, |x| -x));
+            assert_eq!(dst, want, "map_into n={n}");
+            let mut inplace = src.clone();
+            pool.install(|| super::map_inplace(&mut inplace, |x| -x));
+            assert_eq!(inplace, want, "map_inplace n={n}");
+        }
+    }
+}
