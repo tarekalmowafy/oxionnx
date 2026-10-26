@@ -152,8 +152,8 @@ pub struct SplitSpec<'a> {
 
 impl SplitSpec<'_> {
     /// Column block that never straddles an output or a head: the head width
-    /// when there is a norm or rotary, else the largest common divisor of the
-    /// splits. `head` is the rotary head size, if any.
+    /// when there is a norm or rotary, else the largest of 256/128/64/32 that
+    /// divides every split (the splits' common divisor if none does). `head` is the rotary head size, if any.
     pub fn block(&self, head: Option<usize>) -> Option<usize> {
         let mut widths = self.norms.iter().flatten().map(|n| n.gamma.len());
         let norm_d = widths.next();
@@ -171,7 +171,9 @@ impl SplitSpec<'_> {
         match d {
             Some(d) if d > 0 && g % d == 0 && head.is_none_or(|h| h == d) => Some(d),
             Some(_) => None,
-            None => (g > 0).then_some(g),
+            // The GEMM's own column blocking is at most 256 wide; a wider
+            // epilogue block (e.g. 768 for a plain Q/K/V split) slows it down.
+            None => (g > 0).then(|| [256, 128, 64, 32].into_iter().find(|w| g % w == 0).unwrap_or(g)),
         }
     }
 
