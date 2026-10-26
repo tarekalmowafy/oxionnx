@@ -36,3 +36,5 @@ mod parallel;
 mod slot_dispatch;
 #[cfg(test)]
 mod thread_pool;
+#[cfg(test)]
+mod unsorted_graph;

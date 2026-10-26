@@ -343,6 +343,29 @@ impl Session {
         // `Basic` = dead-node elimination, `Extended` = dead-node elimination
         // plus the fusions, `All` = the full pipeline (shape materialisation,
         // constant folding, CSE and fusions).
+        // The optimizer passes assume topological order, which ONNX requires
+        // but some exporters do not keep (ORT's MatMulNBits quantizer appends
+        // the nodes it rewrites at the end). Sort such graphs first; sorted
+        // ones keep their order.
+        let mut graph = graph;
+        {
+            let known: Vec<String> = weights
+                .keys()
+                .cloned()
+                .chain(input_names.iter().cloned())
+                .collect();
+            if !graph.is_topologically_sorted(&known) {
+                let order = graph.topological_sort(&known);
+                let mut slots: Vec<Option<crate::graph::Node>> =
+                    std::mem::take(&mut graph.nodes).into_iter().map(Some).collect();
+                graph.nodes = order.iter().filter_map(|&i| slots[i].take()).collect();
+                tracing::debug!(
+                    target: LOAD_TARGET,
+                    nodes = graph.nodes.len(),
+                    "graph was not topologically sorted; sorted before optimizing",
+                );
+            }
+        }
         let nodes_before_optimize = graph.nodes.len();
         let optimize_started = crate::time_compat::Instant::now();
         let optimized_nodes = match opt_level {

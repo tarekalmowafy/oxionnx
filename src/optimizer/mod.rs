@@ -8,6 +8,7 @@ pub mod dead_code;
 pub mod fusion;
 pub mod graph_diff;
 pub(crate) mod graph_utils;
+pub mod dynamic_quant;
 pub mod nbits;
 pub mod shape_inference;
 pub(crate) mod shape_inference_ext;
@@ -129,6 +130,7 @@ pub fn optimize_with_input_shapes(
     // Quantized weights go into their kernel layout first, so every later pass
     // sees the final op and no ORT-layout copy outlives the build.
     let nodes = if registry.get("OxiMatMulNBits").is_some() {
+        let nodes = dynamic_quant::rewrite_dynamic_quant_matmul(nodes, weights, output_names);
         nbits::prepack_matmul_nbits(nodes, weights, output_names)
     } else {
         nodes
