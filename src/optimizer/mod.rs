@@ -48,6 +48,8 @@ pub fn optimize(
 /// Apply the optimization passes selected by `level`.
 ///
 /// Pass order at [`PassLevel::All`]:
+///  0. **Normalisation** — stable topological sort, and `Constant` nodes
+///     become weights.
 ///  1. **Shape inference** — infer tensor shapes from weights and propagate
 ///     through the graph.  For every `Shape` node whose input has a known
 ///     shape, the output is materialised as a constant weight so that
@@ -63,7 +65,7 @@ pub fn optimize(
 ///     fused kernels — attention (`OxiAttention`), MatMul+GELU/SiLU (`OxiMatMulAct`)
 ///     and MatMul+Split projections (`OxiMatMulSplit`).
 ///
-/// [`PassLevel::Extended`] runs step 3 and step 5; [`PassLevel::Basic`] runs
+/// [`PassLevel::Extended`] runs steps 0, 3 and 5; [`PassLevel::Basic`] runs
 /// step 3 only.  Every pass keeps the declared `output_names` produced.
 pub fn optimize_with_level(
     nodes: Vec<Node>,
@@ -110,6 +112,15 @@ pub fn optimize_with_input_shapes(
     level: PassLevel,
     input_shapes: &HashMap<String, Vec<usize>>,
 ) -> Vec<Node> {
+    // Producers before consumers (a few exports list them out of order, and
+    // several passes below walk the list once), and `Constant` nodes as plain
+    // weights, so no matcher has to look through them.
+    let nodes = if level == PassLevel::Basic {
+        nodes
+    } else {
+        let nodes = dead_code::stable_topological_sort(nodes);
+        constant_fold::fold_constant_nodes(nodes, weights, output_names)
+    };
     // Quantized weights go into their kernel layout first, so every later pass
     // sees the final op and no ORT-layout copy outlives the build.
     let nodes = if registry.get("OxiMatMulNBits").is_some() {

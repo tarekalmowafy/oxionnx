@@ -29,7 +29,7 @@
 
 use crate::graph::{Node, OpKind};
 use crate::tensor::Tensor;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 const MHA: &str = "com.microsoft.MultiHeadAttention";
 
@@ -270,23 +270,7 @@ pub fn fuse_repeat_kv(nodes: Vec<Node>, weights: &HashMap<String, Tensor>, outpu
             n.attrs.ints.insert("kv_num_heads".into(), h);
         }
     }
-    remove_dead(nodes, output_names)
-}
-
-/// Drop nodes none of whose outputs is consumed or a graph output, to a fixed
-/// point. Unlike `dead_code::dead_node_elimination` this does not assume the
-/// node list is topologically sorted (it is not yet, at this stage, for some
-/// exports).
-fn remove_dead(mut nodes: Vec<Node>, output_names: &[String]) -> Vec<Node> {
-    let outputs: HashSet<&str> = output_names.iter().map(String::as_str).collect();
-    loop {
-        let used: HashSet<String> = nodes.iter().flat_map(|n| n.inputs.iter()).filter(|s| !s.is_empty()).cloned().collect();
-        let before = nodes.len();
-        nodes.retain(|n| n.outputs.is_empty() || n.outputs.iter().any(|o| !o.is_empty() && (used.contains(o) || outputs.contains(o.as_str()))));
-        if nodes.len() == before {
-            return nodes;
-        }
-    }
+    crate::optimizer::dead_code::dead_node_elimination(nodes, output_names)
 }
 
 #[cfg(test)]
