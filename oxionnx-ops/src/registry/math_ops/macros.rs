@@ -347,6 +347,10 @@ macro_rules! binary_op_result {
 /// Binary op with in-place support (only when shapes match exactly).
 macro_rules! binary_op_inplace {
     ($name:ident, $op_type:expr, $func:path, $inplace_fn:expr, $typed_fn:path) => {
+        binary_op_inplace!($name, $op_type, $func, $inplace_fn, $typed_fn, |_: &OpContext<'_>, _: &mut Tensor| {});
+    };
+    // `$post` runs on every f32 result (e.g. integer truncation for `Div`).
+    ($name:ident, $op_type:expr, $func:path, $inplace_fn:expr, $typed_fn:path, $post:expr) => {
         pub struct $name;
         impl Operator for $name {
             fn op_type(&self) -> &str {
@@ -358,6 +362,7 @@ macro_rules! binary_op_inplace {
                 let f = crate::math::binary_fn($inplace_fn);
                 let mut out = Tensor { data: Vec::new(), shape: Vec::new() };
                 crate::math::binary_into(ctx.input(0)?, ctx.input(1)?, &mut out, f)?;
+                $post(ctx, &mut out);
                 Ok(vec![out])
             }
             fn supports_inplace(&self) -> bool {
@@ -372,10 +377,12 @@ macro_rules! binary_op_inplace {
                 let f = crate::math::binary_fn($inplace_fn);
                 // Prototype: broadcast in place whenever the output has `input`'s shape.
                 if crate::math::binary_inplace(&mut input, other, f)? {
+                    $post(ctx, &mut input);
                     return Ok(vec![input]);
                 }
                 let mut out = Tensor { data: Vec::new(), shape: Vec::new() };
                 crate::math::binary_into(&input, other, &mut out, f)?;
+                $post(ctx, &mut out);
                 Ok(vec![out])
             }
             fn native_dtypes(&self) -> &'static [oxionnx_core::DType] {
@@ -421,6 +428,7 @@ macro_rules! binary_op_inplace {
                 // Prototype: row-wise broadcast kernel writing straight into the slot.
                 let f = crate::math::binary_fn($inplace_fn);
                 crate::math::binary_into(a, b, &mut slots[0], f)?;
+                $post(ctx, &mut slots[0]);
                 Ok(())
             }
         }

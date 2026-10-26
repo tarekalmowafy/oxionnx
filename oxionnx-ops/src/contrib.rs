@@ -348,10 +348,82 @@ pub fn attention_into(
     dims: AttnDims,
     out: &mut [f32],
 ) -> Result<(), String> {
+    attention_ext_into(q, k, v, bias, AttnExt::default(), dims, out)
+}
+
+/// Softmax sink of [`AttnExt`]: an extra logit that takes part in the
+/// normalisation but has no value row (`exp(x_j) / (exp(sink) + sum exp(x))`).
+#[derive(Clone, Copy, Debug, Default)]
+pub enum AttnSink<'a> {
+    #[default]
+    None,
+    /// "Smooth softmax": a sink logit of 0 for every head.
+    Zero,
+    /// One sink logit per query head.
+    PerHead(&'a [f32]),
+}
+
+/// Per-row key windows and score transforms for [`attention_ext_into`]
+/// (the `com.microsoft::GroupQueryAttention` semantics).
+///
+/// Query row `s` of batch `b` attends to keys `lo..hi` with
+/// `hi = min(causal_offset[b] + s + 1, kv_len[b])` (just `kv_len[b]` without
+/// `causal_offset`; `kv_len` defaults to all `seq_kv` keys) and
+/// `lo = hi - local_window` when the window is shorter than `hi`. Keys outside
+/// the window get probability 0. Scores are `softcap * tanh(x / softcap)`
+/// (when `softcap > 0`) of the scaled product, then the bias is added.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AttnExt<'a> {
+    pub kv_len: Option<&'a [usize]>,
+    pub causal_offset: Option<&'a [usize]>,
+    pub local_window: Option<usize>,
+    pub softcap: f32,
+    pub sink: AttnSink<'a>,
+}
+
+impl AttnExt<'_> {
+    fn is_plain(&self) -> bool {
+        self.kv_len.is_none()
+            && self.causal_offset.is_none()
+            && self.local_window.is_none()
+            && self.softcap <= 0.0
+            && matches!(self.sink, AttnSink::None)
+    }
+
+    /// Key window `lo..hi` of query row `s` in batch `b`.
+    #[inline]
+    fn window(&self, b: usize, s: usize, seq_kv: usize) -> (usize, usize) {
+        let len = self.kv_len.map_or(seq_kv, |l| l[b].min(seq_kv));
+        let hi = self.causal_offset.map_or(len, |o| (o[b] + s + 1).min(len));
+        let lo = match self.local_window {
+            Some(w) if hi > w => hi - w,
+            _ => 0,
+        };
+        (lo, hi)
+    }
+}
+
+/// [`attention_into`] with the key windows, soft-capping and softmax sink of `ext`.
+pub fn attention_ext_into(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    bias: Option<AttnBias<'_>>,
+    ext: AttnExt<'_>,
+    dims: AttnDims,
+    out: &mut [f32],
+) -> Result<(), String> {
     let AttnDims { batch, seq_q, seq_kv, q_heads, kv_heads, head_dim, scale } = dims;
     if kv_heads == 0 || q_heads % kv_heads != 0 || head_dim == 0 {
         return Err(format!("attention: invalid head geometry {dims:?}"));
     }
+    if ext.kv_len.is_some_and(|l| l.len() < batch)
+        || ext.causal_offset.is_some_and(|o| o.len() < batch)
+        || matches!(ext.sink, AttnSink::PerHead(h) if h.len() != q_heads)
+    {
+        return Err(format!("attention: per-batch lengths or per-head sinks do not match {dims:?}"));
+    }
+    let plain = ext.is_plain();
     let (qrs, krs) = (q_heads * head_dim, kv_heads * head_dim);
     if q.len() != batch * seq_q * qrs
         || k.len() != batch * seq_kv * krs
@@ -436,23 +508,36 @@ pub fn attention_into(
             },
         }
         for (i, row) in scores.chunks_mut(seq_kv).enumerate() {
+            let (lo, hi) = if plain { (0, seq_kv) } else { ext.window(b, s0 + i, seq_kv) };
+            let win = &mut row[lo..hi];
             if row_scale != 1.0 {
-                row.iter_mut().for_each(|x| *x *= row_scale);
+                win.iter_mut().for_each(|x| *x *= row_scale);
+            }
+            if ext.softcap > 0.0 {
+                let (c, inv) = (ext.softcap, ext.softcap.recip());
+                win.iter_mut().for_each(|x| *x = c * (*x * inv).tanh());
             }
             if let Some(bb) = bias {
                 let [sb, sg, sr, ss, st] = bb.strides;
-                let base = b * sb + g * sg + r * sr + (s0 + i) * ss;
+                let base = b * sb + g * sg + r * sr + (s0 + i) * ss + lo * st;
                 if st == 1 {
-                    for (x, &y) in row.iter_mut().zip(&bb.data[base..base + seq_kv]) {
+                    for (x, &y) in win.iter_mut().zip(&bb.data[base..base + (hi - lo)]) {
                         *x += y;
                     }
                 } else {
-                    for (j, x) in row.iter_mut().enumerate() {
+                    for (j, x) in win.iter_mut().enumerate() {
                         *x += bb.data[base + j * st];
                     }
                 }
             }
-            softmax_row(row);
+            match ext.sink {
+                AttnSink::None if !win.is_empty() => softmax_row(win),
+                AttnSink::None => {}
+                AttnSink::Zero => softmax_sink_row(win, 0.0),
+                AttnSink::PerHead(sinks) => softmax_sink_row(win, sinks[h]),
+            }
+            row[..lo].fill(0.0);
+            row[hi..].fill(0.0);
         }
         let dst = unsafe { op.0.add((b * seq_q + s0) * qrs + h * head_dim) };
         match pk {
@@ -485,6 +570,18 @@ pub fn attention_into(
         work(task, &mut scores);
     }
     Ok(())
+}
+
+/// Softmax with an extra `sink` logit in the denominator (MLAS "smooth softmax").
+fn softmax_sink_row(row: &mut [f32], sink: f32) {
+    let max = row.iter().copied().fold(sink, f32::max);
+    let mut sum = (sink - max).exp();
+    for x in row.iter_mut() {
+        *x = (*x - max).exp();
+        sum += *x;
+    }
+    let inv = sum.recip();
+    row.iter_mut().for_each(|x| *x *= inv);
 }
 
 fn softmax_row(row: &mut [f32]) {

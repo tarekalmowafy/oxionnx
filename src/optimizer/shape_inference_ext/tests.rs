@@ -391,3 +391,15 @@ fn test_shape_inference_gru() {
     assert_eq!(result.get("y"), Some(&vec![8, 1, 2, 4]));
     assert_eq!(result.get("y_h"), Some(&vec![1, 2, 4]));
 }
+
+#[test]
+fn test_shape_inference_shape_start_end() {
+    let mut node = make_node(OpKind::Shape, "shape", vec!["x"], vec!["y"]);
+    node.attrs.ints.insert("start".to_string(), 1);
+    node.attrs.ints.insert("end".to_string(), 2);
+    let mut tail = make_node(OpKind::Shape, "shape_tail", vec!["x"], vec!["z"]);
+    tail.attrs.ints.insert("start".to_string(), -2);
+    let result = infer_shapes(&[node, tail], &HashMap::new(), &shapes_map(&[("x", vec![1, 5, 2])]));
+    assert_eq!(result.get("y"), Some(&vec![1]));
+    assert_eq!(result.get("z"), Some(&vec![2]));
+}

@@ -6,6 +6,7 @@
 pub mod cast_like;
 pub mod center_crop_pad;
 pub mod col2im;
+pub mod contrib_attention;
 pub mod contrib_ops;
 pub mod nbits_ops;
 pub mod conv_ops;
@@ -179,6 +180,8 @@ pub fn default_registry() -> OperatorRegistry {
     // ── ONNX Runtime contrib ops and optimizer-only fused ops ──────────────
     r.register(Box::new(contrib_ops::SkipSimplifiedLayerNormOp));
     r.register(Box::new(contrib_ops::MsRotaryEmbeddingOp));
+    r.register(Box::new(contrib_attention::MsMultiHeadAttentionOp));
+    r.register(Box::new(contrib_attention::GroupQueryAttentionOp));
     r.register(Box::new(contrib_ops::OxiAttentionOp));
     r.register(Box::new(contrib_ops::OxiMatMulActOp::default()));
     r.register(Box::new(contrib_ops::OxiMatMulSplitOp::default()));
