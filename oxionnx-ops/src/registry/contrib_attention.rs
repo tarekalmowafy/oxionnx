@@ -41,32 +41,18 @@ fn empty_slots(ctx: &OpContext<'_>) -> Vec<Tensor> {
     ctx.node.outputs.iter().map(|_| Tensor { data: vec![], shape: vec![0] }).collect()
 }
 
-/// `[B, N, T, H]` -> `[B, T, N*H]`.
+/// `[B, N, T, H]` -> `[B, T, N*H]` (parallel row copies).
 fn bnsh_to_bsnh(src: &[f32], b: usize, n: usize, t: usize, h: usize) -> Vec<f32> {
     let mut out = vec![0.0; b * t * n * h];
-    for bb in 0..b {
-        for nn in 0..n {
-            for tt in 0..t {
-                let s = ((bb * n + nn) * t + tt) * h;
-                let d = ((bb * t + tt) * n + nn) * h;
-                out[d..d + h].copy_from_slice(&src[s..s + h]);
-            }
-        }
-    }
+    let st = |x: usize| x as isize;
+    crate::datamove::strided_copy(src, 0, &[b, t, n, h], &[st(n * t * h), st(h), st(t * h), 1], &mut out);
     out
 }
 
-/// `[B, T, N*H]` -> `[B, N, T, H]` into `dst`.
+/// `[B, T, N*H]` -> `[B, N, T, H]` into `dst` (parallel row copies).
 fn bsnh_to_bnsh_into(src: &[f32], b: usize, t: usize, n: usize, h: usize, dst: &mut [f32]) {
-    for bb in 0..b {
-        for tt in 0..t {
-            for nn in 0..n {
-                let s = ((bb * t + tt) * n + nn) * h;
-                let d = ((bb * n + nn) * t + tt) * h;
-                dst[d..d + h].copy_from_slice(&src[s..s + h]);
-            }
-        }
-    }
+    let st = |x: usize| x as isize;
+    crate::datamove::strided_copy(src, 0, &[b, n, t, h], &[st(t * n * h), st(h), st(n * h), 1], &mut dst[..b * n * t * h]);
 }
 
 /// Split interleaved per-token rows of `widths` columns each into separate
@@ -103,25 +89,38 @@ fn scale_attr(ctx: &OpContext<'_>, head_size: usize) -> f32 {
     }
 }
 
-/// Element strides of a `[B|1, H|1, S, T]` attention bias in the kernel's
-/// `[B, G, R, S, T]` score space (`h = g * R + r`).
-fn bhst_strides(shape: &[usize], group: usize, s: usize, t: usize) -> [usize; 5] {
-    let sb = if shape[0] == 1 { 0 } else { shape[1] * s * t };
-    let sh = if shape[1] == 1 { 0 } else { s * t };
-    [sb, sh * group, sh, t, 1]
+/// An attention bias shape left-padded with 1s to rank 4.
+fn bhst_dims(shape: &[usize]) -> [usize; 4] {
+    let mut d = [1; 4];
+    let k = shape.len().min(4);
+    d[4 - k..].copy_from_slice(&shape[shape.len() - k..]);
+    d
 }
 
-/// Check an attention bias is `[B|1, H|1, S, T]`.
+/// Element strides of a `[B|1, H|1, S|1, T|1]` attention bias in the kernel's
+/// `[B, G, R, S, T]` score space (`h = g * R + r`); size-1 axes broadcast.
+fn bhst_strides(shape: &[usize], group: usize) -> [usize; 5] {
+    let [db, dh, ds, dt] = bhst_dims(shape);
+    let sb = if db == 1 { 0 } else { dh * ds * dt };
+    let sh = if dh == 1 { 0 } else { ds * dt };
+    let ss = if ds == 1 { 0 } else { dt };
+    let st = if dt == 1 { 0 } else { 1 };
+    [sb, sh * group, sh, ss, st]
+}
+
+/// Check an attention bias broadcasts as `[B|1, H|1, S|1, T|1]` (rank 1-4,
+/// missing leading axes count as 1).
 fn check_bhst(bias: &Tensor, b: usize, heads: usize, s: usize, t: usize) -> Result<(), String> {
-    let ok = bias.ndim() == 4
-        && (bias.shape[0] == b || bias.shape[0] == 1)
-        && (bias.shape[1] == heads || bias.shape[1] == 1)
-        && bias.shape[2] == s
-        && bias.shape[3] == t;
+    let [db, dh, ds, dt] = bhst_dims(&bias.shape);
+    let ok = (1..=4).contains(&bias.ndim())
+        && (db == b || db == 1)
+        && (dh == heads || dh == 1)
+        && (ds == s || ds == 1)
+        && (dt == t || dt == 1);
     if ok {
         Ok(())
     } else {
-        Err(format!("attention_bias {:?} is not [{b}|1, {heads}|1, {s}, {t}]", bias.shape))
+        Err(format!("attention_bias {:?} is not [{b}|1, {heads}|1, {s}|1, {t}|1]", bias.shape))
     }
 }
 
@@ -132,8 +131,11 @@ fn check_bhst(bias: &Tensor, b: usize, heads: usize, s: usize, t: usize) -> Resu
 /// Inputs: `query`, `key`, `value`, `bias`, `key_padding_mask`, `attention_bias`,
 /// `past_key`, `past_value` (`past_sequence_length` and `cache_indirection`,
 /// the shared-buffer / beam-search forms, are not supported).
-/// Attributes: `num_heads`, `scale`, `mask_filter_value`, `unidirectional`.
-/// Outputs: `output` `[B, S, D]`, `present_key`/`present_value` `[B, N, T, H]`
+/// Attributes: `num_heads`, `scale`, `mask_filter_value`, `unidirectional`, and the
+/// oxionnx extension `kv_num_heads` (set by the optimizer's `repeat_kv` fusion; 0 or
+/// absent = `num_heads`): K/V carry that many heads, each shared by
+/// `num_heads / kv_num_heads` query heads, as in GroupQueryAttention.
+/// Outputs: `output` `[B, S, D]`, `present_key`/`present_value` `[B, N_kv, T, H]`
 /// (`qk` is not supported).
 ///
 /// Q/K/V formats: `[B, S, D]` / `[B, L, D]` / `[B, L, D]`; `[B, S, D]` with K/V
@@ -142,7 +144,7 @@ fn check_bhst(bias: &Tensor, b: usize, heads: usize, s: usize, t: usize) -> Resu
 /// `key_padding_mask` is `[B]` (key lengths), `[2B]` (ends, then starts),
 /// `[B, T]` or `[B, S, T]` (1 = keep), masked scores get `mask_filter_value`
 /// added; `unidirectional` scores (key after `past + s`) get `f32::MIN`; then
-/// `attention_bias` `[B|1, N|1, S, T]` is added.
+/// `attention_bias` `[B|1, N|1, S|1, T|1]` (rank 4 or lower, broadcast) is added.
 pub struct MsMultiHeadAttentionOp;
 
 /// Padding-mask forms of `com.microsoft::MultiHeadAttention`'s `key_padding_mask`.
@@ -188,6 +190,11 @@ impl MsMultiHeadAttentionOp {
             return Err(bad("num_heads must be positive".into()));
         }
         let n = n as usize;
+        let nkv = match attrs.i("kv_num_heads", 0) {
+            0 => n,
+            k if k > 0 && n % k as usize == 0 => k as usize,
+            k => return Err(bad(format!("kv_num_heads {k} must divide num_heads {n}"))),
+        };
         let mfv = attrs.f("mask_filter_value", -10000.0);
         let causal = attrs.i("unidirectional", 0) == 1;
         if ctx.optional_input(8).is_some() || ctx.optional_input(9).is_some() {
@@ -208,7 +215,7 @@ impl MsMultiHeadAttentionOp {
             match (query.ndim(), key, value) {
                 (3, Some(kt), Some(vt)) if kt.ndim() == 3 => {
                     let h = qdim(query.shape[2])?;
-                    if kt.shape[0] != b || kt.shape[2] != query.shape[2] || vt.shape != kt.shape {
+                    if kt.shape[0] != b || kt.shape[2] != nkv * h || vt.shape != kt.shape {
                         return Err(bad(format!(
                             "key {:?} / value {:?} do not match query {:?} (value hidden size must equal the query's)",
                             kt.shape, vt.shape, query.shape
@@ -219,18 +226,14 @@ impl MsMultiHeadAttentionOp {
                 (3, Some(kt), Some(vt)) if kt.ndim() == 4 => {
                     let h = qdim(query.shape[2])?;
                     let l = kt.shape[2];
-                    if kt.shape[..] != [b, n, l, h] || vt.shape != kt.shape {
-                        return Err(bad(format!("key {:?} / value {:?} are not [B, N, L, H] = [{b}, {n}, L, {h}]", kt.shape, vt.shape)));
+                    if kt.shape[..] != [b, nkv, l, h] || vt.shape != kt.shape {
+                        return Err(bad(format!("key {:?} / value {:?} are not [B, N, L, H] = [{b}, {nkv}, L, {h}]", kt.shape, vt.shape)));
                     }
-                    (
-                        Cow::Borrowed(&query.data[..]),
-                        Cow::Owned(bnsh_to_bsnh(&kt.data, b, n, l, h)),
-                        Cow::Owned(bnsh_to_bsnh(&vt.data, b, n, l, h)),
-                        l,
-                        h,
-                        false,
-                        true,
-                    )
+                    // Read in place: the kernel takes head-major K/V.
+                    (Cow::Borrowed(&query.data[..]), Cow::Borrowed(&kt.data[..]), Cow::Borrowed(&vt.data[..]), l, h, false, true)
+                }
+                _ if nkv != n && (query.ndim() != 3 || key.map_or(true, |kt| kt.ndim() == 5)) => {
+                    return Err(unsupported("kv_num_heads with packed query/key/value"));
                 }
                 (3, Some(kt), None) if kt.ndim() == 5 => {
                     let h = qdim(query.shape[2])?;
@@ -264,6 +267,10 @@ impl MsMultiHeadAttentionOp {
                 }
             };
         let d = n * h;
+        let dkv = nkv * h;
+        if bias.is_some() && nkv != n {
+            return Err(unsupported("bias with kv_num_heads"));
+        }
         if let Some(bt) = bias {
             if bt.data.len() != 3 * d {
                 return Err(bad(format!("bias has {} elements, expected {}", bt.data.len(), 3 * d)));
@@ -283,20 +290,20 @@ impl MsMultiHeadAttentionOp {
                     return Err(bad("past_key/past_value with [B, N, L, H] key/value".into()));
                 }
                 let p = pk.shape.get(2).copied().unwrap_or(0);
-                if pk.shape[..] != [b, n, p, h] || pv.shape != pk.shape {
-                    return Err(bad(format!("past_key {:?} / past_value {:?} are not [{b}, {n}, P, {h}]", pk.shape, pv.shape)));
+                if pk.shape[..] != [b, nkv, p, h] || pv.shape != pk.shape {
+                    return Err(bad(format!("past_key {:?} / past_value {:?} are not [{b}, {nkv}, P, {h}]", pk.shape, pv.shape)));
                 }
                 if p > 0 {
                     let cat = |past: &[f32], cur: &[f32]| {
                         let t = p + l;
-                        let mut out = bnsh_to_bsnh(past, b, n, p, h);
-                        out.resize(b * t * d, 0.0);
+                        let mut out = bnsh_to_bsnh(past, b, nkv, p, h);
+                        out.resize(b * t * dkv, 0.0);
                         // Spread the past rows to stride T and append the new ones.
                         for bb in (0..b).rev() {
-                            out.copy_within(bb * p * d..(bb + 1) * p * d, bb * t * d);
+                            out.copy_within(bb * p * dkv..(bb + 1) * p * dkv, bb * t * dkv);
                         }
                         for bb in 0..b {
-                            out[(bb * t + p) * d..(bb + 1) * t * d].copy_from_slice(&cur[bb * l * d..(bb + 1) * l * d]);
+                            out[(bb * t + p) * dkv..(bb + 1) * t * dkv].copy_from_slice(&cur[bb * l * dkv..(bb + 1) * l * dkv]);
                         }
                         out
                     };
@@ -328,7 +335,7 @@ impl MsMultiHeadAttentionOp {
         let combined: Option<Vec<f32>>;
         let attn_bias = match (&pad, causal, ab) {
             (PadMask::None, false, None) => None,
-            (PadMask::None, false, Some(a)) => Some(AttnBias { data: &a.data, strides: bhst_strides(&a.shape, 1, s, t) }),
+            (PadMask::None, false, Some(a)) => Some(AttnBias { data: &a.data, strides: bhst_strides(&a.shape, n / nkv) }),
             (PadMask::Ends(..) | PadMask::Keys(_), false, None) => {
                 let buf: Vec<f32> =
                     (0..b * t).map(|i| pad.value(i / t.max(1), 0, i % t.max(1), s, t, mfv)).collect();
@@ -336,8 +343,8 @@ impl MsMultiHeadAttentionOp {
                 Some(AttnBias { data: combined.as_deref().unwrap_or(&[]), strides: [t, 0, 0, 0, 1] })
             }
             _ => {
-                let hb = ab.map_or(1, |a| a.shape[1]);
-                let ab_strides = ab.map(|a| bhst_strides(&a.shape, 1, s, t));
+                let hb = ab.map_or(1, |a| bhst_dims(&a.shape)[1]);
+                let ab_strides = ab.map(|a| bhst_strides(&a.shape, 1));
                 let mut buf = vec![0.0f32; b * hb * s * t];
                 for bb in 0..b {
                     for hh in 0..hb {
@@ -346,7 +353,7 @@ impl MsMultiHeadAttentionOp {
                             for (tt, x) in row.iter_mut().enumerate() {
                                 let m = if causal && tt > p + ss { f32::MIN } else { pad.value(bb, ss, tt, s, t, mfv) };
                                 let a = match (ab, ab_strides) {
-                                    (Some(a), Some([sb, sh, _, sst, _])) => a.data[bb * sb + hh * sh + ss * sst + tt],
+                                    (Some(a), Some([sb, sh, _, sst, stt])) => a.data[bb * sb + hh * sh + ss * sst + tt * stt],
                                     _ => 0.0,
                                 };
                                 *x = a + m;
@@ -356,20 +363,26 @@ impl MsMultiHeadAttentionOp {
                 }
                 combined = Some(buf);
                 let sh = if hb > 1 { s * t } else { 0 };
-                Some(AttnBias { data: combined.as_deref().unwrap_or(&[]), strides: [hb * s * t, sh, 0, t, 1] })
+                let group = n / nkv;
+                Some(AttnBias { data: combined.as_deref().unwrap_or(&[]), strides: [hb * s * t, sh * group, sh, t, 1] })
             }
         };
 
         let scale = scale_attr(ctx, h);
-        let dims = AttnDims { batch: b, seq_q: s, seq_kv: t, q_heads: n, kv_heads: n, head_dim: h, scale };
+        let dims = AttnDims { batch: b, seq_q: s, seq_kv: t, q_heads: n, kv_heads: nkv, head_dim: h, scale };
         let first = slots.first_mut().ok_or_else(|| OnnxError::Internal("MultiHeadAttention: no output slots".into()))?;
         size_slot(first, &[b, s, d]);
-        contrib::attention_into(&q, &k, &v, attn_bias, dims, &mut first.data).map_err(bad)?;
+        let ext = AttnExt { kv_bnsh, ..AttnExt::default() };
+        contrib::attention_ext_into(&q, &k, &v, attn_bias, ext, dims, &mut first.data).map_err(bad)?;
         for (i, src) in [(1, &k), (2, &v)] {
             if wanted(ctx, i) {
                 if let Some(slot) = slots.get_mut(i) {
-                    size_slot(slot, &[b, n, t, h]);
-                    bsnh_to_bnsh_into(src, b, t, n, h, &mut slot.data);
+                    size_slot(slot, &[b, nkv, t, h]);
+                    if kv_bnsh {
+                        slot.data.copy_from_slice(src);
+                    } else {
+                        bsnh_to_bnsh_into(src, b, t, nkv, h, &mut slot.data);
+                    }
                 }
             }
         }
@@ -621,7 +634,7 @@ impl GroupQueryAttentionOp {
                 if total != tbuf {
                     return Err(unsupported("attention_bias with a past buffer longer than total_sequence_length"));
                 }
-                Some(AttnBias { data: &a.data, strides: bhst_strides(&a.shape, group, s, tbuf) })
+                Some(AttnBias { data: &a.data, strides: bhst_strides(&a.shape, group) })
             }
         };
         let sink = match ctx.optional_input(11) {
@@ -636,6 +649,7 @@ impl GroupQueryAttentionOp {
             local_window: (local_window >= 0).then_some(local_window as usize),
             softcap,
             sink,
+            kv_bnsh: false,
         };
         let scale = scale_attr(ctx, d);
         let dims = AttnDims { batch: b, seq_q: s, seq_kv: tbuf, q_heads: hq, kv_heads: hkv, head_dim: d, scale };
@@ -854,6 +868,87 @@ mod tests {
             assert_eq!(out[0].shape, vec![b, s, d]);
             close(&out[0].data, &want, 2e-5, &format!("mask {mask_kind} ab {use_ab} causal {causal} bias {use_bias}"));
         }
+    }
+
+    /// `kv_num_heads` (the `repeat_kv` fusion's form) with 3-D and 4-D K/V equals
+    /// running on K/V repeated to every query head; broadcast `[B, 1, 1, T]` /
+    /// rank-2 attention biases equal their expanded `[B, N, S, T]` form.
+    #[test]
+    fn mha_kv_num_heads_and_broadcast_bias_match_repeated() {
+        let (b, s, nkv, r, h) = (3, 13, 2, 3, 8);
+        let n = nkv * r;
+        let (d, dkv) = (n * h, nkv * h);
+        let q = t(rand(b * s * d, 31), &[b, s, d]);
+        let k = rand(b * s * dkv, 32);
+        let v = rand(b * s * dkv, 33);
+        // repeat_kv: query head j*R + i reads KV head j.
+        let repeat = |x: &[f32]| -> Vec<f32> {
+            let mut out = Vec::with_capacity(b * s * d);
+            for row in x.chunks(dkv) {
+                for j in 0..nkv {
+                    for _ in 0..r {
+                        out.extend_from_slice(&row[j * h..(j + 1) * h]);
+                    }
+                }
+            }
+            out
+        };
+        let (kr, vr) = (t(repeat(&k), &[b, s, d]), t(repeat(&v), &[b, s, d]));
+        let mut k4 = vec![0.0; k.len()];
+        bsnh_to_bnsh_into(&k, b, s, nkv, h, &mut k4);
+        let mut v4 = vec![0.0; v.len()];
+        bsnh_to_bnsh_into(&v, b, s, nkv, h, &mut v4);
+        let (k3, v3) = (t(k.clone(), &[b, s, dkv]), t(v.clone(), &[b, s, dkv]));
+        let (k4, v4) = (t(k4, &[b, nkv, s, h]), t(v4, &[b, nkv, s, h]));
+        let lens = [13usize, 7, 2];
+        // Additive key mask [B, 1, 1, T] and its expansion to [B, N, S, T]; a per-head [1, N, S, T] bias.
+        let small: Vec<f32> = (0..b * s).map(|i| if i % s < lens[i / s] { 0.0 } else { -1e9 }).collect();
+        let full: Vec<f32> = (0..b * n * s * s).map(|i| small[(i / (n * s * s)) * s + i % s]).collect();
+        let (small4, full4) = (t(small.clone(), &[b, 1, 1, s]), t(full, &[b, n, s, s]));
+        let per_head = t(rand(n * s * s, 34), &[1, n, s, s]);
+        let row2 = t(rand(s * s, 35), &[s, s]);
+        let row2_full = t(row2.data.iter().cycle().take(n * s * s).copied().collect(), &[1, n, s, s]);
+        let pad2 = t((0..b * s).map(|i| (i % s < lens[i / s]) as u8 as f32).collect(), &[b, s]);
+        let col = t(rand(b * s, 36), &[b, 1, s, 1]);
+        let col_full = t((0..b * n * s * s).map(|i| col.data[(i / (n * s * s)) * s + (i / s) % s]).collect(), &[b, n, s, s]);
+        for causal in [0i64, 1] {
+            for (pad, bias, bias_ref) in [
+                (None, None, None),
+                (None, Some(&small4), Some(&full4)),
+                (None, Some(&per_head), Some(&per_head)),
+                (None, Some(&row2), Some(&row2_full)),
+                (None, Some(&col), Some(&col_full)),
+                (Some(&pad2), Some(&col), Some(&col_full)),
+                (Some(&pad2), Some(&per_head), Some(&per_head)),
+                (Some(&pad2), Some(&small4), Some(&full4)),
+            ] {
+                let base = [("num_heads", n as i64), ("unidirectional", causal)];
+                let want = run(&MsMultiHeadAttentionOp, MHA, &base, &[], &[Some(&q), Some(&kr), Some(&vr), None, pad, bias_ref], 1);
+                let grouped = [("num_heads", n as i64), ("kv_num_heads", nkv as i64), ("unidirectional", causal)];
+                for (kk, vv, what) in [(&k3, &v3, "3-D"), (&k4, &v4, "4-D")] {
+                    let got = run(&MsMultiHeadAttentionOp, MHA, &grouped, &[], &[Some(&q), Some(kk), Some(vv), None, pad, bias], 1);
+                    close(&got[0].data, &want[0].data, 1e-5, &format!("{what} kv_num_heads, causal {causal}, bias {:?}", bias.map(|x| &x.shape)));
+                }
+                let plain = run(&MsMultiHeadAttentionOp, MHA, &base, &[], &[Some(&q), Some(&kr), Some(&vr), None, pad, bias], 1);
+                close(&plain[0].data, &want[0].data, 1e-5, &format!("broadcast bias {:?}", bias.map(|x| &x.shape)));
+            }
+        }
+        // Present outputs carry the un-repeated heads.
+        let grouped = [("num_heads", n as i64), ("kv_num_heads", nkv as i64)];
+        let got = run(&MsMultiHeadAttentionOp, MHA, &grouped, &[], &[Some(&q), Some(&k3), Some(&v3)], 3);
+        assert_eq!(got[1].shape, vec![b, nkv, s, h]);
+        close(&got[1].data, &k4.data, 0.0, "present_key");
+        close(&got[2].data, &v4.data, 0.0, "present_value");
+        // Bias / bad head counts are rejected.
+        let tb = t(vec![0.0; 3 * d], &[3 * d]);
+        let mut attrs = Attributes::default();
+        attrs.ints.insert("num_heads".into(), n as i64);
+        attrs.ints.insert("kv_num_heads".into(), nkv as i64);
+        let node = Node { op: OpKind::Unknown(MHA.into()), name: "m".into(), inputs: vec!["q".into(), "k".into(), "v".into(), "b".into()], outputs: vec!["o".into()], attrs };
+        let ctx = OpContext { node: &node, inputs: vec![Some(&q), Some(&k3), Some(&v3), Some(&tb)], outer_scope: None, weights: None, registry: None };
+        assert!(MsMultiHeadAttentionOp.execute(&ctx).is_err());
+        let ctx = OpContext { node: &node, inputs: vec![Some(&q), Some(&kr), Some(&vr)], outer_scope: None, weights: None, registry: None };
+        assert!(MsMultiHeadAttentionOp.execute(&ctx).is_err(), "repeated K/V with kv_num_heads must not be accepted");
     }
 
     #[test]

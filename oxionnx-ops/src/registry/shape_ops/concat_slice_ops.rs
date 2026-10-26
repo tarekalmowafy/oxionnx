@@ -57,30 +57,47 @@ impl Operator for ConcatOp {
 // ── Slice ────────────────────────────────────────────────────────────────────
 
 pub struct SliceOp;
+
+/// Slice's resolved view of input 0 (`starts`/`ends`/`axes`/`steps` inputs).
+fn slice_plan(ctx: &OpContext<'_>, x: &Tensor) -> Result<shape::sequence::SlicePlan, OnnxError> {
+    let ints = |t: &Tensor| -> Vec<i64> { t.data.iter().map(|&v| v as i64).collect() };
+    let starts = ints(ctx.input(1)?);
+    let ends = ints(ctx.input(2)?);
+    let axes = ctx.optional_input(3).map(ints);
+    let steps = ctx.optional_input(4).map(ints);
+    shape::sequence::slice_plan(&x.shape, &starts, &ends, axes.as_deref(), steps.as_deref())
+        .map_err(OnnxError::ShapeMismatch)
+}
+
 impl Operator for SliceOp {
     fn op_type(&self) -> &str {
         "Slice"
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
-        let starts: Vec<i64> = ctx.input(1)?.data.iter().map(|&v| v as i64).collect();
-        let ends: Vec<i64> = ctx.input(2)?.data.iter().map(|&v| v as i64).collect();
-        let axes: Option<Vec<i64>> = ctx
-            .optional_input(3)
-            .map(|t| t.data.iter().map(|&v| v as i64).collect());
-        let steps: Option<Vec<i64>> = ctx
-            .optional_input(4)
-            .map(|t| t.data.iter().map(|&v| v as i64).collect());
-        Ok(vec![shape::slice(
-            x,
-            &starts,
-            &ends,
-            axes.as_deref(),
-            steps.as_deref(),
-        )?])
+        let plan = slice_plan(ctx, x)?;
+        let mut out = vec![0.0f32; plan.out_shape.iter().product()];
+        crate::datamove::slice_into(x, &plan.start, &plan.step, &plan.out_shape, &mut out);
+        Ok(vec![Tensor::new(out, plan.out_shape)])
     }
     fn supports_output_slots(&self) -> bool {
         true
+    }
+    /// Strided copy straight into the slot (contiguous runs as one memcpy,
+    /// parallel over outer rows).
+    fn execute_into_slots(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
+        let Some(slot) = slots.first_mut() else {
+            return Ok(());
+        };
+        let x = ctx.input(0)?;
+        let plan = slice_plan(ctx, x)?;
+        let n: usize = plan.out_shape.iter().product();
+        if slot.data.len() != n {
+            slot.data.resize(n, 0.0);
+        }
+        crate::datamove::slice_into(x, &plan.start, &plan.step, &plan.out_shape, &mut slot.data);
+        slot.shape = plan.out_shape;
+        Ok(())
     }
 }
 
@@ -148,37 +165,11 @@ impl Operator for ExpandOp {
         let out_shape = Tensor::broadcast_shape(&x.shape, &shape_in)?;
         let n: usize = checked_numel(&out_shape, "Expand")?;
 
-        let ndim = out_shape.len();
-        let pad = ndim - x.shape.len();
-        let padded: Vec<usize> = (0..pad).map(|_| 1).chain(x.shape.iter().copied()).collect();
-
-        let mut out_strides = vec![0usize; ndim];
-        let mut s = 1usize;
-        for i in (0..ndim).rev() {
-            out_strides[i] = s;
-            s *= out_shape[i];
-        }
-        let mut in_strides = vec![0usize; ndim];
-        let mut s = 1usize;
-        for i in (0..ndim).rev() {
-            in_strides[i] = if padded[i] == 1 { 0 } else { s };
-            s *= padded[i];
-        }
-
         let slot = &mut slots[0];
         if slot.data.len() != n {
             slot.data.resize(n, 0.0_f32);
         }
-        for (out_idx, out_val) in slot.data.iter_mut().enumerate() {
-            let mut rem = out_idx;
-            let mut in_idx = 0usize;
-            for d in 0..ndim {
-                let coord = rem / out_strides[d];
-                rem %= out_strides[d];
-                in_idx += coord * in_strides[d];
-            }
-            *out_val = x.data[in_idx];
-        }
+        crate::datamove::expand_into(x, &out_shape, &mut slot.data);
         slot.shape = out_shape;
         Ok(())
     }

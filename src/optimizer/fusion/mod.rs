@@ -24,12 +24,14 @@ mod instance_norm;
 mod matmul;
 mod matmul_act;
 mod matmul_split;
+mod repeat_kv;
 mod simplify;
 
 pub use attention::fuse_attention;
 pub use instance_norm::fuse_instance_norm;
 pub use matmul_act::fuse_matmul_act;
 pub use matmul_split::fuse_matmul_split;
+pub use repeat_kv::fuse_repeat_kv;
 
 pub use conv::{
     fold_batch_norm_inference, fuse_conv_add_relu, fuse_conv_batchnorm,

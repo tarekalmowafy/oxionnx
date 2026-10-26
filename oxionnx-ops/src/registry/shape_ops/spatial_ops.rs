@@ -67,34 +67,11 @@ impl Operator for TileOp {
             .map(|(&d, &r)| d * r)
             .collect();
         let out_n: usize = out_shape.iter().product();
-
-        let mut out_strides = vec![0usize; ndim];
-        let mut s = 1usize;
-        for i in (0..ndim).rev() {
-            out_strides[i] = s;
-            s *= out_shape[i];
-        }
-        let mut in_strides = vec![0usize; ndim];
-        let mut s = 1usize;
-        for i in (0..ndim).rev() {
-            in_strides[i] = s;
-            s *= x.shape[i];
-        }
-
         let slot = &mut slots[0];
         if slot.data.len() != out_n {
             slot.data.resize(out_n, 0.0_f32);
         }
-        for (out_idx, out_val) in slot.data.iter_mut().enumerate() {
-            let mut rem = out_idx;
-            let mut in_idx = 0usize;
-            for d in 0..ndim {
-                let coord = rem / out_strides[d];
-                rem %= out_strides[d];
-                in_idx += (coord % x.shape[d]) * in_strides[d];
-            }
-            *out_val = x.data[in_idx];
-        }
+        crate::datamove::tile_into(x, &repeats, &mut slot.data);
         slot.shape = out_shape;
         Ok(())
     }
