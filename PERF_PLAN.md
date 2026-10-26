@@ -158,9 +158,11 @@ The MatMul, QKV and attention fusions were written against EmbeddingGemma-2's gr
   - Review activation-pool sizing.
   - Reuse slots across unfused chains.
 
-### [ ] P4.2 Large `Gather` tables
-- **Problem:** embedding tables such as EmbeddingGemma's 537 MB per-layer embeddings are kept fully resident as FP32. ORT and llama.cpp memory-map theirs and only touch the rows a batch uses.
+### [x] P4.2 Large `Gather` tables ([#17](https://github.com/tarekalmowafy/oxionnx/pull/17))
+- **Problem:** embedding tables such as EmbeddingGemma's 537 MB token embeddings are kept fully resident as FP32. ORT and llama.cpp memory-map theirs and only touch the rows a batch uses.
 - **Plan:** keep `Gather`-only initializers in the mapped file, or as BF16, and decode rows on demand.
+- **Done:** tables of at least 4 MiB that only `Gather` (axis 0) or `GatherBlockQuantized` read stay in the mmap'd `.onnx` / external-data file (MADV_RANDOM), and the ops read only the rows they need. Tied tables, graph outputs and `with_keep_weights` are decoded as before. The BF16 option turned out to be unnecessary, because mapping also covers BF16 mode and inline models.
+- **Result:** output is bit-identical (all 32 queries and doc batches, FP32 and BF16, 11 zoo models plus gemma FP32/Q8/Q4). RSS after load, base → new: gemma FP32 1247 → 748 MiB, BF16 1173 → 441, Q8 560 → 377, Q4 424 → 359. Qwen3-0.6B 3055 → 2459, harrier-270m 2009 → 751, arctic-m-v2 1598 → 867, granite-311m-ml 1381 → 623. Peak RSS falls 200–1100 MiB on the large-vocabulary models. Speed is unchanged within noise.
 
 ---
 
