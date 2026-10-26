@@ -150,13 +150,16 @@ The MatMul, QKV and attention fusions were written against EmbeddingGemma-2's gr
 
 ## Phase 4: memory
 
-### [ ] P4.1 Activation memory
+### [x] P4.1 Activation memory ([#20](https://github.com/tarekalmowafy/oxionnx/pull/20))
 - **Problem:** peak RSS on the newer models is 1.1–2.5× ORT's and 2–4× llama-server's. For example, Qwen3 peaks at 4533 MiB on oxionnx FP32, 2861 MiB on ORT and 2153 MiB on llama-server.
 - **Plan:**
   - Stop materialising `repeat_kv` and similar broadcast copies (P1.2).
   - Do more element-wise work in place.
   - Review activation-pool sizing.
   - Reuse slots across unfused chains.
+- **Finding** (`OXIONNX_TRACE_MEM=1`, doc-b8): the peak was the activation pool's idle free lists, not live activations. On granite-97m the live set peaks at 55 MiB, but the pool cached 650 MiB. Kernels allocate their own outputs on the first run, and every buffer went into the pool, which never shrank. Two leaks made it worse. A 24 MiB buffer could be handed to a 32 KiB tensor (rotary cos/sin) and held for the whole run, so on granite-small the live set grew run after run (45 → 446 MiB). Outputs that nothing reads (GroupQueryAttention's `present_k/v` on harrier) stayed live until the run ended. In-place element-wise work and slot reuse across chains are not the bottleneck once the pool is bounded, so they are not done here.
+- **Done:** `SizeClassPool` has a byte budget on its free lists and evicts the least-recently released buffer first. The session sets the budget to the peak of live non-output bytes, with a 64 MiB floor. It grows when a miss is one that an eviction from this run or the previous one would have served, capped at 3× the base. Recycled buffers must fit tightly (≤ 2× the request, or ≤ 64 KiB over). A budgeted pool allocates a fresh large buffer rather than zero-fill the tail of a shorter one. Unread outputs are freed right after their node.
+- **Result** (FP32, max peak RSS over the light-sweep cells, master → PR, ORT): voyage 2318 → 1832 (1432); granite-small 1051 → 428 (441); granite-en 1292 → 923 (865); granite-97m 1376 → 815 (744); granite-311m 2344 → 1881 (2087); harrier-270m 2293 → 2066 (954); harrier-0.6b 3970 → 3202 (3141); pplx 3411 → 3105 (2370); jina 1452 → 1120 (845); Qwen3 3930 → 3367 (2861); arctic 2503 → 1801 (2215). Speed is unchanged or better: doc-b8 8T Qwen3 1348 → 1206 ms, harrier-0.6b 1230 → 1135, harrier-270m 335 → 308; the other cells are within ±3% noise. Cosine vs ORT is 1.0000000. On most models the peak is now the weights after load, or the load transient itself (granite-97m/311m, arctic). That is P4.2.
 
 ### [ ] P4.2 Large `Gather` tables
 - **Problem:** embedding tables such as EmbeddingGemma's 537 MB per-layer embeddings are kept fully resident as FP32. ORT and llama.cpp memory-map theirs and only touch the rows a batch uses.
