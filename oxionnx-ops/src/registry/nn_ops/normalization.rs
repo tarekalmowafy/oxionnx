@@ -8,18 +8,65 @@ use crate::nn;
 // ── LayerNorm ───────────────────────────────────────────────────────────────
 
 pub struct LayerNormOp;
+
+impl LayerNormOp {
+    /// Writes `Y` and, when the node declares them, `Mean` and `InvStdDev`
+    /// (shape of `X` with the normalised dims set to 1).
+    fn run(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
+        let x = ctx.input(0)?;
+        let scale = ctx.input(1)?;
+        let bias = ctx.optional_input(2);
+        let eps = ctx.attrs().f("epsilon", 1e-5);
+        let axis = ctx.attrs().i("axis", -1);
+        let ndim = x.ndim() as i64;
+        let ax = if axis < 0 { axis + ndim } else { axis };
+        if ax < 0 || ax > ndim {
+            return Err(OnnxError::ShapeMismatch(format!("LayerNormalization: axis {axis} out of range for rank {ndim}")));
+        }
+        let mut stat_shape = x.shape.clone();
+        for d in &mut stat_shape[ax as usize..] {
+            *d = 1;
+        }
+        let wants = |i: usize| ctx.node.outputs.get(i).is_some_and(|n| !n.is_empty());
+        let (first, rest) = slots
+            .split_first_mut()
+            .ok_or_else(|| OnnxError::Internal("LayerNormOp: no output slots".into()))?;
+        size_slot(first, &x.shape);
+        let (mut mean, mut inv) = (None, None);
+        for (i, slot) in rest.iter_mut().enumerate() {
+            if wants(i + 1) {
+                size_slot(slot, &stat_shape);
+                if i == 0 {
+                    mean = Some(&mut slot.data[..]);
+                } else if i == 1 {
+                    inv = Some(&mut slot.data[..]);
+                }
+            }
+        }
+        nn::normalization::layer_norm_stats_into(x, scale, bias, eps, axis, &mut first.data, mean, inv)
+            .map_err(OnnxError::ShapeMismatch)
+    }
+}
+
+/// Size `slot` to `shape`; its contents are fully overwritten by the caller.
+fn size_slot(slot: &mut Tensor, shape: &[usize]) {
+    let n: usize = shape.iter().product();
+    if slot.data.len() != n {
+        slot.data.resize(n, 0.0_f32);
+    }
+    slot.shape.clear();
+    slot.shape.extend_from_slice(shape);
+}
+
 impl Operator for LayerNormOp {
     fn op_type(&self) -> &str {
         "LayerNormalization"
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
-        let x = ctx.input(0)?;
-        let scale = ctx.input(1)?;
-        let bias = ctx.optional_input(2);
-        let attrs = ctx.attrs();
-        let eps = attrs.f("epsilon", 1e-5);
-        let axis = attrs.i("axis", -1);
-        Ok(vec![nn::layer_norm(x, scale, bias, eps, axis)?])
+        let n_out = ctx.node.outputs.len().clamp(1, 3);
+        let mut slots: Vec<Tensor> = (0..n_out).map(|_| Tensor { data: vec![], shape: vec![] }).collect();
+        self.run(ctx, &mut slots)?;
+        Ok(slots)
     }
     fn supports_output_slots(&self) -> bool {
         true
@@ -29,21 +76,7 @@ impl Operator for LayerNormOp {
         ctx: &OpContext<'_>,
         slots: &mut [Tensor],
     ) -> Result<(), OnnxError> {
-        if slots.is_empty() {
-            return Err(OnnxError::Internal("LayerNormOp: no output slots".into()));
-        }
-        let x = ctx.input(0)?;
-        let scale = ctx.input(1)?;
-        let bias = ctx.optional_input(2);
-        let eps = ctx.attrs().f("epsilon", 1e-5);
-        let axis = ctx.attrs().i("axis", -1);
-        let n = x.numel();
-        if slots[0].data.len() != n {
-            slots[0].data.resize(n, 0.0_f32);
-        }
-        slots[0].shape.clone_from(&x.shape);
-        nn::normalization::layer_norm_into(x, scale, bias, eps, axis, &mut slots[0].data)?;
-        Ok(())
+        self.run(ctx, slots)
     }
 }
 
@@ -402,5 +435,60 @@ impl Operator for MeanVarianceNormalizationOp {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod layer_norm_op_tests {
+    use super::*;
+    use oxionnx_core::graph::{Attributes, Node, OpKind};
+
+    #[test]
+    fn layer_norm_mean_and_inv_std_outputs() {
+        // [2, 3, 4] normalised over the last two axes (axis = 1).
+        let x: Vec<f32> = (0..24).map(|i| ((i * 7) % 11) as f32 * 0.3 - 1.0).collect();
+        let x = Tensor::new(x, vec![2, 3, 4]);
+        let scale = Tensor::new((0..12).map(|i| 0.5 + i as f32 * 0.1).collect(), vec![3, 4]);
+        let bias = Tensor::new((0..12).map(|i| i as f32 * 0.01).collect(), vec![3, 4]);
+        let mut attrs = Attributes::default();
+        attrs.ints.insert("axis".into(), 1);
+        attrs.floats.insert("epsilon".into(), 1e-5);
+        let node = Node {
+            op: OpKind::LayerNorm,
+            name: "ln".into(),
+            inputs: vec!["x".into(), "s".into(), "b".into()],
+            outputs: vec!["y".into(), "mean".into(), "inv".into()],
+            attrs,
+        };
+        let ctx = OpContext {
+            node: &node,
+            inputs: vec![Some(&x), Some(&scale), Some(&bias)],
+            outer_scope: None,
+            weights: None,
+            registry: None,
+        };
+        let out = LayerNormOp.execute(&ctx).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1].shape, vec![2, 1, 1]);
+        assert_eq!(out[2].shape, vec![2, 1, 1]);
+        for r in 0..2 {
+            let row = &x.data[r * 12..(r + 1) * 12];
+            let m = row.iter().map(|&v| v as f64).sum::<f64>() / 12.0;
+            let var = row.iter().map(|&v| (v as f64 - m).powi(2)).sum::<f64>() / 12.0;
+            let inv = 1.0 / (var + 1e-5).sqrt();
+            assert!((out[1].data[r] as f64 - m).abs() < 1e-5);
+            assert!((out[2].data[r] as f64 - inv).abs() < 1e-4 * inv);
+            for j in 0..12 {
+                let want = (row[j] as f64 - m) * inv * scale.data[j] as f64 + bias.data[j] as f64;
+                assert!((out[0].data[r * 12 + j] as f64 - want).abs() < 1e-5, "y[{r},{j}]");
+            }
+        }
+        // Slot path matches.
+        let mut slots: Vec<Tensor> = (0..3).map(|_| Tensor::new(vec![], vec![0])).collect();
+        LayerNormOp.execute_into_slots(&ctx, &mut slots).unwrap();
+        for (a, b) in slots.iter().zip(&out) {
+            assert_eq!(a.data, b.data);
+            assert_eq!(a.shape, b.shape);
+        }
     }
 }

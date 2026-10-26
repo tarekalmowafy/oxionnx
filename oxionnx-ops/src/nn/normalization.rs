@@ -10,74 +10,58 @@ pub(crate) fn layer_norm_into(
     axis: i64,
     out: &mut [f32],
 ) -> Result<(), String> {
-    let ndim = x.ndim();
-    let ax = if axis < 0 {
-        (axis + ndim as i64) as usize
-    } else {
-        axis as usize
+    layer_norm_stats_into(x, scale, bias, eps, axis, out, None, None)
+}
+
+/// `scale` (or `bias`) as exactly `n` elements: borrowed when it already has
+/// `n`, otherwise tiled (ONNX allows a scale that broadcasts over the
+/// normalised dims).
+fn tile_param(t: &Tensor, n: usize) -> Result<std::borrow::Cow<'_, [f32]>, String> {
+    let len = t.data.len();
+    if len == n {
+        return Ok(std::borrow::Cow::Borrowed(&t.data[..]));
+    }
+    if len == 0 || n % len != 0 {
+        return Err(format!("normalization: scale/bias of {len} elements does not broadcast to {n}"));
+    }
+    Ok(std::borrow::Cow::Owned((0..n).map(|j| t.data[j % len]).collect()))
+}
+
+/// [`layer_norm_into`], optionally also writing the per-row `mean` and
+/// `inv_std_dev` (`LayerNormalization` outputs 1 and 2).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn layer_norm_stats_into(
+    x: &Tensor,
+    scale: &Tensor,
+    bias: Option<&Tensor>,
+    eps: f32,
+    axis: i64,
+    out: &mut [f32],
+    mean: Option<&mut [f32]>,
+    inv_std: Option<&mut [f32]>,
+) -> Result<(), String> {
+    let ndim = x.ndim() as i64;
+    let ax = if axis < 0 { axis + ndim } else { axis };
+    if ax < 0 || ax > ndim {
+        return Err(format!("layer_norm: axis {axis} out of range for rank {ndim}"));
+    }
+    let norm_size: usize = x.shape[ax as usize..].iter().product();
+    if norm_size == 0 || x.data.is_empty() {
+        return Ok(());
+    }
+    let gamma = tile_param(scale, norm_size)?;
+    let beta = bias.map(|b| tile_param(b, norm_size)).transpose()?;
+    let args = crate::norm_rows::NormRows {
+        x: &x.data,
+        skip: None,
+        bias: None,
+        gamma: &gamma,
+        beta: beta.as_deref(),
+        hidden: norm_size,
+        eps,
+        rms: false,
     };
-    let norm_size: usize = x.shape[ax..].iter().product();
-
-    #[cfg(feature = "simd")]
-    {
-        // `simd_layer_norm_strided` normalizes in place, so (only on this
-        // path) `out` needs to start as a copy of `x`; the non-SIMD path
-        // below reads `x.data` directly and writes `out` in a single pass,
-        // so it never needs this copy at all.
-        out.copy_from_slice(&x.data);
-        let bias_data = bias.map(|b| b.data.as_slice());
-        crate::simd_ops::simd_layer_norm_strided(out, norm_size, &scale.data, bias_data, eps);
-        Ok(())
-    }
-
-    #[cfg(not(feature = "simd"))]
-    {
-        let outer: usize = x.shape[..ax].iter().product::<usize>().max(1);
-        let scale_len = scale.numel();
-        let bias_len = bias.map(|b| b.numel());
-        // ONNX-conformant case (`scale`/`bias` cover exactly one normalized
-        // group): index directly, no modulo -- `j % norm_size == j` for
-        // every `j < norm_size` anyway, so this is bit-identical to the
-        // modulo form for every input that hits it, just without the
-        // per-element hardware division. A model supplying a shorter/longer
-        // scale or bias (legal but unusual broadcast) falls back to the
-        // original modulo-indexed loop just below.
-        let fast_path = scale_len == norm_size && bias_len.map_or(true, |bl| bl == norm_size);
-
-        for o in 0..outer {
-            let in_slice = &x.data[o * norm_size..(o + 1) * norm_size];
-            let out_slice = &mut out[o * norm_size..(o + 1) * norm_size];
-            let mean = in_slice.iter().sum::<f32>() / norm_size as f32;
-            let var = in_slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / norm_size as f32;
-            let inv_std = (var + eps).sqrt().recip();
-
-            if fast_path {
-                for ((o_v, &i_v), &s) in out_slice
-                    .iter_mut()
-                    .zip(in_slice.iter())
-                    .zip(scale.data[..norm_size].iter())
-                {
-                    *o_v = (i_v - mean) * inv_std * s;
-                }
-                if let Some(b) = bias {
-                    for (o_v, &bv) in out_slice.iter_mut().zip(b.data[..norm_size].iter()) {
-                        *o_v += bv;
-                    }
-                }
-            } else {
-                for (j, (o_v, &i_v)) in out_slice.iter_mut().zip(in_slice.iter()).enumerate() {
-                    *o_v = (i_v - mean) * inv_std * scale.data[j % scale_len];
-                }
-                if let Some(b) = bias {
-                    let bl = b.numel();
-                    for (j, o_v) in out_slice.iter_mut().enumerate() {
-                        *o_v += b.data[j % bl];
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
+    crate::norm_rows::norm_rows_into(&args, crate::norm_rows::NormRowsOut { out, sum: None, mean, inv_std })
 }
 
 pub(crate) fn rms_norm_into(
@@ -93,51 +77,23 @@ pub(crate) fn rms_norm_into(
         .shape
         .last()
         .ok_or_else(|| "rms_norm: empty shape".to_string())?;
-    if norm_size == 0 {
+    if norm_size == 0 || x.data.is_empty() {
         // A zero-size trailing dim makes the whole tensor empty (nothing to
-        // normalize); `x.numel() / norm_size` below would otherwise be an
-        // integer division by zero for a shape a dynamic-axis model can
-        // legitimately produce.
+        // normalize).
         return Ok(());
     }
-    let outer = x.numel() / norm_size;
-    let scale_len = scale.numel();
-    // See `layer_norm_into` above: bit-identical to the modulo form for
-    // every input that hits it, since `j % norm_size == j` when `j <
-    // norm_size`.
-    let fast_path = scale_len == norm_size;
-
-    // Prototype (onnx_spike): rows in parallel, and an 8-lane sum of squares the
-    // compiler can vectorize (changes summation order -> ulp-level differences).
-    let _ = outer;
-    let n_out = x.numel();
-    crate::par::for_each_row(&mut out[..n_out], norm_size, |o, out_slice| {
-        let in_slice = &x.data[o * norm_size..(o + 1) * norm_size];
-        let mut lanes = [0.0f32; 8];
-        let mut chunks = in_slice.chunks_exact(8);
-        for c in &mut chunks {
-            for (l, &v) in lanes.iter_mut().zip(c) {
-                *l += v * v;
-            }
-        }
-        let tail: f32 = chunks.remainder().iter().map(|&v| v * v).sum();
-        let mean_sq = (lanes.iter().sum::<f32>() + tail) / norm_size as f32;
-        let inv_rms = (mean_sq + eps).sqrt().recip();
-        if fast_path {
-            for ((o_v, &i_v), &s) in out_slice
-                .iter_mut()
-                .zip(in_slice.iter())
-                .zip(scale.data[..norm_size].iter())
-            {
-                *o_v = i_v * inv_rms * s;
-            }
-        } else {
-            for (j, (o_v, &i_v)) in out_slice.iter_mut().zip(in_slice.iter()).enumerate() {
-                *o_v = i_v * inv_rms * scale.data[j % scale_len];
-            }
-        }
-    });
-    Ok(())
+    let gamma = tile_param(scale, norm_size)?;
+    let args = crate::norm_rows::NormRows {
+        x: &x.data,
+        skip: None,
+        bias: None,
+        gamma: &gamma,
+        beta: None,
+        hidden: norm_size,
+        eps,
+        rms: true,
+    };
+    crate::norm_rows::norm_rows_into(&args, crate::norm_rows::NormRowsOut { out, sum: None, mean: None, inv_std: None })
 }
 
 pub(crate) fn batch_norm_into(
@@ -849,9 +805,7 @@ mod perf_rewrite_tests {
     // ── layer_norm / rms_norm ───────────────────────────────────────────────
 
     /// Independent reference: the exact modulo-indexed loop `layer_norm_into`
-    /// used before this change. Only exercised under `#[cfg(not(feature =
-    /// "simd"))]` below -- see the comment there.
-    #[cfg(not(feature = "simd"))]
+    /// used before this change.
     fn reference_layer_norm(
         x: &[f32],
         shape: &[usize],
@@ -960,22 +914,10 @@ mod perf_rewrite_tests {
             let scale_data: Vec<f32> = (0..scale_len).map(|i| 0.5 + i as f32 * 0.25).collect();
             let scale = Tensor::new(scale_data.clone(), vec![scale_len]);
 
-            // [Found during this change, NOT introduced by it, and out of
-            // this file's owned scope to fix] `layer_norm`'s SIMD path
-            // (`simd_ops::{neon,avx2}::layer_norm_inplace`, unconditionally
-            // reached whenever the `simd` feature is enabled -- this
-            // dispatch already existed before this rewrite, unchanged here)
-            // loads `scale`/`bias` in SIMD-lane-width chunks via
-            // `scale.as_ptr().add(offset % scale.len())` with no bound on
-            // how far that load reads past `scale.len()`. For a `scale`
-            // shorter than the lane width (4 on NEON, 8 on AVX2) -- exactly
-            // this broadcast/repeat case -- that is an out-of-bounds SIMD
-            // load: real undefined behaviour, not a rounding difference, so
-            // it must not even be invoked here (a "close enough" tolerance
-            // check on the output of UB would be meaningless). Skip the
-            // layer_norm side of this check under `simd`; `rms_norm` has no
-            // SIMD path at all and is unaffected.
-            #[cfg(not(feature = "simd"))]
+            // The row kernel tiles a short scale/bias to the normalised size
+            // up front, so this exercises the same vectorised path as the
+            // full-size case (summation order differs from the scalar
+            // reference, hence the tolerance).
             {
                 // Every shape/norm_size pair above normalizes over exactly
                 // the last axis (`norm_size` is that axis's own size), so
@@ -993,18 +935,16 @@ mod perf_rewrite_tests {
                     1e-5,
                     shape.len() - 1,
                 );
-                assert_eq!(
-                    y_ln.data, want_ln,
-                    "layer_norm broadcast fallback: shape={shape:?}"
-                );
+                for (g, w) in y_ln.data.iter().zip(&want_ln) {
+                    assert!((g - w).abs() <= 1e-5 * (1.0 + w.abs()), "layer_norm broadcast: shape={shape:?}: {g} vs {w}");
+                }
             }
 
             let y_rms = rms_norm(&x, &scale, 1e-6).expect("rms_norm failed");
             let want_rms = reference_rms_norm(&x_data, shape, &scale_data, 1e-6);
-            assert_eq!(
-                y_rms.data, want_rms,
-                "rms_norm broadcast fallback: shape={shape:?}"
-            );
+            for (g, w) in y_rms.data.iter().zip(&want_rms) {
+                assert!((g - w).abs() <= 1e-5 * (1.0 + w.abs()), "rms_norm broadcast: shape={shape:?}: {g} vs {w}");
+            }
         }
     }
 

@@ -5,12 +5,12 @@
 //! Gather+Gather composition, Dropout elimination, Transpose+Reshape simplification,
 //! spatial (InstanceNorm-style) normalization chains, scaled dot-product attention,
 //! MatMul + GELU (plain and gated), MatMul + Split projections (with head norm
-//! and rotary).
+//! and rotary), residual Add + norm (`Skip[Simplified]LayerNormalization`).
 //!
 //! All of them are wired into [`crate::optimizer::optimize_with_level`] at
 //! `PassLevel::Extended` and above, except `fuse_conv_add_relu`,
-//! `fuse_instance_norm`, `fuse_attention`, `fuse_matmul_act` and
-//! `fuse_matmul_split`, which emit the optimizer-only `ConvAddRelu` /
+//! `fuse_instance_norm`, `fuse_attention`, `fuse_matmul_act`,
+//! `fuse_matmul_split` and `fuse_skip_norm`, which emit the optimizer-only `ConvAddRelu` /
 //! `OxiInstanceNorm` / `OxiAttention` / `OxiMatMulAct` / `OxiMatMulSplit` ops
 //! and therefore run only when the active `OperatorRegistry` provides a kernel
 //! for them.
@@ -25,11 +25,13 @@ mod matmul;
 mod matmul_act;
 mod matmul_split;
 mod simplify;
+mod skip_norm;
 
 pub use attention::fuse_attention;
 pub use instance_norm::fuse_instance_norm;
 pub use matmul_act::fuse_matmul_act;
 pub use matmul_split::fuse_matmul_split;
+pub use skip_norm::fuse_skip_norm;
 
 pub use conv::{
     fold_batch_norm_inference, fuse_conv_add_relu, fuse_conv_batchnorm,

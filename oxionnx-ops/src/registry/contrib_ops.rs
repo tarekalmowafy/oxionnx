@@ -4,7 +4,8 @@
 //!
 //! The model loader keeps op types whose `com.microsoft` semantics differ from a
 //! same-named ONNX op apart by prefixing the domain (`com.microsoft.RotaryEmbedding`);
-//! `SkipSimplifiedLayerNormalization` exists only in `com.microsoft` and keeps its name.
+//! `SkipLayerNormalization` / `SkipSimplifiedLayerNormalization` exist only in
+//! `com.microsoft` and keep their names.
 
 use oxionnx_core::{OnnxError, OpContext, Operator, Tensor};
 
@@ -29,7 +30,7 @@ fn empty_slots(ctx: &OpContext<'_>) -> Vec<Tensor> {
     ctx.node.outputs.iter().map(|_| Tensor { data: vec![], shape: vec![] }).collect()
 }
 
-// ── SkipSimplifiedLayerNormalization ─────────────────────────────────────────
+// ── SkipLayerNormalization / SkipSimplifiedLayerNormalization ────────────────
 
 /// `com.microsoft::SkipSimplifiedLayerNormalization`.
 ///
@@ -38,57 +39,113 @@ fn empty_slots(ctx: &OpContext<'_>) -> Vec<Tensor> {
 /// `inv_std_var` (`[.., 1]`), `input_skip_bias_sum`.
 pub struct SkipSimplifiedLayerNormOp;
 
-impl SkipSimplifiedLayerNormOp {
-    fn run(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
-        let x = ctx.input(0)?;
-        let skip = ctx.input(1)?;
-        let gamma = ctx.input(2)?;
-        let bias = ctx.optional_input(3);
-        let eps = ctx.attrs().f("epsilon", 1e-5);
-        let outs = &ctx.node.outputs;
-        if outs.get(1).is_some_and(|n| !n.is_empty()) {
-            return Err(OnnxError::Unsupported(
-                "SkipSimplifiedLayerNormalization: the `mean` output is not defined for RMS norm".into(),
-            ));
-        }
-        let hidden = *x.shape.last().ok_or_else(|| err("SkipSimplifiedLayerNormalization: scalar input".into()))?;
-        let wants = |i: usize| outs.get(i).is_some_and(|n| !n.is_empty());
-        let (want_inv, want_sum) = (wants(2), wants(3));
-        let mut inv_shape = x.shape.clone();
-        if let Some(l) = inv_shape.last_mut() {
-            *l = 1;
-        }
-        let (first, rest) = slots
-            .split_first_mut()
-            .ok_or_else(|| OnnxError::Internal("SkipSimplifiedLayerNormalization: no output slots".into()))?;
-        shape_slot(first, &x.shape);
-        let (mut inv, mut sum) = (None, None);
-        for (i, slot) in rest.iter_mut().enumerate() {
-            match i + 1 {
-                2 if want_inv => {
-                    shape_slot(slot, &inv_shape);
-                    inv = Some(&mut slot.data[..]);
-                }
-                3 if want_sum => {
-                    shape_slot(slot, &x.shape);
-                    sum = Some(&mut slot.data[..]);
-                }
-                _ => {}
-            }
-        }
-        contrib::skip_rms_norm_into(
-            &x.data,
-            &skip.data,
-            &gamma.data,
-            bias.map(|b| &b.data[..]),
-            hidden,
-            eps,
-            &mut first.data,
-            sum,
-            inv,
-        )
-        .map_err(err)
+/// `com.microsoft::SkipLayerNormalization`.
+///
+/// Inputs: `input`, `skip`, `gamma`, optional `beta`, optional `bias`.
+/// Outputs: `output`, `mean` (`[.., 1]`), `inv_std_var` (`[.., 1]`),
+/// `input_skip_bias_sum`.
+///
+/// Also emitted by the optimizer for `Add -> LayerNormalization`; `input` and
+/// `skip` may then come in either order and broadcast in any way `Add` allows
+/// (anything other than equal shapes or a trailing-rows `skip` takes a
+/// materialised broadcast sum).
+pub struct SkipLayerNormOp;
+
+/// `t` as exactly `n` elements (tiled when it has fewer that divide `n`).
+fn tile_vec(t: &Tensor, n: usize) -> Option<std::borrow::Cow<'_, [f32]>> {
+    let len = t.data.len();
+    if len == n {
+        Some(std::borrow::Cow::Borrowed(&t.data[..]))
+    } else if len > 0 && n % len == 0 {
+        Some(std::borrow::Cow::Owned((0..n).map(|j| t.data[j % len]).collect()))
+    } else {
+        None
     }
+}
+
+/// Shared body of the two skip-norm ops.
+fn run_skip_norm<'a>(ctx: &'a OpContext<'a>, slots: &mut [Tensor], rms: bool) -> Result<(), OnnxError> {
+    let name = if rms { "SkipSimplifiedLayerNormalization" } else { "SkipLayerNormalization" };
+    let (mut x, mut skip) = (ctx.input(0)?, ctx.input(1)?);
+    let gamma = ctx.input(2)?;
+    let (beta, bias) = if rms { (None, ctx.optional_input(3)) } else { (ctx.optional_input(3), ctx.optional_input(4)) };
+    let eps = ctx.attrs().f("epsilon", 1e-5);
+    let outs = &ctx.node.outputs;
+    let wants = |i: usize| outs.get(i).is_some_and(|n| !n.is_empty());
+    if rms && wants(1) {
+        return Err(OnnxError::Unsupported(format!("{name}: the `mean` output is not defined for RMS norm")));
+    }
+    // `skip` must be `input`'s shape or a trailing part of it; swap a residual
+    // pair that came the other way round, and materialise any other broadcast.
+    let is_suffix = |a: &Tensor, b: &Tensor| {
+        let lead = a.shape.iter().take_while(|&&d| d == 1).count().min(a.ndim().saturating_sub(1));
+        a.ndim() <= b.ndim() && b.shape.ends_with(&a.shape[lead..])
+    };
+    if !is_suffix(skip, x) && is_suffix(x, skip) {
+        std::mem::swap(&mut x, &mut skip);
+    }
+    let summed;
+    let (xd, skip_d): (&Tensor, Option<&[f32]>) = if is_suffix(skip, x) {
+        (x, Some(&skip.data[..]))
+    } else {
+        summed = crate::math::add(x, skip).map_err(err)?;
+        (&summed, None)
+    };
+    let shape = xd.shape.clone();
+    let hidden = *shape.last().ok_or_else(|| err(format!("{name}: scalar input")))?;
+    let mut stat_shape = shape.clone();
+    if let Some(l) = stat_shape.last_mut() {
+        *l = 1;
+    }
+    let (first, rest) =
+        slots.split_first_mut().ok_or_else(|| OnnxError::Internal(format!("{name}: no output slots")))?;
+    shape_slot(first, &shape);
+    let (mut mean, mut inv, mut sum) = (None, None, None);
+    for (i, slot) in rest.iter_mut().enumerate() {
+        match i + 1 {
+            1 if wants(1) => {
+                shape_slot(slot, &stat_shape);
+                mean = Some(&mut slot.data[..]);
+            }
+            2 if wants(2) => {
+                shape_slot(slot, &stat_shape);
+                inv = Some(&mut slot.data[..]);
+            }
+            3 if wants(3) => {
+                shape_slot(slot, &shape);
+                sum = Some(&mut slot.data[..]);
+            }
+            _ => {}
+        }
+    }
+    // A scale / shift / bias that broadcasts from fewer elements is tiled.
+    let tile = |t: &'a Tensor| tile_vec(t, hidden).ok_or_else(|| {
+        err(format!("{name}: gamma/beta/bias must have {hidden} elements, got {}", t.data.len()))
+    });
+    let gamma = tile(gamma)?;
+    let beta = beta.map(tile).transpose()?;
+    let bias = bias.map(tile).transpose()?;
+    let args = crate::norm_rows::NormRows {
+        x: &xd.data,
+        skip: skip_d,
+        bias: bias.as_deref(),
+        gamma: &gamma,
+        beta: beta.as_deref(),
+        hidden,
+        eps,
+        rms,
+    };
+    if skip_d.is_none() && bias.is_some() {
+        // The materialised sum still needs the bias: add it as a one-row skip.
+        let args = crate::norm_rows::NormRows { skip: args.bias, bias: None, ..args };
+        return crate::norm_rows::norm_rows_into(
+            &args,
+            crate::norm_rows::NormRowsOut { out: &mut first.data, sum, mean, inv_std: inv },
+        )
+        .map_err(|e| err(format!("{name}: {e}")));
+    }
+    crate::norm_rows::norm_rows_into(&args, crate::norm_rows::NormRowsOut { out: &mut first.data, sum, mean, inv_std: inv })
+        .map_err(|e| err(format!("{name}: {e}")))
 }
 
 impl Operator for SkipSimplifiedLayerNormOp {
@@ -97,14 +154,31 @@ impl Operator for SkipSimplifiedLayerNormOp {
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let mut slots = empty_slots(ctx);
-        self.run(ctx, &mut slots)?;
+        run_skip_norm(ctx, &mut slots, true)?;
         Ok(slots)
     }
     fn supports_output_slots(&self) -> bool {
         true
     }
     fn execute_into_slots(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
-        self.run(ctx, slots)
+        run_skip_norm(ctx, slots, true)
+    }
+}
+
+impl Operator for SkipLayerNormOp {
+    fn op_type(&self) -> &str {
+        "SkipLayerNormalization"
+    }
+    fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+        let mut slots = empty_slots(ctx);
+        run_skip_norm(ctx, &mut slots, false)?;
+        Ok(slots)
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
+    fn execute_into_slots(&self, ctx: &OpContext<'_>, slots: &mut [Tensor]) -> Result<(), OnnxError> {
+        run_skip_norm(ctx, slots, false)
     }
 }
 
@@ -795,5 +869,87 @@ mod tests {
         assert_eq!(broadcast_strides(&[3, 1, 1, 5, 4], &[3, 2, 2, 5, 4]), Some(vec![20, 0, 0, 4, 1]));
         assert_eq!(broadcast_strides(&[5, 4], &[3, 2, 2, 5, 4]), Some(vec![0, 0, 0, 4, 1]));
         assert_eq!(broadcast_strides(&[2, 4], &[3, 2, 2, 5, 4]), None);
+    }
+
+    /// `Add` + `LayerNormalization` reference in f64: (y, mean, inv_std, sum).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn skip_ln_ref(x: &[f32], skip: &[f32], g: &[f32], beta: &[f32], bias: &[f32], h: usize, eps: f32, rms: bool)
+        -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let (mut y, mut m, mut inv, mut sum) = (vec![], vec![], vec![], vec![]);
+        for r in 0..x.len() / h {
+            let v: Vec<f32> = (0..h).map(|j| x[r * h + j] + skip[(r * h + j) % skip.len()] + bias[j]).collect();
+            let mean = if rms { 0.0 } else { v.iter().map(|&a| a as f64).sum::<f64>() / h as f64 };
+            let var = v.iter().map(|&a| (a as f64 - mean).powi(2)).sum::<f64>() / h as f64;
+            let is = 1.0 / (var + eps as f64).sqrt();
+            for j in 0..h {
+                y.push(((v[j] as f64 - mean) * is * g[j] as f64 + beta[j] as f64) as f32);
+            }
+            sum.extend_from_slice(&v);
+            m.push(mean as f32);
+            inv.push(is as f32);
+        }
+        (y, m, inv, sum)
+    }
+
+    fn assert_close(a: &[f32], b: &[f32], what: &str) {
+        assert_eq!(a.len(), b.len(), "{what}");
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            assert!((x - y).abs() <= 2e-5 * (1.0 + y.abs()), "{what}[{i}]: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn skip_layer_norm_all_outputs_and_slots() {
+        use oxionnx_core::graph::{Attributes, Node, OpKind};
+        let (b, s, h) = (2, 5, 48);
+        let t = |n: usize, seed: u64| crate::gemm_bf16::tests::rand(n, seed);
+        let x = Tensor::new(t(b * s * h, 1), vec![b, s, h]);
+        let skip = Tensor::new(t(s * h, 2), vec![s, h]);
+        let g = Tensor::new(t(h, 3), vec![h]);
+        let beta = Tensor::new(t(h, 4), vec![h]);
+        let bias = Tensor::new(t(h, 5), vec![h]);
+        let zeros = vec![0.0; h];
+        for rms in [false, true] {
+            let mut attrs = Attributes::default();
+            attrs.floats.insert("epsilon".into(), 1e-5);
+            let (op, inputs, outputs): (OpKind, Vec<String>, Vec<String>) = if rms {
+                (
+                    OpKind::Unknown("SkipSimplifiedLayerNormalization".into()),
+                    ["x", "skip", "g", "bias"].map(String::from).to_vec(),
+                    ["y", "", "inv", "sum"].map(String::from).to_vec(),
+                )
+            } else {
+                (
+                    OpKind::Unknown("SkipLayerNormalization".into()),
+                    ["x", "skip", "g", "beta", "bias"].map(String::from).to_vec(),
+                    ["y", "mean", "inv", "sum"].map(String::from).to_vec(),
+                )
+            };
+            let node = Node { op, name: "n".into(), inputs, outputs, attrs };
+            let ins: Vec<Option<&Tensor>> = if rms {
+                vec![Some(&x), Some(&skip), Some(&g), Some(&bias)]
+            } else {
+                vec![Some(&x), Some(&skip), Some(&g), Some(&beta), Some(&bias)]
+            };
+            let ctx = OpContext { node: &node, inputs: ins, outer_scope: None, weights: None, registry: None };
+            let (y, m, inv, sum) =
+                skip_ln_ref(&x.data, &skip.data, &g.data, if rms { &zeros } else { &beta.data }, &bias.data, h, 1e-5, rms);
+            let out = if rms { SkipSimplifiedLayerNormOp.execute(&ctx) } else { SkipLayerNormOp.execute(&ctx) }.unwrap();
+            assert_close(&out[0].data, &y, "y");
+            assert_eq!(out[0].shape, vec![b, s, h]);
+            if !rms {
+                assert_close(&out[1].data, &m, "mean");
+                assert_eq!(out[1].shape, vec![b, s, 1]);
+            }
+            assert_close(&out[2].data, &inv, "inv");
+            assert_close(&out[3].data, &sum, "sum");
+            // Slot path, with stale (wrong-sized, garbage) slots.
+            let mut slots: Vec<Tensor> = (0..4).map(|_| Tensor::new(vec![f32::NAN; 7], vec![7])).collect();
+            let op: &dyn Operator = if rms { &SkipSimplifiedLayerNormOp } else { &SkipLayerNormOp };
+            op.execute_into_slots(&ctx, &mut slots).unwrap();
+            assert_eq!(slots[0].data, out[0].data);
+            assert_eq!(slots[3].data, out[3].data);
+            assert_eq!(slots[2].shape, vec![b, s, 1]);
+        }
     }
 }
