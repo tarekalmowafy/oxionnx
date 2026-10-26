@@ -16,6 +16,7 @@ use crate::tensor::Tensor;
 use std::collections::HashMap;
 
 use crate::optimizer::shape_inference::get_input_shape;
+use oxionnx_ops::registry::misc_ops::shape_slice_bounds;
 
 use advanced::{
     infer_conv_transpose_shape, infer_einsum_shape, infer_gru_shape, infer_linear_classifier_shape,
@@ -188,7 +189,8 @@ pub(crate) fn infer_ext_node_shapes(
 
         OpKind::Shape => {
             let shape = get_input_shape(node, 0, known)?;
-            Some(vec![vec![shape.len()]])
+            let (start, end) = shape_slice_bounds(shape.len(), &node.attrs);
+            Some(vec![vec![end - start]])
         }
 
         OpKind::Constant => {

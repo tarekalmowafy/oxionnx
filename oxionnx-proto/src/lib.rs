@@ -6,6 +6,7 @@
 pub mod mmap_loader;
 
 pub mod byte_tensor;
+pub mod int_div;
 pub mod model;
 pub mod parser;
 #[allow(unsafe_code)]
